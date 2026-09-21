@@ -2860,12 +2860,13 @@ static bool view_ram_info(void)
 #ifdef IPOD_VIDEO
 /* Bring-up test for the VideoCore host interface (bcm_host.c).  Needs the files extracted from the
    iPod firmware (vc_extract.py) under /.rockbox/vc/Resources/VideoCore/{Boot,Library}/.
-   Writes a log to /bcm_host_log.txt. */
+   Writes a log to /bcm_host_log.txt (flushed line by line). */
 #include "bcm_host.h"
 extern void bcm_io_lock(void);
 extern void bcm_io_unlock(void);
 extern void bcm_io_read(unsigned vc_addr, void *dst, unsigned len);
-extern bool bcm_use_vmcs_image(const void *img, unsigned len);
+extern int  bcm_use_vmcs_image(const void *img, unsigned len);
+extern unsigned bcm_get_boot_info(unsigned snap[4]);
 
 #define BCM_VC_ROOT    "/.rockbox/vc"
 #define BCM_VMCS_PATH  BCM_VC_ROOT "/Resources/VideoCore/Boot/vmcs.bin"
@@ -2890,18 +2891,80 @@ static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
 }
 
+/* Hex dump of BCM memory into the log, 16 bytes per line. */
+static void bcm_dump(const char *what, unsigned vc_addr, unsigned len)
+{
+    static unsigned char d[64] __attribute__((aligned(4)));
+    unsigned i, j;
+    if (len > sizeof d) len = sizeof d;
+    bcm_io_lock();
+    bcm_io_read(vc_addr, d, len);
+    bcm_io_unlock();
+    BLOG("%s @%08x:", what, vc_addr);
+    for (i = 0; i < len; i += 16)
+    {
+        char line[80]; int n = snprintf(line, sizeof line, "  %04x:", i);
+        for (j = 0; j < 16 && i + j < len; j++)
+            n += snprintf(line + n, sizeof line - n, " %02x", d[i + j]);
+        bcm_logline(line, n);
+    }
+}
+
+/* Compare the image with what is now in VC RAM.  The running VC rewrites its own data, so a few
+   differing blocks are normal; zero matching blocks means the image did not get there. */
+static void bcm_verify_upload(unsigned len)
+{
+    static unsigned char rb[1024] __attribute__((aligned(4)));
+    unsigned off, bad = 0, total = 0, shown = 0;
+    for (off = 0; off + sizeof rb <= len; off += sizeof rb)
+    {
+        bcm_io_lock();
+        bcm_io_read(off, rb, sizeof rb);
+        bcm_io_unlock();
+        total++;
+        if (memcmp(rb, bcm_vmcs_buf + off, sizeof rb))
+        {
+            bad++;
+            if (shown < 6) { BLOG("  block differs at 0x%x", off); shown++; }
+        }
+    }
+    BLOG("upload verify: %u of %u KiB blocks differ from vmcs.bin", bad, total);
+}
+
+/* Log a multi-line gencmd reply, one short line per reply line. */
+static void bcm_log_text(const char *cmd, int r, const char *text)
+{
+    BLOG("%s -> %d:", cmd, r);
+    while (*text)
+    {
+        char seg[124];
+        int n = 0;
+        while (*text && *text != '\n' && n < 120)
+            seg[n++] = *text++;
+        if (*text == '\n')
+            text++;
+        seg[n] = 0;
+        if (n)
+            BLOG("  %s", seg);
+    }
+}
+
 static bool dbg_bcm_host(void)
 {
-    char resp[192];
+    static char resp[1536];
+    unsigned snap[4], boots;
     uint32_t w[4];
     int fd, r, i;
+    const struct bcm_host_diag *dg;
     static const char * const cmds[] = {
         "version", "commands", "tasks", "set_vll_dir /Resources/VideoCore/Library",
-        "load_application mplayer"   /* last: makes the VC open its libraries over VCFS (trace shows the paths) */
+        "load_application mplayer.vll",   /* the VC opens the library over VCFS (trace shows the paths) */
+        "commands",                       /* now lists the mp_* commands if the load worked */
+        "tasks"
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v3, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -2920,26 +2983,36 @@ static bool dbg_bcm_host(void)
     BLOG("vmcs.bin %d bytes", r);
 
     splash(0, "Booting VideoCore from file...");
-    if (!bcm_use_vmcs_image(bcm_vmcs_buf, (unsigned)r))
-    {
-        BLOG("NOR vmcs section not found: BCM cannot be power-cycled");
+    r = bcm_use_vmcs_image(bcm_vmcs_buf, (unsigned)r);
+    boots = bcm_get_boot_info(snap);
+    BLOG("bcm_use_vmcs_image = %d (0 ok, -1 no NOR vmcs, -2 BCM not rebooted); boots so far %u", r, boots);
+    BLOG("VC[1F0..1FC] right after boot = %08x %08x %08x %08x",
+         snap[0], snap[1], snap[2], snap[3]);
+    if (r != 0)
         goto out;
-    }
 
-    for (i = 0; i < 200; i++)          /* wait for VC[0x1F8] == 1 (an LCD update may be in flight) */
+    bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
+    BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
+         (unsigned)w[0], (unsigned)w[1], (unsigned)w[2], (unsigned)w[3]);
+
+    bcm_verify_upload((unsigned)(sizeof bcm_vmcs_buf < 201376 ? sizeof bcm_vmcs_buf : 201376));
+    bcm_dump("build string in VC RAM", 0x1F540, 64);
+
+    for (i = 0; i < 3; i++)
     {
-        bcm_io_lock();
-        bcm_io_read(0x1F0, w, 16);
-        bcm_io_unlock();
-        if (i < 5 || i % 50 == 0)
-            BLOG("VC[1F0..1FC] = %08x %08x %08x %08x", (unsigned)w[0], (unsigned)w[1],
-                 (unsigned)w[2], (unsigned)w[3]);
         r = bcm_host_attach();
-        if (r != -1)
-            break;
-        sleep(HZ/50);
+        if (r == 0) break;
+        sleep(HZ/10);
     }
-    BLOG("bcm_host_attach = %d after %d tries", r, i + 1);
+    dg = bcm_host_get_diag();
+    BLOG("bcm_host_attach = %d; ready_ok(VC[1F8]==1)=%d", r, dg->ready_ok);
+    BLOG("directory:  %04x %04x %04x %04x %04x %04x %04x %04x",
+         dg->dir[0], dg->dir[1], dg->dir[2], dg->dir[3], dg->dir[4], dg->dir[5], dg->dir[6], dg->dir[7]);
+    BLOG("types:      %04x %04x %04x %04x %04x %04x %04x %04x",
+         dg->type[0], dg->type[1], dg->type[2], dg->type[3], dg->type[4], dg->type[5], dg->type[6], dg->type[7]);
+    if (dg->w1fc)
+        bcm_dump("host-interface block (VC[1FC])", dg->w1fc, 64);
+    bcm_dump("VC[0x200] (address used by the QEMU model)", 0x200, 64);
     if (r != 0)
         goto out;
 
@@ -2947,8 +3020,8 @@ static bool dbg_bcm_host(void)
     bcm_host_set_trace(bcm_trace_cb);
     for (i = 0; i < (int)(sizeof cmds / sizeof cmds[0]); i++)
     {
-        r = bcm_gencmd(cmds[i], resp, sizeof resp, 300);
-        BLOG("%s -> %d: %s", cmds[i], r, resp);
+        r = bcm_gencmd(cmds[i], resp, sizeof resp, 1000);
+        bcm_log_text(cmds[i], r, resp);
     }
 
     {   /* listen for unsolicited traffic (VCFS/VCHR/VCPD requests) for 5 seconds */

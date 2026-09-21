@@ -201,6 +201,22 @@ static void test_vcfs(const char *file)
     uint32_t h; memcpy(&h, r.payload, 4);
     CHECK(res == 0 && h != 0 && h != 0xffffffffu, "open ok res=%u h=%u", res, h);
 
+    /* as seen on real hardware: backslashes and no extension (dlopen of "test") */
+    const char *hw = "\\Resources\\VideoCore\\Library\\test";
+    res = vcfs_call(0x4c, 1, 0, 0, hw, (uint16_t)strlen(hw) + 1, &r);
+    uint32_t h2; memcpy(&h2, r.payload, 4);
+    CHECK(res == 0 && h2 != 0 && h2 != 0xffffffffu, "backslash + extension-less path opens test.vll (res=%u)", res);
+    vcfs_call(0x41, h2, 0, 0, NULL, 0, &r);
+    const char *nosuch = "\\Resources\\VideoCore\\Library\\nosuchmodule";
+    res = vcfs_call(0x4c, 1, 0, 0, nosuch, (uint16_t)strlen(nosuch) + 1, &r);
+    CHECK(res == 1, "missing module -> error reply");
+    const char *rel = "\\test";
+    res = vcfs_call(0x4c, 1, 0, 0, rel, (uint16_t)strlen(rel) + 1, &r);
+    CHECK(res == 1, "the VC's fallback probe of a bare name is refused");
+    const char *bsdots = "\\Resources\\..\\etc\\passwd";
+    res = vcfs_call(0x4c, 1, 0, 0, bsdots, (uint16_t)strlen(bsdots) + 1, &r);
+    CHECK(res == 1, "backslash path traversal rejected");
+
     const char *bad = "/Resources/../etc/passwd";
     res = vcfs_call(0x4c, 8, 0, 0, bad, (uint16_t)strlen(bad) + 1, &r);
     CHECK(res == 1, "path traversal rejected (res=%u)", res);
@@ -236,7 +252,7 @@ static void test_vcfs(const char *file)
 
     res = vcfs_call(0x41, h, 0, 0, NULL, 0, &r);
     CHECK(res == 0 && r.len == 0, "close");
-    CHECK(trace_opens == 4 && trace_reads > 3, "trace hook saw opens=%d reads=%d", trace_opens, trace_reads);
+    CHECK(trace_opens == 8 && trace_reads > 3, "trace hook saw opens=%d reads=%d", trace_opens, trace_reads);
     res = vcfs_call(0x44, h, 1, 10, NULL, 0, &r);
     CHECK(res == 1, "read after close is an error");
     res = vcfs_call(0x42, 0, 0, 0, NULL, 0, &r);

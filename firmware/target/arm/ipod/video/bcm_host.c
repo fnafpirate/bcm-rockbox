@@ -391,30 +391,43 @@ static void vcfs_dispatch(struct hi_chan *c, const struct hi_msg *m)
 
     switch (m->op) {
     case VCFS_OPEN: {                                     /* stock: rt 0x287dd4 */
+        /* Seen on real hardware (dlopen of "mplayer"): mode 1, path "\\Resources\\VideoCore\\Library\\mplayer"
+         * - backslash separators and NO ".vll" extension - and then a fallback "\\mplayer". */
         uint32_t mode = p[0], h = 0xffffffffu;
-        char path[192];
+        char path[192], req[128];
+        size_t rl = 0, maxl = m->len > 16 ? m->len - 16u : 0;
+        if (maxl > sizeof req - 1) maxl = sizeof req - 1;
+        while (rl < maxl && data[rl]) { req[rl] = data[rl] == '\\' ? '/' : (char)data[rl]; rl++; }
+        req[rl] = 0;
         if (mode != 0x20 && mode != 0x40) {               /* trunc / noreplace -> -1 in stock */
-            const char *req = (const char *)data;
-            size_t rl = 0, maxl = m->len > 16 ? m->len - 16u : 0;
-            while (rl < maxl && req[rl]) rl++;
             static const char pre[] = "/Resources";
             bool ok = rl >= sizeof pre - 1 && !memcmp(req, pre, sizeof pre - 1);
             for (size_t i = 0; ok && i + 1 < rl; i++)               /* no path traversal */
                 if (req[i] == '.' && req[i + 1] == '.') ok = false;
             size_t rootl = strlen(hi.vfs_root);
-            if (ok && rootl + rl < sizeof path) {
+            if (ok && rootl + rl + 5 < sizeof path) {
                 memcpy(path, hi.vfs_root, rootl);
                 memcpy(path + rootl, req, rl);
                 path[rootl + rl] = 0;
                 int fd = open(path, O_RDONLY);
+                if (fd < 0) {                             /* extension-less name: try <name>.vll */
+                    bool has_dot = false;
+                    for (size_t i = rl; i > 0 && req[i - 1] != '/'; i--)
+                        if (req[i - 1] == '.') has_dot = true;
+                    if (!has_dot) {
+                        memcpy(path + rootl + rl, ".vll", 5);
+                        fd = open(path, O_RDONLY);
+                    }
+                }
                 if (fd >= 0) {
                     for (int i = 0; i < 8; i++)
                         if (hi.vfs_fd[i] < 0) { hi.vfs_fd[i] = fd; h = (uint32_t)i + 1; break; }
                     if (h == 0xffffffffu) close(fd);
+                    else TRACE("vcfs mapped", 0, 0, path);
                 }
             }
         }
-        TRACE("vcfs open", mode, h, (const char *)data);
+        TRACE("vcfs open", mode, h, req);
         st32(out, h);
         reply(c, m, h == 0xffffffffu ? 1 : 0, out, 4);
         break; }
