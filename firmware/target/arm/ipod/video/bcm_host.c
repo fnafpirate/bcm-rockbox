@@ -40,7 +40,7 @@
 #define HI_MAGIC          0xF1A55A1Fu
 #define HI_NCHAN          8
 #define HI_HDR            16u                 /* message header size */
-#define HI_MAX_PAYLOAD    0x800u
+#define HI_MAX_PAYLOAD    0x4010u             /* 16 KiB of file data + the 16-byte VCFS parameter block */
 
 #define H_TX_SIG          0x10                /* host -> VC signal byte             */
 #define H_RX_ACK          0x11                /* host ack of VC signals             */
@@ -186,7 +186,7 @@ int bcm_host_attach(void)
     for (int i = 0; i < HI_NCHAN; i++) {
         struct hi_chan *c = &hi.ch[i];
         memset(c, 0, sizeof *c);
-        if (dir[i] == 0 || (dir[i] & 3) || dir[i] > 0x4000) continue;   /* implausible entry */
+        if (dir[i] == 0 || (dir[i] & 3)) continue;               /* empty or misaligned entry (real offsets reach 0x5740) */
         uint8_t d[D_SIZE];
         bcm_io_read(hi.base + dir[i], d, D_SIZE);
         c->desc     = dir[i];
@@ -196,6 +196,7 @@ int bcm_host_attach(void)
         c->tx_rd    = ld16(d + D_TX_RD);     c->tx_wr  = ld16(d + D_TX_WR);
         c->rx_rd    = ld16(d + D_RX_RD);     c->rx_wr  = ld16(d + D_RX_WR);
         diag.type[i] = c->type; diag.tx_start[i] = c->tx_start; diag.rx_start[i] = c->rx_start;
+        diag.tx_end[i] = c->tx_end; diag.rx_end[i] = c->rx_end;
         /* plausible: a small type number and rings with start < end */
         if (c->type >= 1 && c->type <= 15 && c->tx_start < c->tx_end && c->rx_start < c->rx_end) {
             c->present = true;
@@ -258,7 +259,7 @@ static void chan_kick(struct hi_chan *c)
 /* Send one message, waiting (bounded) for ring space. Returns 0 or -1. */
 static int hi_tx(struct hi_chan *c, uint32_t op, uint32_t seq, const void *payload, uint32_t len)
 {
-    uint8_t buf[HI_HDR + HI_MAX_PAYLOAD + 16];
+    static uint8_t buf[HI_HDR + HI_MAX_PAYLOAD + 16];   /* static: single service thread, keeps the stack small */
     uint32_t padded = (len + 15u) & ~15u;
     if (len > HI_MAX_PAYLOAD) return -1;
     memset(buf, 0, HI_HDR + padded);
@@ -452,7 +453,7 @@ static void vcfs_dispatch(struct hi_chan *c, const struct hi_msg *m)
         memset(out, 0, 16);
         if (h >= 1 && h <= 8 && hi.vfs_fd[h - 1] >= 0 && size) {
             uint32_t want = size * count;
-            if (want > HI_MAX_PAYLOAD) want = HI_MAX_PAYLOAD;     /* bounded by the ring message */
+            if (want > HI_MAX_PAYLOAD - 16) want = HI_MAX_PAYLOAD - 16;   /* real hardware asked for 0x800; a 0x800+16 reply was refused by the old 0x800 cap */
             got = (int32_t)read(hi.vfs_fd[h - 1], out + 16, want);
         }
         TRACE("vcfs read", h, (uint32_t)got, NULL);

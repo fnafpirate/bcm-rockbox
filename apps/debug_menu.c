@@ -2964,7 +2964,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v3, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v4, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3010,6 +3010,11 @@ static bool dbg_bcm_host(void)
          dg->dir[0], dg->dir[1], dg->dir[2], dg->dir[3], dg->dir[4], dg->dir[5], dg->dir[6], dg->dir[7]);
     BLOG("types:      %04x %04x %04x %04x %04x %04x %04x %04x",
          dg->type[0], dg->type[1], dg->type[2], dg->type[3], dg->type[4], dg->type[5], dg->type[6], dg->type[7]);
+    for (i = 0; i < 8; i++)
+        if (dg->dir[i])
+            BLOG("ch%d: descriptor +%04x type %u  tx[%04x,%04x) rx[%04x,%04x)", i, dg->dir[i],
+                 dg->type[i], (unsigned)dg->tx_start[i], (unsigned)dg->tx_end[i],
+                 (unsigned)dg->rx_start[i], (unsigned)dg->rx_end[i]);
     if (dg->w1fc)
         bcm_dump("host-interface block (VC[1FC])", dg->w1fc, 64);
     bcm_dump("VC[0x200] (address used by the QEMU model)", 0x200, 64);

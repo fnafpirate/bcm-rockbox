@@ -28,7 +28,7 @@ struct bcm_host_diag {
     bool     ready_ok;                     /* VC[0x1F8] == 1 (the stock firmware's condition) */
     uint16_t dir[8];                       /* channel directory at base (offsets from base) */
     uint16_t type[8];                      /* descriptor type per channel (0 = absent) */
-    uint32_t tx_start[8], rx_start[8];
+    uint32_t tx_start[8], tx_end[8], rx_start[8], rx_end[8];   /* ring bounds, offsets from base */
 };
 const struct bcm_host_diag *bcm_host_get_diag(void);
 

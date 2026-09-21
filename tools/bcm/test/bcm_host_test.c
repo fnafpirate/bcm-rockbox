@@ -250,6 +250,17 @@ static void test_vcfs(const char *file)
     CHECK(total == (size_t)sb.st_size && !memcmp(got, ref, sb.st_size), "file content round-trips through VCFS (%zu bytes)", total);
     free(got); free(ref);
 
+    /* exactly what real hardware asked for: fread(handle, 1, 0x800) - a 0x810-byte reply */
+    res = vcfs_call(0x43, h, 0, 0, NULL, 0, &r);
+    static uint8_t big[16 + 0x4010];
+    { uint32_t p[4] = { h, 1, 0x800, 0 }; uint8_t pl[16]; memcpy(pl, p, 16);
+      vc_send(2, 0x44, 0x80000900u, pl, 16); bcm_host_service();
+      struct rmsg *rr = (struct rmsg *)big; (void)rr; }
+    { static struct rmsg rb; int ok = vc_recv(2, &rb);
+      uint32_t cnt = 0; if (ok) memcpy(&cnt, rb.payload, 4);
+      CHECK(ok && rb.op == 0 && rb.len == 16 + cnt && cnt == (sb.st_size >= 0x800 ? 0x800u : (uint32_t)sb.st_size),
+            "0x800-byte read (as sent by the VC) is answered: ok=%d len=%u count=%u", ok, ok ? rb.len : 0, cnt); }
+
     res = vcfs_call(0x41, h, 0, 0, NULL, 0, &r);
     CHECK(res == 0 && r.len == 0, "close");
     CHECK(trace_opens == 8 && trace_reads > 3, "trace hook saw opens=%d reads=%d", trace_opens, trace_reads);
@@ -408,6 +419,23 @@ static void test_attach_variants(void)
     vc_init();
 }
 
+/* real hardware directory: 0030 0680 48d0 4bb0 5740 - offsets well above 0x4000, types in an order
+   other than 1,2,5,6,7 (index 1 was type 5) */
+static void test_high_directory(void)
+{
+    vc_init(); q_reset();
+    uint32_t hi_off[5] = { 0x30, 0x680, 0x48d0, 0x4bb0, 0x5740 };
+    uint8_t save[5][0x50];
+    for (int i = 0; i < 5; i++) memcpy(save[i], vcram + D(i), 0x50);
+    for (int i = 0; i < 5; i++) { memcpy(vcram + BASE + hi_off[i], save[i], 0x50); s16(BASE + i * 2, (uint16_t)hi_off[i]); }
+    s16(BASE + 2, 0x680); memcpy(vcram + BASE + 0x680 + 4, &(uint16_t){5}, 2);          /* index 1 = type 5 */
+    CHECK(bcm_host_attach() == 0, "attach with descriptors at high offsets");
+    const struct bcm_host_diag *dg = bcm_host_get_diag();
+    CHECK(dg->dir[4] == 0x5740 && dg->type[4] == 7 && dg->type[1] == 5, "all five channels seen (type[4]=%u type[1]=%u)", dg->type[4], dg->type[1]);
+    CHECK(dg->tx_end[4] > dg->tx_start[4] && dg->rx_end[4] > dg->rx_start[4], "ring bounds recorded");
+    vc_init();
+}
+
 int main(int argc, char **argv)
 {
     const char *file = argc > 1 ? argv[1] : "/mnt/user-data/uploads/passthruhandler.vll";
@@ -418,6 +446,7 @@ int main(int argc, char **argv)
     printf("[pds]\n"); fflush(stdout); test_pds();
     printf("[ring wrap / back-pressure]\n"); fflush(stdout); test_wrap(file);
     printf("[attach variants]\n"); fflush(stdout); test_attach_variants();
+    printf("[high directory offsets]\n"); fflush(stdout); test_high_directory();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",
            st->rx_msgs, st->tx_msgs, st->vcfs_ops, st->pds_ops, st->bad_magic, st->unknown_ops);
