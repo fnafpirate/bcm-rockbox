@@ -13,11 +13,24 @@
 
 /* ---- bring-up ---------------------------------------------------------------- */
 
-/* Call after the VideoCore has been booted (bcm_init(), VC[0x1F8] == 1).
- * Reads VC[0x1F0..0x1FF], the channel directory and the channel descriptors.
- * Returns 0 on success, <0 on failure (-1: VC[0x1F8] != 1, -2: bad info pointer,
- * -3: no gencmd channel). */
+/* Call after the VideoCore has been booted (bcm_init()).
+ * Reads VC[0x1F0..0x1FF], takes the info pointer at VC[0x1FC] as the base of the host-interface
+ * block, reads the channel directory and the channel descriptors.
+ * The stock firmware requires VC[0x1F8] == 1 here; on real hardware under Rockbox that word holds
+ * the legacy LCD command (0xFFFF0000), so it is only recorded (diag.ready_ok), not enforced.
+ * Returns 0 on success, <0 on failure (-2: bad info pointer, -3: no gencmd channel,
+ * -4: no plausible channel directory). */
 int  bcm_host_attach(void);
+
+/* What attach saw, for logging. Valid after any call to bcm_host_attach(). */
+struct bcm_host_diag {
+    uint32_t w1f0, w1f4, w1f8, w1fc;       /* VC[0x1F0..0x1FC] */
+    bool     ready_ok;                     /* VC[0x1F8] == 1 (the stock firmware's condition) */
+    uint16_t dir[8];                       /* channel directory at base (offsets from base) */
+    uint16_t type[8];                      /* descriptor type per channel (0 = absent) */
+    uint32_t tx_start[8], rx_start[8];
+};
+const struct bcm_host_diag *bcm_host_get_diag(void);
 
 /* Poll the VC->host signal byte and service every channel with pending messages.
  * There is no interrupt to imitate (see report 11.3): call at ~100-200 Hz from a thread. */

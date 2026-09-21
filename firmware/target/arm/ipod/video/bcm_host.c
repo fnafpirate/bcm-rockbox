@@ -124,6 +124,8 @@ static struct {
 void bcm_host_set_trace(void (*fn)(const char *, uint32_t, uint32_t, const char *)) { hi.trace = fn; }
 
 const struct bcm_host_stats *bcm_host_get_stats(void) { return &hi.st; }
+static struct bcm_host_diag diag;
+const struct bcm_host_diag *bcm_host_get_diag(void) { return &diag; }
 
 /* ------------------------------------------------------------- small helpers -- */
 static uint32_t rd32(uint32_t addr) { uint32_t v; bcm_io_read(addr, &v, 4); return v; }
@@ -164,41 +166,52 @@ int bcm_host_attach(void)
 {
     uint32_t w[4];
     memset(&hi.st, 0, sizeof hi.st);
+    memset(&diag, 0, sizeof diag);
+    hi.attached = false;
     bcm_io_lock();
     bcm_io_read(0x1F0, w, 16);
-    if (w[2] != 1) { bcm_io_unlock(); BCM_LOG("VC[0x1F8]=%u", w[2]); return -1; }
+    diag.w1f0 = w[0]; diag.w1f4 = w[1]; diag.w1f8 = w[2]; diag.w1fc = w[3];
+    diag.ready_ok = (w[2] == 1);
     hi.base = w[3];
-    if (hi.base == 0 || (hi.base & 3)) { bcm_io_unlock(); return -2; }
+    if (hi.base == 0 || (hi.base & 3)) { bcm_io_unlock(); BCM_LOG("bad info pointer %08x", hi.base); return -2; }
 
     uint16_t dir[HI_NCHAN];
     bcm_io_read(hi.base, dir, 16);
+    memcpy(diag.dir, dir, sizeof dir);
     uint32_t hdr = rd32(hi.base + H_TX_SIG);
     hi.tx_sig = (uint8_t)hdr;
     hi.rx_ack = (uint8_t)(hdr >> 8);
 
+    int present = 0;
     for (int i = 0; i < HI_NCHAN; i++) {
         struct hi_chan *c = &hi.ch[i];
         memset(c, 0, sizeof *c);
-        if (dir[i] == 0) continue;
+        if (dir[i] == 0 || (dir[i] & 3) || dir[i] > 0x4000) continue;   /* implausible entry */
         uint8_t d[D_SIZE];
         bcm_io_read(hi.base + dir[i], d, D_SIZE);
-        c->present  = true;
         c->desc     = dir[i];
         c->type     = ld16(d + D_TYPE);
         c->tx_start = ld16(d + D_TX_START);  c->tx_end = ld16(d + D_TX_END);
         c->rx_start = ld16(d + D_RX_START);  c->rx_end = ld16(d + D_RX_END);
         c->tx_rd    = ld16(d + D_TX_RD);     c->tx_wr  = ld16(d + D_TX_WR);
         c->rx_rd    = ld16(d + D_RX_RD);     c->rx_wr  = ld16(d + D_RX_WR);
+        diag.type[i] = c->type; diag.tx_start[i] = c->tx_start; diag.rx_start[i] = c->rx_start;
+        /* plausible: a small type number and rings with start < end */
+        if (c->type >= 1 && c->type <= 15 && c->tx_start < c->tx_end && c->rx_start < c->rx_end) {
+            c->present = true;
+            present++;
+        }
     }
     bcm_io_unlock();
 
+    if (present == 0) return -4;
     for (int i = 0; i < 8; i++) hi.vfs_fd[i] = -1;
     hi.pds_stream_buf[0] = 0; hi.pds_stream_buf[1] = 1;
     hi.pds_stream_buf[2] = hi.pds_stream_buf[3] = 0;
     hi.pds_cur_stream = -1;
     memset(hi.pds_pend, 0, sizeof hi.pds_pend);
+    if (!chan_by_type(CH_GENCMD)) return -3;
     hi.attached = true;
-    if (!chan_by_type(CH_GENCMD)) { hi.attached = false; return -3; }
     return 0;
 }
 

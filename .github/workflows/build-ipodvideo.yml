@@ -1,3 +1,9 @@
+# Put this file in your fork at:  .github/workflows/build-ipodvideo.yml
+# It runs on every push to branch "bcm-host" (and from Actions -> Run workflow once it exists on
+# your default branch).  First run builds the ARM cross-compiler (~40-60 min); it is cached as
+# soon as it is built, so a later failure does not lose it.
+# On failure the errors are written to the run's Summary page (the first page you see when you
+# open the run) - copy them from there.  Output: artifact "rockbox-ipodvideo".
 name: Build iPod Video
 
 on:
@@ -46,6 +52,7 @@ jobs:
           path: /opt/rbdev
           key: rbdev-arm-gcc9.5-${{ hashFiles('tools/rockboxdev.sh') }}
 
+      # rockboxdev.sh installs into <prefix>/bin  (it prints "Make sure your PATH includes $prefix/bin")
       - name: Check toolchain
         run: |
           export PATH=/opt/rbdev/bin:$PATH

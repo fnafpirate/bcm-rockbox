@@ -110,6 +110,10 @@ struct
 #endif
 } lcd_state IBSS_ATTR;
 
+/* Diagnostics for bcm_host: VC[0x1F0..0x1FC] right after the last bcm_init(), and the boot count */
+static unsigned bcm_boot_snap[4];
+static unsigned bcm_boot_count;
+
 /* Serializes thread-context access to the BCM ports: lcd_update_rect(), lcd_blit_yuv() and the
    VideoCore host interface (bcm_host.c).  lcd_tick() is excluded separately by lcd_block_tick(). */
 #ifndef BOOTLOADER
@@ -382,19 +386,30 @@ void bcm_io_idle(void)
 }
 
 #ifdef HAVE_LCD_SLEEP
-/* Replace the VideoCore OS image used by bcm_init() and power-cycle the BCM so it boots from it.
+/* Replace the VideoCore OS image used by bcm_init() and power-cycle the BCM so that it boots from it.
    `img` must stay valid for as long as the LCD may sleep/wake (bcm_init() re-uploads it each
-   time); it must be 16-bit aligned.  Returns false if the NOR vmcs section was not found, since
-   the LCD sleep/wake machinery is disabled in that case. */
-bool bcm_use_vmcs_image(const void *img, unsigned len)
+   time); it must be 16-bit aligned.
+   Returns 0 on success, -1 if the NOR vmcs section was not found (LCD sleep/wake is disabled then),
+   -2 if bcm_init() did not run (the LCD was not awake, so nothing was rebooted). */
+int bcm_use_vmcs_image(const void *img, unsigned len)
 {
+    unsigned before = bcm_boot_count;
     if (flash_vmcs_length == 0)
-        return false;
+        return -1;
     lcd_sleep();                                       /* waits for the BCM to go idle, powers it off */
     flash_vmcs_offset = (const fb_data *)img;
     flash_vmcs_length = ((len + 3) >> 1) & ~1;         /* lcd_write_data wants an even count of 16-bit values */
     lcd_awake();                                       /* bcm_init() uploads the new image */
-    return true;
+    return (bcm_boot_count != before) ? 0 : -2;
+}
+
+/* VC[0x1F0..0x1FC] as read at the end of the last bcm_init(); returns the number of boots so far. */
+unsigned bcm_get_boot_info(unsigned snap[4])
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        snap[i] = bcm_boot_snap[i];
+    return bcm_boot_count;
 }
 #endif /* HAVE_LCD_SLEEP */
 #endif /* !BOOTLOADER */
@@ -691,6 +706,11 @@ static void bcm_init(void)
 
     while (bcm_read32(BCMA_COMMAND) == 0)
         yield();
+
+    /* Diagnostics for bcm_host: what the VC published right after boot, before any LCD update */
+    for (i = 0; i < 4; i++)
+        bcm_boot_snap[i] = bcm_read32(0x1F0 + 4*i);
+    bcm_boot_count++;
 
     /* sleep(HZ/2) apparently unneeded */
 }

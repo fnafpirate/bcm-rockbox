@@ -27,9 +27,9 @@ void bcm_io_doorbell(void); /* BCM_CONTROL = 0x31 */
 void bcm_io_idle(void);     /* called while waiting; sleep(1) on target, so poll counts are ~10 ms units */
 
 /* Target only (lcd-video.c): replace the VideoCore OS image and power-cycle the BCM so that it
- * boots from `img` (16-bit aligned, must stay valid). Returns false if the NOR vmcs section was
- * not found. */
+ * boots from `img` (16-bit aligned, must stay valid). */
 #include <stdbool.h>
-bool bcm_use_vmcs_image(const void *img, unsigned len);
+int  bcm_use_vmcs_image(const void *img, unsigned len);   /* 0 ok, -1 no NOR vmcs, -2 BCM not rebooted */
+unsigned bcm_get_boot_info(unsigned snap[4]);             /* VC[0x1F0..0x1FC] right after boot; returns boot count */
 
 #endif

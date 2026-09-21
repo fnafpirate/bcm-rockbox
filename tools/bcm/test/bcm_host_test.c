@@ -30,8 +30,11 @@ void bcm_io_lock(void) {}
 void bcm_io_unlock(void) {}
 void bcm_io_doorbell(void) { doorbells++; }
 void bcm_io_idle(void) { if (idle_hook) idle_hook(); }
-void bcm_io_read(uint32_t a, void *d, size_t n)  { if ((a | n) & 3) { printf("BAD unaligned read %x/%zu\n", a, n); exit(2); } memcpy(d, vcram + a, n); }
-void bcm_io_write(uint32_t a, const void *s, size_t n) { if ((a | n) & 3) { printf("BAD unaligned write %x/%zu\n", a, n); exit(2); } memcpy(vcram + a, s, n); }
+void bcm_io_read(uint32_t a, void *d, size_t n)  { if ((a | n) & 3) { printf("BAD unaligned read %x/%zu\n", a, n); exit(2); }
+    if ((uint64_t)a + n > sizeof vcram) { memset(d, 0xFF, n); return; }   /* unmapped VC address reads as ones */
+    memcpy(d, vcram + a, n); }
+void bcm_io_write(uint32_t a, const void *s, size_t n) { if ((a | n) & 3) { printf("BAD unaligned write %x/%zu\n", a, n); exit(2); }
+    if ((uint64_t)a + n <= sizeof vcram) memcpy(vcram + a, s, n); }
 
 static uint16_t g16(uint32_t a) { uint16_t v; memcpy(&v, vcram + a, 2); return v; }
 static void     s16(uint32_t a, uint16_t v) { memcpy(vcram + a, &v, 2); }
@@ -365,6 +368,30 @@ static void test_wrap(const char *file)
     idle_hook = NULL;
 }
 
+/* attach() must not depend on VC[0x1F8]==1, and must reject a nonsense info pointer ------------ */
+static void test_attach_variants(void)
+{
+    /* what real hardware showed under Rockbox: VC[0x1F8] = the legacy LCD command 0xFFFF0000 */
+    vc_init(); q_reset();
+    s32(0x1F8, 0xFFFF0000u);
+    CHECK(bcm_host_attach() == 0, "attach succeeds although VC[0x1F8] != 1");
+    const struct bcm_host_diag *dg = bcm_host_get_diag();
+    CHECK(!dg->ready_ok && dg->w1f8 == 0xFFFF0000u && dg->w1fc == BASE, "diag records the words (ready_ok=%d)", dg->ready_ok);
+    CHECK(dg->type[0] == 1 && dg->type[2] == 5 && dg->type[4] == 7, "diag types");
+
+    /* the value seen on real hardware in VC[0x1FC]: an address outside anything mapped here */
+    vc_init(); s32(0x1F8, 0xFFFF0000u); s32(0x1FC, 0xFE000CA0u);
+    CHECK(bcm_host_attach() == -4, "garbage directory rejected (-4)");
+    dg = bcm_host_get_diag();
+    CHECK(dg->w1fc == 0xFE000CA0u, "diag still records VC[0x1FC]");
+
+    vc_init(); s32(0x1FC, 0);
+    CHECK(bcm_host_attach() == -2, "zero info pointer rejected (-2)");
+    vc_init(); s32(0x1FC, BASE + 2);
+    CHECK(bcm_host_attach() == -2, "unaligned info pointer rejected (-2)");
+    vc_init();
+}
+
 int main(int argc, char **argv)
 {
     const char *file = argc > 1 ? argv[1] : "/mnt/user-data/uploads/passthruhandler.vll";
@@ -374,6 +401,7 @@ int main(int argc, char **argv)
     printf("[vcfs]\n"); fflush(stdout); test_vcfs(file);
     printf("[pds]\n"); fflush(stdout); test_pds();
     printf("[ring wrap / back-pressure]\n"); fflush(stdout); test_wrap(file);
+    printf("[attach variants]\n"); fflush(stdout); test_attach_variants();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",
            st->rx_msgs, st->tx_msgs, st->vcfs_ops, st->pds_ops, st->bad_magic, st->unknown_ops);
