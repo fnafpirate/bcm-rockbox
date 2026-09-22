@@ -2871,6 +2871,7 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 #define BCM_VC_ROOT    "/.rockbox/vc"
 #define BCM_VMCS_PATH  BCM_VC_ROOT "/Resources/VideoCore/Boot/vmcs.bin"
 #define BCM_LOG_PATH   "/bcm_host_log.txt"
+#define BCM_TESTFILE_PATH BCM_VC_ROOT "/../../testfile.txt"   /* -> /.rockbox/testfile.txt: first line = video path */
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
 static int bcm_log_fd = -1;
@@ -2889,6 +2890,108 @@ static void bcm_logline(const char *s, int n)
 static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
 {
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
+}
+
+static void bcm_log_text(const char *cmd, int r, const char *text)
+{
+    BLOG("%s -> %d:", cmd, r);
+    while (*text)
+    {
+        char seg[124];
+        int n = 0;
+        while (*text && *text != '\n' && n < 120)
+            seg[n++] = *text++;
+        if (*text == '\n')
+            text++;
+        seg[n] = 0;
+        if (n)
+            BLOG("  %s", seg);
+    }
+}
+
+/* Minimal PDS callbacks for the v8 playback probe: log what the VC asks for, feed nothing real
+   yet (bcm_pds_send_empty() on every get_frame). The point of this run is only to see whether
+   mp_selectplay/mp_play produce ANY VideoCore-initiated PDS traffic, and with what parameters --
+   not to play the file. */
+static int pds_probe_starts, pds_probe_frames, pds_probe_seeks, pds_probe_stops;
+static void pds_probe_start(int id, uint32_t w1)
+{
+    pds_probe_starts++;
+    BLOG("  PDS start: stream=%d w1=%08x", id, (unsigned)w1);
+}
+static void pds_probe_get_frame(int id, uint32_t w1, uint32_t w2)
+{
+    pds_probe_frames++;
+    BLOG("  PDS get_frame #%d: stream=%d w1=%08x w2=%08x", pds_probe_frames, id, (unsigned)w1, (unsigned)w2);
+    bcm_pds_send_empty();          /* "no frame available" -- we are not feeding real data yet */
+}
+static void pds_probe_seek(int id, uint32_t pos)
+{
+    pds_probe_seeks++;
+    BLOG("  PDS seek: stream=%d pos=%u", id, (unsigned)pos);
+}
+static void pds_probe_stop(void)
+{
+    pds_probe_stops++;
+    BLOG("  PDS stop");
+}
+static const struct bcm_pds_ops pds_probe_ops = {
+    pds_probe_start, pds_probe_get_frame, pds_probe_seek, pds_probe_stop
+};
+
+/* v8 playback probe: read /.rockbox/testfile.txt for a video path (so the file can be changed
+   without a rebuild), then try mp_region/mp_selectplay/mp_play and watch for PDS traffic.
+   "rgb565" and "yuv422i" are real mode strings found in this vmcs.bin (0x1ccd80-ish); nothing
+   else about the mp_region/mp_selectplay argument syntax has been confirmed on hardware yet, so
+   this logs whatever gencmd replies come back, error or not. */
+static void bcm_playback_probe(void)
+{
+    char resp[256], video[192];
+    int fd, r, i;
+
+    fd = open(BCM_TESTFILE_PATH, O_RDONLY);
+    if (fd < 0) {
+        BLOG("no %s -- skipping playback probe (create it with one line: the video's path)", BCM_TESTFILE_PATH);
+        return;
+    }
+    r = read(fd, video, sizeof video - 1);
+    close(fd);
+    if (r <= 0) { BLOG("testfile.txt is empty"); return; }
+    video[r] = 0;
+    for (i = 0; i < r; i++) if (video[i] == '\r' || video[i] == '\n') { video[i] = 0; break; }
+    BLOG("playback probe: test video = %s", video);
+
+    {   /* just confirm Rockbox itself can open it -- this file is NOT sent to the VC (PDS pulls
+           frames from the host on demand; there is no file-open step on the VC side for video) */
+        int vfd = open(video, O_RDONLY);
+        if (vfd < 0) { BLOG("cannot open %s from Rockbox -- check the path", video); return; }
+        close(vfd);
+    }
+
+    static const char * const modes[] = { "rgb565", "yuv422i" };
+    for (i = 0; i < (int)(sizeof modes / sizeof modes[0]); i++) {
+        char cmd[96];
+        snprintf(cmd, sizeof cmd, "mp_region display=0 dest=fullscreen mode=%s", modes[i]);
+        r = bcm_gencmd(cmd, resp, sizeof resp, 300);
+        bcm_log_text(cmd, r, resp);
+    }
+
+    bcm_pds_set_ops(&pds_probe_ops);
+    r = bcm_gencmd("mp_selectplay passthru:test 0", resp, sizeof resp, 300);
+    bcm_log_text("mp_selectplay passthru:test 0", r, resp);
+    r = bcm_gencmd("mp_play", resp, sizeof resp, 300);
+    bcm_log_text("mp_play", r, resp);
+
+    {
+        long end = current_tick + 8*HZ;
+        while (TIME_BEFORE(current_tick, end)) { bcm_host_service(); sleep(HZ/100); }
+    }
+    BLOG("PDS probe: starts=%d frames=%d seeks=%d stops=%d", pds_probe_starts, pds_probe_frames, pds_probe_seeks, pds_probe_stops);
+
+    r = bcm_gencmd("mp_get_status", resp, sizeof resp, 300);
+    bcm_log_text("mp_get_status", r, resp);
+    r = bcm_gencmd("mp_stop", resp, sizeof resp, 300);
+    bcm_log_text("mp_stop", r, resp);
 }
 
 /* Hex dump of BCM memory into the log, 16 bytes per line. */
@@ -2932,23 +3035,6 @@ static void bcm_verify_upload(unsigned len)
 }
 
 /* Log a multi-line gencmd reply, one short line per reply line. */
-static void bcm_log_text(const char *cmd, int r, const char *text)
-{
-    BLOG("%s -> %d:", cmd, r);
-    while (*text)
-    {
-        char seg[124];
-        int n = 0;
-        while (*text && *text != '\n' && n < 120)
-            seg[n++] = *text++;
-        if (*text == '\n')
-            text++;
-        seg[n] = 0;
-        if (n)
-            BLOG("  %s", seg);
-    }
-}
-
 static bool dbg_bcm_host(void)
 {
     static char resp[1536];
@@ -2964,7 +3050,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v7, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v8, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3042,6 +3128,8 @@ static bool dbg_bcm_host(void)
              (unsigned)st->pds_ops, (unsigned)st->bad_magic, (unsigned)st->unknown_ops);
         BLOG("truncated=%u resynced=%u", (unsigned)st->truncated, (unsigned)st->resynced);
     }
+
+    bcm_playback_probe();
 
 out:
     if (bcm_log_fd >= 0)
