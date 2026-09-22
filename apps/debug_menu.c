@@ -2892,9 +2892,11 @@ static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
 }
 
+static long bcm_cmd_t0;
 static void bcm_log_text(const char *cmd, int r, const char *text)
 {
-    BLOG("%s -> %d:", cmd, r);
+    long dt = current_tick - bcm_cmd_t0;
+    BLOG("%s -> %d (%ld.%02lds):", cmd, r, dt / HZ, (dt % HZ) * 100 / HZ);
     while (*text)
     {
         char seg[124];
@@ -2968,18 +2970,28 @@ static void bcm_playback_probe(void)
         close(vfd);
     }
 
+    /* Run 8: mp_region (mode=yuv422i) made the VC dlopen passthruhandler.vll over VCFS -- 27 file
+       ops, each read done one 32-bit word at a time (the only proven-correct read path so far)
+       -- and that alone ran past the old 300-poll (~3s) budget, so "-2" there most likely means
+       "still working", not "rejected". Budget raised to 3000 (~30s worst case) for every command
+       from here on; bcm_host_service() keeps running and logging PDS/VCFS traffic throughout
+       regardless of what any single gencmd's own result says, so nothing is missed even if a
+       budget is still too short. */
     static const char * const modes[] = { "rgb565", "yuv422i" };
     for (i = 0; i < (int)(sizeof modes / sizeof modes[0]); i++) {
         char cmd[96];
         snprintf(cmd, sizeof cmd, "mp_region display=0 dest=fullscreen mode=%s", modes[i]);
-        r = bcm_gencmd(cmd, resp, sizeof resp, 300);
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd(cmd, resp, sizeof resp, 3000);
         bcm_log_text(cmd, r, resp);
     }
 
     bcm_pds_set_ops(&pds_probe_ops);
-    r = bcm_gencmd("mp_selectplay passthru:test 0", resp, sizeof resp, 300);
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd("mp_selectplay passthru:test 0", resp, sizeof resp, 3000);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
-    r = bcm_gencmd("mp_play", resp, sizeof resp, 300);
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd("mp_play", resp, sizeof resp, 3000);
     bcm_log_text("mp_play", r, resp);
 
     {
@@ -2988,9 +3000,11 @@ static void bcm_playback_probe(void)
     }
     BLOG("PDS probe: starts=%d frames=%d seeks=%d stops=%d", pds_probe_starts, pds_probe_frames, pds_probe_seeks, pds_probe_stops);
 
-    r = bcm_gencmd("mp_get_status", resp, sizeof resp, 300);
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd("mp_get_status", resp, sizeof resp, 3000);
     bcm_log_text("mp_get_status", r, resp);
-    r = bcm_gencmd("mp_stop", resp, sizeof resp, 300);
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd("mp_stop", resp, sizeof resp, 3000);
     bcm_log_text("mp_stop", r, resp);
 }
 
@@ -3034,7 +3048,6 @@ static void bcm_verify_upload(unsigned len)
     BLOG("upload verify: %u of %u KiB blocks differ from vmcs.bin", bad, total);
 }
 
-/* Log a multi-line gencmd reply, one short line per reply line. */
 static bool dbg_bcm_host(void)
 {
     static char resp[1536];
@@ -3050,7 +3063,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v8, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v9, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3111,6 +3124,7 @@ static bool dbg_bcm_host(void)
     bcm_host_set_trace(bcm_trace_cb);
     for (i = 0; i < (int)(sizeof cmds / sizeof cmds[0]); i++)
     {
+        bcm_cmd_t0 = current_tick;
         r = bcm_gencmd(cmds[i], resp, sizeof resp, 1000);
         bcm_log_text(cmds[i], r, resp);
     }
