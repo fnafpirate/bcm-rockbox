@@ -2963,12 +2963,16 @@ static void bcm_playback_probe(void)
     for (i = 0; i < r; i++) if (video[i] == '\r' || video[i] == '\n') { video[i] = 0; break; }
     BLOG("playback probe: test video = %s", video);
 
+    BLOG("opening test video from Rockbox...");    /* progress marker: if the log stops right
+                                                        after this line, the open() call itself
+                                                        is what hung or crashed */
     {   /* just confirm Rockbox itself can open it -- this file is NOT sent to the VC (PDS pulls
            frames from the host on demand; there is no file-open step on the VC side for video) */
         int vfd = open(video, O_RDONLY);
         if (vfd < 0) { BLOG("cannot open %s from Rockbox -- check the path", video); return; }
         close(vfd);
     }
+    BLOG("test video opened OK");
 
     /* Run 8: mp_region (mode=yuv422i) made the VC dlopen passthruhandler.vll over VCFS -- 27 file
        ops, each read done one 32-bit word at a time (the only proven-correct read path so far)
@@ -2981,15 +2985,18 @@ static void bcm_playback_probe(void)
     for (i = 0; i < (int)(sizeof modes / sizeof modes[0]); i++) {
         char cmd[96];
         snprintf(cmd, sizeof cmd, "mp_region display=0 dest=fullscreen mode=%s", modes[i]);
+        BLOG("sending: %s", cmd);
         bcm_cmd_t0 = current_tick;
         r = bcm_gencmd(cmd, resp, sizeof resp, 3000);
         bcm_log_text(cmd, r, resp);
     }
 
     bcm_pds_set_ops(&pds_probe_ops);
+    BLOG("sending: mp_selectplay passthru:test 0");
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd("mp_selectplay passthru:test 0", resp, sizeof resp, 3000);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
+    BLOG("sending: mp_play");
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd("mp_play", resp, sizeof resp, 3000);
     bcm_log_text("mp_play", r, resp);
@@ -3058,12 +3065,14 @@ static bool dbg_bcm_host(void)
     static const char * const cmds[] = {
         "version", "commands", "tasks", "set_vll_dir /Resources/VideoCore/Library",
         "load_application mplayer.vll",   /* the VC opens the library over VCFS (trace shows the paths) */
-        "commands",                       /* now lists the mp_* commands if the load worked */
-        "tasks"
+        "commands"                        /* now lists the mp_* commands if the load worked */
+        /* "tasks" removed here: it has timed out at the full 1000-poll (20s) budget in every run
+           so far with no diagnostic value, right after this same spot -- cause not found yet
+           (see report Session3 sections 20/21), not worth 20s of every future run until it is. */
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v9, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v10, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
