@@ -311,40 +311,17 @@ static uint32_t ring_read(struct hi_chan *c, uint8_t *dst, uint32_t len)
     return got;
 }
 
-/* Read exactly `total` bytes of a message body, waiting for the VC to write more when the message is
- * larger than the ring (seen on hardware: a 500-byte `commands` reply through a 0x200-byte ring).
- * Bytes beyond `cap` are consumed and dropped so the ring stays in sync. Returns 0 or -1 (timeout).
- * Called with the BCM I/O lock held. */
-static int ring_read_body(struct hi_chan *c, uint8_t *dst, uint32_t cap, uint32_t total)
-{
-    uint32_t got = 0;
-    int spins = 0;
-    uint8_t scratch[64];
-    while (got < total) {
-        uint32_t want = total - got, n;
-        if (got < cap) {
-            if (want > cap - got) want = cap - got;
-            n = ring_read(c, dst + got, want);
-        } else {
-            if (want > sizeof scratch) want = sizeof scratch;
-            n = ring_read(c, scratch, want);
-        }
-        if (n) {
-            got += n;
-            wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);      /* let the VC reuse the space */
-            spins = 0;
-            continue;
-        }
-        bcm_io_unlock();
-        bcm_io_idle();
-        bcm_io_lock();
-        c->rx_wr = rd16(hi.base + c->desc + D_RX_WR);
-        if (++spins > 500) return -1;                          /* ~5 s at sleep(1) */
-    }
-    return 0;
-}
-
-/* Pop one complete message. Returns 1 if a message was read, 0 if none. */
+/* Pop one complete message. Returns 1 if a message was read, 0 if none.
+ *
+ * v5 tried to WAIT for the rest of a message that did not fit the ring in one write (a plausible
+ * design, matching how the host's own hi_tx() waits for space). On real hardware this hung for
+ * ~5s and then desynchronised every later reply on the channel (session 3, run 5: `commands` and
+ * `set_vll_dir` both timed out, bad_magic=5). The VC does not appear to top a reply up after the
+ * fact -- it either fits or it does not -- so v6 does not wait: it takes whatever is in the ring
+ * right now and, if that is less than the header's declared length, delivers it as a truncated
+ * message (dropping the unwritten tail) rather than discarding it and stalling the caller. This
+ * matches the one known real case (a ~540-byte `commands` list through a 512-byte ring) and never
+ * blocks, so a genuinely bad header (bogus length) costs one truncated message, not a 5s hang. */
 static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 {
     bcm_io_lock();
@@ -354,22 +331,24 @@ static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 
     uint8_t hdr[HI_HDR];
     ring_read(c, hdr, HI_HDR);
-    wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
     if (ld32(hdr) != HI_MAGIC) {
         hi.st.bad_magic++;
+        wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
         bcm_io_unlock();
         return 0;
     }
     m->seq = ld32(hdr + 4);
     m->op  = ld32(hdr + 8);
-    m->len = ld16(hdr + 12);
-    uint32_t padded = ((uint32_t)m->len + 15u) & ~15u;
-    if (padded && ring_read_body(c, m->payload, sizeof m->payload, padded) < 0) {
-        hi.st.bad_magic++;                                /* incomplete message: give up on it */
-        bcm_io_unlock();
-        return 0;
+    uint32_t declared = ld16(hdr + 12);
+    uint32_t padded = (declared + 15u) & ~15u;
+    if (padded > sizeof m->payload) padded = (uint32_t)sizeof m->payload;   /* never overrun our buffer */
+    uint32_t got = padded ? ring_read(c, m->payload, padded) : 0;
+    if (got < padded) {
+        hi.st.truncated++;                                /* delivered short, not dropped -- see comment above */
+        memset(m->payload + got, 0, padded - got);
     }
-    wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);          /* publish host read pointer */
+    m->len = (uint16_t)(got < declared ? got : declared);
+    wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);          /* one publish, same place/timing as pre-v5 */
     bcm_io_unlock();
     hi.st.rx_msgs++;
     return 1;

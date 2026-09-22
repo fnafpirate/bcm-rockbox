@@ -103,7 +103,7 @@ enum { PDS_FLAG_FIRST = 0, PDS_FLAG_MIDDLE = 1, PDS_FLAG_WHOLE = 2, PDS_FLAG_LAS
 void bcm_host_set_trace(void (*fn)(const char *tag, uint32_t a, uint32_t b, const char *s));
 
 /* ---- diagnostics ---------------------------------------------------------------- */
-struct bcm_host_stats { uint32_t rx_msgs, tx_msgs, vcfs_ops, pds_ops, bad_magic, unknown_ops; };
+struct bcm_host_stats { uint32_t rx_msgs, tx_msgs, vcfs_ops, pds_ops, bad_magic, unknown_ops, truncated; };
 const struct bcm_host_stats *bcm_host_get_stats(void);
 
 #endif

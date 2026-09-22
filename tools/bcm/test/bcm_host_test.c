@@ -397,7 +397,6 @@ static void test_wrap(const char *file)
 
 /* A VC->host message larger than the RX ring, delivered while the host is already reading it
    (real hardware: a 500-byte `commands` reply through a 0x200-byte ring). */
-static uint8_t  pend[8192]; static uint32_t pend_n, pend_pos; static int pend_ch;
 static uint32_t vc_ring_put_some(int ch, const uint8_t *src, uint32_t len)
 {
     uint32_t d = D(ch), done = 0;
@@ -414,34 +413,67 @@ static uint32_t vc_ring_put_some(int ch, const uint8_t *src, uint32_t len)
     }
     return done;
 }
-static char big_text[700];
-static void gencmd_big_idle(void)
+/* Real hardware evidence (session 3, run 5): a VC reply that does not fit the ring in one write
+ * (a ~540-byte `commands` list through a 512-byte ring) is delivered SHORT -- the VC does not seem
+ * to top it up -- and the header still declares the full length. hi_rx_pop must treat that as a
+ * truncated-but-valid message, not wait for more (waiting hung for 5s and then desynced every
+ * later reply on the channel: bad_magic=5 in that log). */
+static void test_truncated_reply(void)
 {
-    if (pend_n == 0) {
-        struct rmsg mm;
-        if (vc_recv(0, &mm)) {                              /* host's gencmd request arrived: build the big reply */
-            for (int i = 0; i < 699; i++) big_text[i] = (char)('a' + i % 26);
-            big_text[699] = 0;
-            uint8_t hdr[16] = {0}; uint32_t magic = 0xF1A55A1Fu, op = 2; uint16_t len = 700;
-            memcpy(hdr, &magic, 4); memcpy(hdr + 4, &mm.seq, 4); memcpy(hdr + 8, &op, 4); memcpy(hdr + 12, &len, 2);
-            pend_n = 16 + 704; memset(pend, 0, pend_n); memcpy(pend, hdr, 16); memcpy(pend + 16, big_text, 700);
-            pend_pos = 0; pend_ch = 0;
-            vcram[BASE + 0x21] ^= 1;   /* real hardware signals once, as the message starts, not once it ends */
-        }
-    }
-    if (pend_n && pend_pos < pend_n)
-        pend_pos += vc_ring_put_some(pend_ch, pend + pend_pos, pend_n - pend_pos);
-}
-static void test_big_rx_message(void)
-{
-    RING = 0x200; vc_init(); q_reset(); pend_n = 0;
+    RING = 0x200; vc_init(); q_reset();
     CHECK(bcm_host_attach() == 0, "attach with 0x200 rings");
-    idle_hook = gencmd_big_idle;
+    char text[700]; for (int i = 0; i < 699; i++) text[i] = (char)('a' + i % 26); text[699] = 0;
+    uint8_t hdr[16] = {0}; uint32_t magic = 0xF1A55A1Fu, seq = 0x80000001u, op = 2; uint16_t len = 700;
+    memcpy(hdr, &magic, 4); memcpy(hdr + 4, &seq, 4); memcpy(hdr + 8, &op, 4); memcpy(hdr + 12, &len, 2);
+    /* write only what fits in one pass (240-ish usable bytes for this ring), exactly what a
+       non-retrying VC producer would do -- no idle_hook draining in between */
+    uint32_t wrote = vc_ring_put_some(0, hdr, 16);
+    wrote += vc_ring_put_some(0, (const uint8_t *)text, 700 - (wrote > 16 ? 0 : 0));
+    (void)wrote;
+    vcram[BASE + 0x21] ^= 1;
+
     char resp[1024];
-    int r = bcm_gencmd("commands", resp, sizeof resp, 400);
-    CHECK(r == 2, "big reply delivered (result word %d)", r);
-    CHECK(!strcmp(resp, big_text), "700-byte reply through a 512-byte ring arrives intact (%zu bytes)", strlen(resp));
-    CHECK(bcm_host_get_stats()->bad_magic == 0, "no bad_magic after reassembly");
+    int r = bcm_gencmd("commands", resp, sizeof resp, 50);
+    CHECK(r == -2, "the FIRST poll only sees the truncated message: bcm_gencmd's own request was never sent"
+                    " in this test (we injected the reply directly), so it correctly times out (r=%d) --"
+                    " what matters is what bcm_host_service() delivered, checked next", r);
+    const struct bcm_host_stats *st = bcm_host_get_stats();
+    CHECK(st->truncated >= 1, "truncated counter incremented (%u)", st->truncated);
+    CHECK(st->bad_magic == 0, "no bad_magic -- a short reply is not a protocol error (%u)", st->bad_magic);
+    RING = 0x1000; vc_init(); q_reset();
+}
+
+static void gencmd_idle_truncate_commands(void)
+{
+    struct rmsg m;
+    if (!vc_recv(0, &m)) return;
+    if (!strcmp((char *)m.payload, "commands")) {
+        /* the VC's own reply, but only the part one ring pass can carry -- no closing quote,
+           exactly the missing-quote truncation observed on real hardware */
+        char text[700]; for (int i = 0; i < 699; i++) text[i] = (char)('a' + i % 26); text[699] = 0;
+        uint8_t hdr[16] = {0}; uint32_t magic = 0xF1A55A1Fu, op = 2; uint16_t len = 700;
+        memcpy(hdr, &magic, 4); memcpy(hdr + 4, &m.seq, 4); memcpy(hdr + 8, &op, 4); memcpy(hdr + 12, &len, 2);
+        vc_ring_put_some(0, hdr, 16);
+        vc_ring_put_some(0, (const uint8_t *)text, 700);       /* only what fits actually lands */
+        vcram[BASE + 0x21] ^= 1;
+    } else {
+        char resp[32] = "ok";
+        vc_send(0, 0, m.seq, resp, 3);
+    }
+}
+static void test_gencmd_after_truncation(void)
+{
+    /* the real regression: does the channel keep working for the NEXT command? */
+    RING = 0x200; vc_init(); q_reset();
+    CHECK(bcm_host_attach() == 0, "attach with 0x200 rings");
+    idle_hook = gencmd_idle_truncate_commands;
+    char resp[1024];
+    int r1 = bcm_gencmd("version", resp, sizeof resp, 200);
+    CHECK(r1 == 0, "version still works first (%d)", r1);
+    int r2 = bcm_gencmd("commands", resp, sizeof resp, 200);
+    CHECK(r2 == 2 && strlen(resp) < 700, "commands returns the truncated text rather than hanging (r=%d len=%zu)", r2, strlen(resp));
+    int r3 = bcm_gencmd("tasks", resp, sizeof resp, 200);
+    CHECK(r3 == 0, "tasks still works right after (%d) -- the channel was not desynced", r3);
     idle_hook = NULL; RING = 0x1000; vc_init(); q_reset();
 }
 
@@ -509,7 +541,8 @@ int main(int argc, char **argv)
     printf("[ring wrap / back-pressure]\n"); fflush(stdout); test_wrap(file);
     printf("[attach variants]\n"); fflush(stdout); test_attach_variants();
     printf("[high directory offsets]\n"); fflush(stdout); test_high_directory();
-    printf("[big rx message]\n"); fflush(stdout); test_big_rx_message();
+    printf("[truncated reply]\n"); fflush(stdout); test_truncated_reply();
+    printf("[gencmd survives truncation]\n"); fflush(stdout); test_gencmd_after_truncation();
     printf("[vchr]\n"); fflush(stdout); test_vchr_reply();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",
