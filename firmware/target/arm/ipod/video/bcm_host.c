@@ -311,6 +311,39 @@ static uint32_t ring_read(struct hi_chan *c, uint8_t *dst, uint32_t len)
     return got;
 }
 
+/* Read exactly `total` bytes of a message body, waiting for the VC to write more when the message is
+ * larger than the ring (seen on hardware: a 500-byte `commands` reply through a 0x200-byte ring).
+ * Bytes beyond `cap` are consumed and dropped so the ring stays in sync. Returns 0 or -1 (timeout).
+ * Called with the BCM I/O lock held. */
+static int ring_read_body(struct hi_chan *c, uint8_t *dst, uint32_t cap, uint32_t total)
+{
+    uint32_t got = 0;
+    int spins = 0;
+    uint8_t scratch[64];
+    while (got < total) {
+        uint32_t want = total - got, n;
+        if (got < cap) {
+            if (want > cap - got) want = cap - got;
+            n = ring_read(c, dst + got, want);
+        } else {
+            if (want > sizeof scratch) want = sizeof scratch;
+            n = ring_read(c, scratch, want);
+        }
+        if (n) {
+            got += n;
+            wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);      /* let the VC reuse the space */
+            spins = 0;
+            continue;
+        }
+        bcm_io_unlock();
+        bcm_io_idle();
+        bcm_io_lock();
+        c->rx_wr = rd16(hi.base + c->desc + D_RX_WR);
+        if (++spins > 500) return -1;                          /* ~5 s at sleep(1) */
+    }
+    return 0;
+}
+
 /* Pop one complete message. Returns 1 if a message was read, 0 if none. */
 static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 {
@@ -321,9 +354,9 @@ static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 
     uint8_t hdr[HI_HDR];
     ring_read(c, hdr, HI_HDR);
+    wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
     if (ld32(hdr) != HI_MAGIC) {
         hi.st.bad_magic++;
-        wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
         bcm_io_unlock();
         return 0;
     }
@@ -331,8 +364,11 @@ static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
     m->op  = ld32(hdr + 8);
     m->len = ld16(hdr + 12);
     uint32_t padded = ((uint32_t)m->len + 15u) & ~15u;
-    if (padded > sizeof m->payload) padded = sizeof m->payload;   /* defensive */
-    if (padded) ring_read(c, m->payload, padded);
+    if (padded && ring_read_body(c, m->payload, sizeof m->payload, padded) < 0) {
+        hi.st.bad_magic++;                                /* incomplete message: give up on it */
+        bcm_io_unlock();
+        return 0;
+    }
     wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);          /* publish host read pointer */
     bcm_io_unlock();
     hi.st.rx_msgs++;
@@ -554,7 +590,16 @@ static void pds_dispatch(struct hi_chan *c, const struct hi_msg *m)
     memcpy(w, m->payload, m->len < 24 ? m->len : 24);
     hi.st.pds_ops++;
     hi.pds_last_seq = m->seq;                             /* echoed in later replies */
-    TRACE("pds op", m->op, w[1], NULL);
+    {   /* payload words as hex, for the log: the real values of the 0x41/0x42 fields are still unknown */
+        static const char dig[] = "0123456789abcdef";
+        char hx[64], *o = hx;
+        for (int i = 0; i < 6; i++) {
+            for (int k = 7; k >= 0; k--) *o++ = dig[(w[i] >> (4 * k)) & 15];
+            *o++ = ' ';
+        }
+        *o = 0;
+        TRACE("pds op", m->op, m->len, hx);
+    }
 
     switch (m->op) {
     case PDS_PING:                                        /* only opcode with an immediate reply */
@@ -616,7 +661,11 @@ void bcm_host_service(void)
             case CH_GENCMD: gencmd_rx(&m); break;
             case CH_VCFS:   vcfs_dispatch(c, &m); break;
             case CH_VCPD:   pds_dispatch(c, &m); break;
-            case CH_VCHR:                                 /* opcodes not decoded yet (rt 0xf9ca0) */
+            case CH_VCHR:                                 /* hostreq: stock op 0x46 calls a stub returning 0 and replies */
+                hi.st.unknown_ops++;
+                TRACE("vchr op", m.op, m.len, NULL);
+                if (m.op != 0x61) { uint32_t z = 0; reply(c, &m, 0, &z, 4); }
+                break;
             case CH_GRAPHICS:
             default:        hi.st.unknown_ops++;
                             TRACE(c->type == CH_VCHR ? "vchr op" : "chan op", m.op, m.len, NULL);

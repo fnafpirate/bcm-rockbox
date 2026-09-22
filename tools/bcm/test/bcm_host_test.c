@@ -395,6 +395,68 @@ static void test_wrap(const char *file)
     idle_hook = NULL;
 }
 
+/* A VC->host message larger than the RX ring, delivered while the host is already reading it
+   (real hardware: a 500-byte `commands` reply through a 0x200-byte ring). */
+static uint8_t  pend[8192]; static uint32_t pend_n, pend_pos; static int pend_ch;
+static uint32_t vc_ring_put_some(int ch, const uint8_t *src, uint32_t len)
+{
+    uint32_t d = D(ch), done = 0;
+    uint16_t st = g16(d + 0x0a), en = g16(d + 0x0c), rd = g16(d + 0x30), wr = g16(d + 0x40);
+    while (done < len) {
+        uint16_t lim = (st == rd) ? en : rd;
+        int32_t max = (int32_t)lim - 0x10, n;
+        if ((int32_t)wr > max) n = en - wr; else n = max - wr;
+        if (n <= 0) break;
+        if ((uint32_t)n > len - done) n = (int32_t)(len - done);
+        memcpy(vcram + BASE + wr, src + done, n);
+        wr += n; done += n; if (wr == en) wr = st;
+        s16(d + 0x40, wr);
+    }
+    return done;
+}
+static char big_text[700];
+static void gencmd_big_idle(void)
+{
+    if (pend_n == 0) {
+        struct rmsg mm;
+        if (vc_recv(0, &mm)) {                              /* host's gencmd request arrived: build the big reply */
+            for (int i = 0; i < 699; i++) big_text[i] = (char)('a' + i % 26);
+            big_text[699] = 0;
+            uint8_t hdr[16] = {0}; uint32_t magic = 0xF1A55A1Fu, op = 2; uint16_t len = 700;
+            memcpy(hdr, &magic, 4); memcpy(hdr + 4, &mm.seq, 4); memcpy(hdr + 8, &op, 4); memcpy(hdr + 12, &len, 2);
+            pend_n = 16 + 704; memset(pend, 0, pend_n); memcpy(pend, hdr, 16); memcpy(pend + 16, big_text, 700);
+            pend_pos = 0; pend_ch = 0;
+            vcram[BASE + 0x21] ^= 1;   /* real hardware signals once, as the message starts, not once it ends */
+        }
+    }
+    if (pend_n && pend_pos < pend_n)
+        pend_pos += vc_ring_put_some(pend_ch, pend + pend_pos, pend_n - pend_pos);
+}
+static void test_big_rx_message(void)
+{
+    RING = 0x200; vc_init(); q_reset(); pend_n = 0;
+    CHECK(bcm_host_attach() == 0, "attach with 0x200 rings");
+    idle_hook = gencmd_big_idle;
+    char resp[1024];
+    int r = bcm_gencmd("commands", resp, sizeof resp, 400);
+    CHECK(r == 2, "big reply delivered (result word %d)", r);
+    CHECK(!strcmp(resp, big_text), "700-byte reply through a 512-byte ring arrives intact (%zu bytes)", strlen(resp));
+    CHECK(bcm_host_get_stats()->bad_magic == 0, "no bad_magic after reassembly");
+    idle_hook = NULL; RING = 0x1000; vc_init(); q_reset();
+}
+
+static void test_vchr_reply(void)
+{
+    vc_init(); q_reset();
+    CHECK(bcm_host_attach() == 0, "attach");
+    uint8_t pl[16] = {0};
+    vc_send(3, 0x46, 0x80000abcu, pl, 4);                          /* type 6 = VCHR is directory index 3 */
+    bcm_host_service();
+    struct rmsg r;
+    CHECK(vc_recv(3, &r) && r.op == 0 && r.len == 4 && r.seq == 0x80000abcu, "VCHR op 0x46 is answered with result 0 and a 4-byte payload");
+    uint32_t z = 1; memcpy(&z, r.payload, 4); CHECK(z == 0, "payload is 0");
+}
+
 /* attach() must not depend on VC[0x1F8]==1, and must reject a nonsense info pointer ------------ */
 static void test_attach_variants(void)
 {
@@ -447,6 +509,8 @@ int main(int argc, char **argv)
     printf("[ring wrap / back-pressure]\n"); fflush(stdout); test_wrap(file);
     printf("[attach variants]\n"); fflush(stdout); test_attach_variants();
     printf("[high directory offsets]\n"); fflush(stdout); test_high_directory();
+    printf("[big rx message]\n"); fflush(stdout); test_big_rx_message();
+    printf("[vchr]\n"); fflush(stdout); test_vchr_reply();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",
            st->rx_msgs, st->tx_msgs, st->vcfs_ops, st->pds_ops, st->bad_magic, st->unknown_ops);

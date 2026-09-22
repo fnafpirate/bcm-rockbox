@@ -2964,7 +2964,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v4, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v5, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
