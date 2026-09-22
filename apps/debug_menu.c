@@ -2964,7 +2964,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v6, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v7, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3040,7 +3040,7 @@ static bool dbg_bcm_host(void)
         BLOG("rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u",
              (unsigned)st->rx_msgs, (unsigned)st->tx_msgs, (unsigned)st->vcfs_ops,
              (unsigned)st->pds_ops, (unsigned)st->bad_magic, (unsigned)st->unknown_ops);
-        BLOG("truncated=%u", (unsigned)st->truncated);
+        BLOG("truncated=%u resynced=%u", (unsigned)st->truncated, (unsigned)st->resynced);
     }
 
 out:

@@ -461,6 +461,34 @@ static void gencmd_idle_truncate_commands(void)
         vc_send(0, 0, m.seq, resp, 3);
     }
 }
+
+static void gencmd_idle_with_leading_junk(void)
+{
+    static int done = 0;
+    struct rmsg m;
+    if (!done && vc_recv(0, &m)) {
+        static const uint8_t junk[8] = { 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x99 };
+        vc_ring_put_some(0, junk, sizeof junk);          /* a few stray bytes ahead of the real reply */
+        char resp[32] = "version=Mar 10 2008 15:17:43";
+        vc_send(0, 0, m.seq, resp, (uint16_t)strlen(resp) + 1);
+        done = 1;
+    }
+}
+static void test_resync_after_stray_bytes(void)
+{
+    /* a handful of garbage bytes ahead of a good message (e.g. a late tail from an earlier
+       truncated write) must cost a few bytes, not the whole next message */
+    vc_init(); q_reset();
+    CHECK(bcm_host_attach() == 0, "attach");
+    idle_hook = gencmd_idle_with_leading_junk;
+    char resp[64];
+    int r = bcm_gencmd("version", resp, sizeof resp, 200);
+    CHECK(r == 0 && !strcmp(resp, "version=Mar 10 2008 15:17:43"), "reply recovered past 8 stray bytes (r=%d resp='%s')", r, resp);
+    CHECK(bcm_host_get_stats()->resynced >= 4, "resynced counter advanced (%u)", bcm_host_get_stats()->resynced);
+    CHECK(bcm_host_get_stats()->bad_magic == 0, "no bad_magic charged for a recoverable resync");
+    idle_hook = NULL; vc_init(); q_reset();
+}
+
 static void test_gencmd_after_truncation(void)
 {
     /* the real regression: does the channel keep working for the NEXT command? */
@@ -543,6 +571,7 @@ int main(int argc, char **argv)
     printf("[high directory offsets]\n"); fflush(stdout); test_high_directory();
     printf("[truncated reply]\n"); fflush(stdout); test_truncated_reply();
     printf("[gencmd survives truncation]\n"); fflush(stdout); test_gencmd_after_truncation();
+    printf("[resync after stray bytes]\n"); fflush(stdout); test_resync_after_stray_bytes();
     printf("[vchr]\n"); fflush(stdout); test_vchr_reply();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",

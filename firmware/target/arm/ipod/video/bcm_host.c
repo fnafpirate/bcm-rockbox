@@ -329,14 +329,27 @@ static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
     uint32_t avail = ring_used(c->rx_start, c->rx_end, c->rx_rd, c->rx_wr);
     if (avail < HI_HDR) { bcm_io_unlock(); return 0; }
 
+    /* On real hardware a truncated oversized reply can leave a few stray tail bytes that arrive
+     * just after our snapshot of `avail` (session 3, run 6: one bad_magic, right after a
+     * truncated 36-item `commands` list, then the next command timed out). Rather than dropping
+     * a whole message for a few garbage bytes, resync: scan up to 64 bytes (4-byte aligned) for
+     * the next magic word before giving up. */
     uint8_t hdr[HI_HDR];
     ring_read(c, hdr, HI_HDR);
-    if (ld32(hdr) != HI_MAGIC) {
-        hi.st.bad_magic++;
-        wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
-        bcm_io_unlock();
-        return 0;
+    int resynced = 0;
+    while (ld32(hdr) != HI_MAGIC) {
+        avail = ring_used(c->rx_start, c->rx_end, c->rx_rd, c->rx_wr);
+        if (resynced >= 64 || avail < 4) {
+            hi.st.bad_magic++;
+            wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
+            bcm_io_unlock();
+            return 0;
+        }
+        memmove(hdr, hdr + 4, HI_HDR - 4);
+        ring_read(c, hdr + HI_HDR - 4, 4);
+        resynced += 4;
     }
+    if (resynced) hi.st.resynced += resynced;
     m->seq = ld32(hdr + 4);
     m->op  = ld32(hdr + 8);
     uint32_t declared = ld16(hdr + 12);
