@@ -40,8 +40,21 @@ void bcm_host_service(void);
 
 /* Sends `cmd` (header opcode 1, payload = string incl. NUL) and waits for the reply with the
  * same sequence number. The reply text is copied to `resp`. Returns the header result word
- * (>=0) or <0 on timeout / not attached. `max_polls` bounds the wait. */
+ * (>=0) or <0 on timeout / not attached. `max_polls` bounds the wait; each poll calls
+ * bcm_host_service() then, if still waiting, bcm_io_idle() once. Implemented on top of
+ * bcm_gencmd_start()/bcm_gencmd_poll() below. */
 int  bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls);
+
+/* Split form of bcm_gencmd(), for callers that want to log progress (or do something else) while
+ * waiting instead of blocking silently. Only one gencmd request can be outstanding at a time.
+ *   bcm_gencmd_start(cmd)                 -- sends the request; returns 0, or <0 if not attached.
+ *   bcm_gencmd_poll(resp, resp_sz)        -- services the host interface once and checks for the
+ *                                             reply; returns the header result word if it has
+ *                                             arrived, or -3 if still waiting. Does not sleep.
+ * Typical use: bcm_gencmd_start(cmd); then loop calling bcm_gencmd_poll() with your own sleep and
+ * progress logging between calls until it returns something other than -3. */
+int  bcm_gencmd_start(const char *cmd);
+int  bcm_gencmd_poll(char *resp, size_t resp_sz);
 
 /* ---- channel 5: VCFS (VideoCore -> host file API, read-only) ------------------ */
 

@@ -489,6 +489,31 @@ static void test_resync_after_stray_bytes(void)
     idle_hook = NULL; vc_init(); q_reset();
 }
 
+
+static void test_gencmd_start_poll(void)
+{
+    /* the split API a slow command's caller uses to log heartbeats: gencmd_start() must not block,
+       and poll() must return -3 (still waiting) until the reply lands, then the real result once. */
+    vc_init(); q_reset();
+    CHECK(bcm_host_attach() == 0, "attach");
+    idle_hook = gencmd_idle;
+    CHECK(bcm_gencmd_start("version") == 0, "start returns immediately");
+    char resp[64];
+    int heartbeats = 0, r = -3;
+    for (int i = 0; i < 50 && r == -3; i++) {
+        r = bcm_gencmd_poll(resp, sizeof resp);
+        if (r == -3) { heartbeats++; gencmd_idle(); }
+    }
+    CHECK(r == 0 && !strcmp(resp, "version=Mar 10 2008 15:17:43"), "poll eventually returns the reply (r=%d resp='%s')", r, resp);
+    CHECK(heartbeats >= 1, "at least one -3 (still waiting) seen before completion (%d)", heartbeats);
+    int r2 = bcm_gencmd_poll(resp, sizeof resp);
+    CHECK(r2 == -1, "polling again with nothing outstanding returns -1 (%d)", r2);
+    /* old bcm_gencmd() must still work exactly as before, built on top of start/poll now */
+    int r3 = bcm_gencmd("version", resp, sizeof resp, 200);
+    CHECK(r3 == 0 && !strcmp(resp, "version=Mar 10 2008 15:17:43"), "bcm_gencmd() unaffected by the refactor (r=%d)", r3);
+    idle_hook = NULL; vc_init(); q_reset();
+}
+
 static void test_gencmd_after_truncation(void)
 {
     /* the real regression: does the channel keep working for the NEXT command? */
@@ -564,6 +589,7 @@ int main(int argc, char **argv)
     vc_init();
     CHECK(bcm_host_attach() == 0, "attach");
     printf("[gencmd]\n"); fflush(stdout); test_gencmd();
+    printf("[gencmd start/poll]\n"); fflush(stdout); test_gencmd_start_poll();
     printf("[vcfs]\n"); fflush(stdout); test_vcfs(file);
     printf("[pds]\n"); fflush(stdout); test_pds();
     printf("[ring wrap / back-pressure]\n"); fflush(stdout); test_wrap(file);

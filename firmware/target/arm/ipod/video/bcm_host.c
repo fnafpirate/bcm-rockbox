@@ -104,6 +104,7 @@ static struct {
     /* gencmd */
     bool     gc_wait;  uint32_t gc_seq;  bool gc_done;  int gc_result;
     char     *gc_resp; size_t gc_resp_sz;
+    uint32_t gc_pending_cmd_seq;   /* unused beyond bookkeeping; kept for future diagnostics */
     /* VCFS */
     char     vfs_root[96];
     int      vfs_fd[8];
@@ -368,21 +369,39 @@ static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 }
 
 /* ---------------------------------------------------------------- gencmd ------ */
-int bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls)
+int bcm_gencmd_start(const char *cmd)
 {
     struct hi_chan *c = chan_by_type(CH_GENCMD);
     if (!hi.attached || !c) return -1;
     c->seq = (c->seq + 1) & 0x7fffffffu;
     hi.gc_wait = true; hi.gc_done = false; hi.gc_seq = c->seq;
+    hi.gc_resp = NULL; hi.gc_resp_sz = 0;                 /* filled in by the first poll() call */
+    hi.gc_pending_cmd_seq = c->seq;
+    if (hi_tx(c, GENCMD_OPCODE, c->seq, cmd, (uint32_t)strlen(cmd) + 1) < 0) { hi.gc_wait = false; return -1; }
+    return 0;
+}
+
+int bcm_gencmd_poll(char *resp, size_t resp_sz)
+{
+    if (!hi.gc_wait) return -1;                           /* nothing outstanding */
     hi.gc_resp = resp; hi.gc_resp_sz = resp_sz;
     if (resp && resp_sz) resp[0] = 0;
-    if (hi_tx(c, GENCMD_OPCODE, c->seq, cmd, (uint32_t)strlen(cmd) + 1) < 0) { hi.gc_wait = false; return -1; }
-    for (int i = 0; i < max_polls && !hi.gc_done; i++) {
-        bcm_host_service();
-        if (!hi.gc_done) bcm_io_idle();
-    }
+    bcm_host_service();
+    if (!hi.gc_done) return -3;
     hi.gc_wait = false;
-    return hi.gc_done ? hi.gc_result : -2;
+    return hi.gc_result;
+}
+
+int bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls)
+{
+    if (bcm_gencmd_start(cmd) < 0) return -1;
+    int r = -3;
+    for (int i = 0; i < max_polls; i++) {
+        r = bcm_gencmd_poll(resp, resp_sz);
+        if (r != -3) break;
+        bcm_io_idle();
+    }
+    return r == -3 ? -2 : r;
 }
 
 static void gencmd_rx(const struct hi_msg *m)

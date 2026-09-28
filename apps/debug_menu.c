@@ -2892,6 +2892,29 @@ static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
 }
 
+/* Send one command and wait, logging a heartbeat every ~2s instead of going silent -- so a log
+   that stops mid-wait means the DEVICE stopped responding right then (a freeze), not just that
+   this particular command is slow. Never resends: one bcm_gencmd_start(), repeated
+   bcm_gencmd_poll() until it settles or max_secs elapses. */
+static int bcm_gencmd_watched(const char *cmd, char *resp, size_t resp_sz, int max_secs)
+{
+    BLOG("sending: %s", cmd);
+    if (bcm_gencmd_start(cmd) < 0) { BLOG("  (not attached)"); return -1; }
+    long t0 = current_tick, last_beat = t0;
+    int r = -3;
+    while (r == -3) {
+        r = bcm_gencmd_poll(resp, resp_sz);
+        if (r != -3) break;
+        if (current_tick - last_beat >= 2 * HZ) {
+            BLOG("  ...still waiting (%lds)", (current_tick - t0) / HZ);
+            last_beat = current_tick;
+        }
+        if (current_tick - t0 >= max_secs * HZ) { r = -2; break; }
+        sleep(HZ / 20);
+    }
+    return r;
+}
+
 static long bcm_cmd_t0;
 static void bcm_log_text(const char *cmd, int r, const char *text)
 {
@@ -2981,24 +3004,21 @@ static void bcm_playback_probe(void)
        from here on; bcm_host_service() keeps running and logging PDS/VCFS traffic throughout
        regardless of what any single gencmd's own result says, so nothing is missed even if a
        budget is still too short. */
-    static const char * const modes[] = { "rgb565", "yuv422i" };
-    for (i = 0; i < (int)(sizeof modes / sizeof modes[0]); i++) {
-        char cmd[96];
-        snprintf(cmd, sizeof cmd, "mp_region display=0 dest=fullscreen mode=%s", modes[i]);
-        BLOG("sending: %s", cmd);
-        bcm_cmd_t0 = current_tick;
-        r = bcm_gencmd(cmd, resp, sizeof resp, 3000);
-        bcm_log_text(cmd, r, resp);
-    }
+    /* rgb565 timed out at its full 30s budget with no logged VC activity at all in run 9, then the
+       device produced nothing further in run 10 right after this same command was sent -- either
+       still slow or a freeze, indistinguishable without a heartbeat, which run 10 did not have.
+       yuv422i is the one PROVEN to make progress (run 8: dlopen + PDS start within its window), so
+       try that alone first; rgb565 can be tried again once yuv422i's timing is characterised. */
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched("mp_region display=0 dest=fullscreen mode=yuv422i", resp, sizeof resp, 30);
+    bcm_log_text("mp_region display=0 dest=fullscreen mode=yuv422i", r, resp);
 
     bcm_pds_set_ops(&pds_probe_ops);
-    BLOG("sending: mp_selectplay passthru:test 0");
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd("mp_selectplay passthru:test 0", resp, sizeof resp, 3000);
+    r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, 30);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
-    BLOG("sending: mp_play");
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd("mp_play", resp, sizeof resp, 3000);
+    r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 30);
     bcm_log_text("mp_play", r, resp);
 
     {
@@ -3072,7 +3092,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v10, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v11, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
