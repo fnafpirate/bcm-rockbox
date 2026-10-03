@@ -2969,6 +2969,283 @@ static const struct bcm_pds_ops pds_probe_ops = {
    "rgb565" and "yuv422i" are real mode strings found in this vmcs.bin (0x1ccd80-ish); nothing
    else about the mp_region/mp_selectplay argument syntax has been confirmed on hardware yet, so
    this logs whatever gencmd replies come back, error or not. */
+/* v12: display bring-up probe. Stock ARM firmware never sends vmcs_display_enable; the only display
+   power/model command in the ARM image is "display_control <id> model=<1|2> power=<n>" (builder at rt
+   0x164e9c; model = 2 when the SysInfo hw word is 0x000b00xx with xx >= 0x10, i.e. 5.5G -- inference).
+   The display id (ctx+4) was NOT resolved, so try 0 then 1. Every reply (or error=... string) is logged.
+   Short 6s budget each: the VC answers display commands quickly or not at all. */
+static void bcm_display_probe(void)
+{
+    static const char * const dc[] = {
+        "display_control 0 model=2 power=1",
+        "display_control 1 model=2 power=1",
+        "display_control 0 model=1 power=1",
+    };
+    char resp[256];
+    int i, r;
+    for (i = 0; i < (int)(sizeof dc / sizeof dc[0]); i++)
+    {
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd_watched(dc[i], resp, sizeof resp, 6);
+        bcm_log_text(dc[i], r, resp);
+    }
+}
+
+/* ---- v13: minimal streaming MP4 (H.264) reader -------------------------------------------------
+   Nothing is loaded into RAM except what one frame needs: the sample/chunk/time tables are read
+   from the file on demand, so a 1-hour clip with 100k+ samples is fine. Output is H.264 *Annex B*
+   (00 00 00 01 start codes, SPS+PPS in front of the first frame and every IDR) because
+   h264dec.vll exports the JM-style GetAnnexbNALU/InterpretSPS/InterpretPPS -- i.e. it parses an
+   Annex-B byte stream, not MP4's length-prefixed samples. The PDS frame payload being raw Annex B
+   is therefore an inference from those symbols, not something seen on hardware yet. */
+#define M4_RAW_MAX 61440
+#define M4_OUT_MAX 65536
+#define FOURCC(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
+static uint8_t m4_raw[M4_RAW_MAX];
+static uint8_t m4_out[M4_OUT_MAX];
+static struct {
+    int fd;
+    uint32_t timescale, width, height;
+    uint8_t  profile, level, nal_len;
+    uint8_t  ps[512]; uint32_t ps_len;                  /* SPS+PPS, Annex B */
+    uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n;
+    bool     co64;
+    uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first;   /* sample cursor */
+    uint32_t stts_i, stts_left, stts_delta; uint64_t dts;
+} m4 = { .fd = -1 };
+
+static uint32_t m4_be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+static bool m4_rd(uint32_t off, void *buf, uint32_t n)
+{
+    if (lseek(m4.fd, (off_t)off, SEEK_SET) != (off_t)off) return false;
+    return read(m4.fd, buf, n) == (ssize_t)n;
+}
+static uint32_t m4_u32(uint32_t off) { uint8_t b[4]; return m4_rd(off, b, 4) ? m4_be32(b) : 0; }
+static uint32_t m4_u16(uint32_t off) { uint8_t b[2]; return m4_rd(off, b, 2) ? (uint32_t)((b[0]<<8)|b[1]) : 0; }
+static uint32_t m4_u8(uint32_t off)  { uint8_t b[1]; return m4_rd(off, b, 1) ? b[0] : 0; }
+
+/* iterate the boxes in [*pos,end): payload range returned via ps and pe; false when none left or malformed */
+static bool m4_box(uint32_t *pos, uint32_t end, uint32_t *type, uint32_t *ps, uint32_t *pe)
+{
+    uint8_t h[8]; uint32_t size, hdr = 8;
+    if (*pos + 8 > end || !m4_rd(*pos, h, 8)) return false;
+    size = m4_be32(h); *type = m4_be32(h + 4);
+    if (size == 1) { uint8_t e[8]; if (!m4_rd(*pos + 8, e, 8) || m4_be32(e)) return false; size = m4_be32(e + 4); hdr = 16; }
+    else if (size == 0) size = end - *pos;
+    if (size < hdr || size > end - *pos) return false;
+    *ps = *pos + hdr; *pe = *pos + size; *pos += size;
+    return true;
+}
+static bool m4_find(uint32_t s, uint32_t e, uint32_t want, uint32_t *cs, uint32_t *ce)
+{
+    uint32_t pos = s, t, a, b;
+    while (m4_box(&pos, e, &t, &a, &b)) if (t == want) { *cs = a; *ce = b; return true; }
+    return false;
+}
+
+static bool m4_trak(uint32_t ps, uint32_t pe)
+{
+    uint32_t ms, me, a, b, minf_s, minf_e, stbl_s, stbl_e, pos, t, s, e;
+    bool have_avc = false, have[5] = { false, false, false, false, false };
+    if (!m4_find(ps, pe, FOURCC('m','d','i','a'), &ms, &me)) return false;
+    if (!m4_find(ms, me, FOURCC('h','d','l','r'), &a, &b) || m4_u32(a + 8) != FOURCC('v','i','d','e')) return false;
+    if (!m4_find(ms, me, FOURCC('m','d','h','d'), &a, &b)) return false;
+    m4.timescale = m4_u8(a) == 1 ? m4_u32(a + 20) : m4_u32(a + 12);
+    if (!m4.timescale) return false;
+    if (!m4_find(ms, me, FOURCC('m','i','n','f'), &minf_s, &minf_e)) return false;
+    if (!m4_find(minf_s, minf_e, FOURCC('s','t','b','l'), &stbl_s, &stbl_e)) return false;
+    m4.co64 = false;
+    pos = stbl_s;
+    while (m4_box(&pos, stbl_e, &t, &s, &e))
+    {
+        if (t == FOURCC('s','t','s','d'))
+        {
+            uint32_t ent = s + 8, esz = m4_u32(ent), cs, ce;
+            if (m4_u32(ent + 4) != FOURCC('a','v','c','1') || esz < 86 + 8) return false;
+            m4.width = m4_u16(ent + 32); m4.height = m4_u16(ent + 34);
+            if (!m4_find(ent + 86, ent + esz, FOURCC('a','v','c','C'), &cs, &ce) || ce - cs < 7) return false;
+            m4.profile = (uint8_t)m4_u8(cs + 1); m4.level = (uint8_t)m4_u8(cs + 3);
+            m4.nal_len = (uint8_t)((m4_u8(cs + 4) & 3) + 1);
+            {   uint32_t p = cs + 6, i, n = m4_u8(cs + 5) & 0x1f; int pass;
+                m4.ps_len = 0;
+                for (pass = 0; pass < 2; pass++)
+                {
+                    if (pass == 1) { n = m4_u8(p); p++; }            /* PPS count */
+                    for (i = 0; i < n; i++)
+                    {
+                        uint32_t l = m4_u16(p); p += 2;
+                        if (m4.ps_len + 4 + l > sizeof m4.ps || p + l > ce) return false;
+                        m4.ps[m4.ps_len++] = 0; m4.ps[m4.ps_len++] = 0; m4.ps[m4.ps_len++] = 0; m4.ps[m4.ps_len++] = 1;
+                        if (!m4_rd(p, m4.ps + m4.ps_len, l)) return false;
+                        m4.ps_len += l; p += l;
+                    }
+                }
+            }
+            have_avc = true;
+        }
+        else if (t == FOURCC('s','t','t','s')) { m4.stts = s + 8; m4.stts_n = m4_u32(s + 4); have[0] = true; }
+        else if (t == FOURCC('s','t','s','c')) { m4.stsc = s + 8; m4.stsc_n = m4_u32(s + 4); have[1] = true; }
+        else if (t == FOURCC('s','t','s','z')) { m4.stsz_fixed = m4_u32(s + 4); m4.stsz_n = m4_u32(s + 8); m4.stsz = s + 12; have[2] = true; }
+        else if (t == FOURCC('s','t','c','o')) { m4.stco = s + 8; m4.stco_n = m4_u32(s + 4); m4.co64 = false; have[3] = true; }
+        else if (t == FOURCC('c','o','6','4')) { m4.stco = s + 8; m4.stco_n = m4_u32(s + 4); m4.co64 = true;  have[3] = true; }
+    }
+    have[4] = have_avc;
+    return have[0] && have[1] && have[2] && have[3] && have[4] && m4.stsz_n && m4.stts_n && m4.stsc_n && m4.stco_n;
+}
+
+static void m4_rewind(void)
+{
+    m4.idx = 0; m4.chunk = 1; m4.s_in_chunk = 0; m4.off_in_chunk = 0; m4.stsc_i = 0;
+    m4.spc = m4_u32(m4.stsc + 4); if (!m4.spc) m4.spc = 1;
+    m4.next_first = m4.stsc_n > 1 ? m4_u32(m4.stsc + 12) : 0xffffffffu;
+    m4.stts_i = 0; m4.stts_left = m4_u32(m4.stts); m4.stts_delta = m4_u32(m4.stts + 4); m4.dts = 0;
+}
+
+static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; }
+
+/* 0 = ok, <0 = reason */
+static int mp4_open(const char *path)
+{
+    uint32_t fsz, pos = 0, t, ps, pe, moov_s = 0, moov_e = 0;
+    off_t sz;
+    m4_close();
+    m4.fd = open(path, O_RDONLY);
+    if (m4.fd < 0) return -1;
+    sz = lseek(m4.fd, 0, SEEK_END);
+    if (sz <= 0) { m4_close(); return -2; }
+    fsz = (uint32_t)sz;
+    while (m4_box(&pos, fsz, &t, &ps, &pe)) if (t == FOURCC('m','o','o','v')) { moov_s = ps; moov_e = pe; break; }
+    if (!moov_e) { m4_close(); return -3; }
+    pos = moov_s;
+    while (m4_box(&pos, moov_e, &t, &ps, &pe))
+        if (t == FOURCC('t','r','a','k') && m4_trak(ps, pe)) { m4_rewind(); return 0; }
+    m4_close();
+    return -4;                                   /* no usable H.264 (avc1) video track */
+}
+
+/* Next video sample as Annex B in m4_out. Returns its length, 0 at end of stream, -1 for a sample
+   that was skipped (too big / unreadable -- cursor still advances so the caller can just retry). */
+static int m4_next(uint32_t *ts_ms, bool *key)
+{
+    uint32_t size, coff, off, p, o = 0, n, k;
+    bool idr = false, first = (m4.idx == 0);
+    if (m4.fd < 0 || m4.idx >= m4.stsz_n || m4.chunk > m4.stco_n) return 0;
+    size = m4.stsz_fixed ? m4.stsz_fixed : m4_u32(m4.stsz + 4 * m4.idx);
+    coff = m4.co64 ? m4_u32(m4.stco + 8 * (m4.chunk - 1) + 4) : m4_u32(m4.stco + 4 * (m4.chunk - 1));
+    off  = coff + m4.off_in_chunk;
+    *ts_ms = (uint32_t)(m4.dts * 1000ULL / m4.timescale);
+
+    m4.idx++; m4.off_in_chunk += size;                                   /* advance the cursors first */
+    if (++m4.s_in_chunk >= m4.spc)
+    {
+        m4.chunk++; m4.s_in_chunk = 0; m4.off_in_chunk = 0;
+        if (m4.chunk >= m4.next_first && m4.stsc_i + 1 < m4.stsc_n)
+        {
+            m4.stsc_i++; m4.spc = m4_u32(m4.stsc + 12 * m4.stsc_i + 4); if (!m4.spc) m4.spc = 1;
+            m4.next_first = m4.stsc_i + 1 < m4.stsc_n ? m4_u32(m4.stsc + 12 * (m4.stsc_i + 1)) : 0xffffffffu;
+        }
+    }
+    m4.dts += m4.stts_delta;
+    if (m4.stts_left && --m4.stts_left == 0 && m4.stts_i + 1 < m4.stts_n)
+    {
+        m4.stts_i++; m4.stts_left = m4_u32(m4.stts + 8 * m4.stts_i); m4.stts_delta = m4_u32(m4.stts + 8 * m4.stts_i + 4);
+    }
+
+    *key = false;
+    if (size == 0 || size > M4_RAW_MAX || !m4_rd(off, m4_raw, size)) return -1;
+    for (p = 0; p + m4.nal_len <= size; )                               /* pass 1: is there an IDR? */
+    {
+        n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | m4_raw[p + k];
+        if (n == 0 || p + m4.nal_len + n > size) break;
+        if ((m4_raw[p + m4.nal_len] & 0x1f) == 5) idr = true;
+        p += m4.nal_len + n;
+    }
+    if ((first || idr) && m4.ps_len) { memcpy(m4_out, m4.ps, m4.ps_len); o = m4.ps_len; }
+    for (p = 0; p + m4.nal_len <= size; )                               /* pass 2: length-prefixed -> Annex B */
+    {
+        n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | m4_raw[p + k];
+        if (n == 0 || p + m4.nal_len + n > size || o + 4 + n > M4_OUT_MAX) break;
+        m4_out[o++] = 0; m4_out[o++] = 0; m4_out[o++] = 0; m4_out[o++] = 1;
+        memcpy(m4_out + o, m4_raw + p + m4.nal_len, n); o += n;
+        p += m4.nal_len + n;
+    }
+    *key = idr;
+    return o ? (int)o : -1;
+}
+
+/* v13: PDS callbacks that really feed the test video. Stream/buffer mapping, the meaning of f2/f4/meta[]
+   and whether the VC wants Annex B are all UNVERIFIED (see bcm_host.h): everything the VC asks is
+   logged for the first frames so the next run can correct them. Video only -- audio (AAC) is NOT fed;
+   any request for a stream other than the video one is answered "nothing" (send_empty). */
+static int v_frames, v_bytes, v_getframes, v_empty, v_eos, v_seeks, v_skips;
+static bool v_stop, v_live;
+static long v_eos_tick;
+static void v_start(int id, uint32_t w1) { BLOG("  PDS start: stream=%d w1=%08x", id, (unsigned)w1); }
+static void v_get_frame(int id, uint32_t w1, uint32_t w2)
+{
+    uint32_t ts = 0; bool key = false; int n, tries = 0, want = (int)w2, r;
+    struct bcm_pds_frame f;
+    v_getframes++;
+    if (v_getframes <= 12)
+        BLOG("  PDS get_frame #%d: cur_stream=%d w1=%08x w2=%08x", v_getframes, id, (unsigned)w1, (unsigned)w2);
+    if (want != -1 && want != 0)                        /* not the video stream (assumed 0 or "any") */
+    {
+        v_empty++; bcm_pds_send_empty();
+        if (v_empty <= 4) BLOG("  -> not video (want=%d): sent empty", want);
+        return;
+    }
+    do { n = m4_next(&ts, &key); if (n < 0) v_skips++; } while (n < 0 && ++tries < 8);
+    if (n <= 0)
+    {
+        if (!v_eos) { BLOG("  end of stream after %d frames (%d bytes)", v_frames, v_bytes); v_eos_tick = current_tick; }
+        v_eos++; bcm_pds_send_empty();
+        return;
+    }
+    memset(&f, 0, sizeof f);
+    f.stream_id = (int16_t)(want == -1 ? id : want);
+    f.f4 = ts;                                          /* GUESS: timestamp, ms */
+    f.length = (uint32_t)n; f.data = m4_out;
+    r = bcm_pds_send_frame(&f);
+    v_frames++; v_bytes += n;
+    if (v_frames <= 12 || v_frames % 30 == 0 || r < 0)
+        BLOG("  frame #%d sample=%u len=%d key=%d ts=%ums send=%d", v_frames, (unsigned)m4.idx, n, key, (unsigned)ts, r);
+}
+static void v_seek(int id, uint32_t pos)
+{
+    v_seeks++;
+    BLOG("  PDS seek: stream=%d pos=%u -> %s", id, (unsigned)pos, pos == 0 ? "rewind" : "ignored (units unknown)");
+    if (pos == 0) m4_rewind();
+}
+static void v_stopcb(void) { BLOG("  PDS stop (frames sent so far: %d)", v_frames); v_stop = true; }
+static const struct bcm_pds_ops pds_video_ops = { v_start, v_get_frame, v_seek, v_stopcb };
+
+/* Service loop while the VC plays: ~100 Hz, status line every 2 s, mp_get_stats every 5 s. */
+static void bcm_video_run(int secs)
+{
+    long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
+    char resp[256];
+    while (TIME_BEFORE(current_tick, end) && !v_stop)
+    {
+        bcm_host_service();
+        if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
+        if (!TIME_BEFORE(current_tick, next_log))
+        {
+            BLOG("  video: get_frame=%d sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d",
+                 v_getframes, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips);
+            next_log += 2 * HZ;
+        }
+        if (!TIME_BEFORE(current_tick, next_stat))
+        {
+            int r;
+            bcm_cmd_t0 = current_tick;
+            r = bcm_gencmd_watched("mp_get_stats video", resp, sizeof resp, 1);
+            bcm_log_text("mp_get_stats video", r, resp);
+            next_stat += 5 * HZ;
+        }
+        sleep(HZ / 100);
+    }
+}
+
 static void bcm_playback_probe(void)
 {
     char resp[256], video[192];
@@ -3013,7 +3290,23 @@ static void bcm_playback_probe(void)
     r = bcm_gencmd_watched("mp_region display=0 dest=fullscreen mode=yuv422i", resp, sizeof resp, 30);
     bcm_log_text("mp_region display=0 dest=fullscreen mode=yuv422i", r, resp);
 
-    bcm_pds_set_ops(&pds_probe_ops);
+    {   int mr = mp4_open(video);
+        if (mr == 0)
+        {
+            BLOG("MP4 ok: %ux%u H.264 profile_idc=%u level_idc=%u nal_len=%u timescale=%u samples=%u SPS+PPS=%u B",
+                 (unsigned)m4.width, (unsigned)m4.height, m4.profile, m4.level, m4.nal_len,
+                 (unsigned)m4.timescale, (unsigned)m4.stsz_n, (unsigned)m4.ps_len);
+            if (m4.profile != 66)
+                BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
+            bcm_pds_set_ops(&pds_video_ops); v_live = true;
+            BLOG("REAL VIDEO FEED enabled (video stream only, no audio)");
+        }
+        else
+        {
+            BLOG("mp4_open failed (%d: -1 open, -2 empty, -3 no moov, -4 no avc1 track) -- empty-frame probe only", mr);
+            bcm_pds_set_ops(&pds_probe_ops);
+        }
+    }
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, 30);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
@@ -3021,6 +3314,13 @@ static void bcm_playback_probe(void)
     r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 30);
     bcm_log_text("mp_play", r, resp);
 
+    if (v_live)
+    {
+        bcm_video_run(45);                 /* v13: really play for up to 45 s (stops early on PDS stop / end of stream) */
+        BLOG("VIDEO RESULT: get_frame=%d frames_sent=%d bytes=%d empty=%d eos=%d stop=%d", v_getframes, v_frames, v_bytes, v_empty, v_eos, v_stop);
+        m4_close();
+    }
+    else
     {
         long end = current_tick + 8*HZ;
         while (TIME_BEFORE(current_tick, end)) { bcm_host_service(); sleep(HZ/100); }
@@ -3092,7 +3392,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v11, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v13, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3118,6 +3418,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
+    splash(HZ*2, "v13 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3172,8 +3473,12 @@ static bool dbg_bcm_host(void)
         BLOG("truncated=%u resynced=%u", (unsigned)st->truncated, (unsigned)st->resynced);
     }
 
+    bcm_display_probe();
+    splash(HZ*2, "v13 marker B: after display_control");
     bcm_playback_probe();
 
+    if (v_live)
+        splashf(HZ*3, "v13: sent %d video frames", v_frames);
 out:
     if (bcm_log_fd >= 0)
         close(bcm_log_fd);

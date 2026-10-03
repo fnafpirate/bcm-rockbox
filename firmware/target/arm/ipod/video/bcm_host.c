@@ -406,7 +406,14 @@ int bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls)
 
 static void gencmd_rx(const struct hi_msg *m)
 {
-    if (!hi.gc_wait || m->seq != hi.gc_seq) { TRACE("gencmd unsolicited", m->op, m->len, (const char *)m->payload); return; }
+    if (!hi.gc_wait || m->seq != hi.gc_seq)
+    {   /* v12: say WHICH case this is and show both seq numbers -- a reply whose seq differs from the
+         * one we sent would look exactly like "the VC never answered". Behaviour unchanged (still
+         * dropped); this only makes it visible in the log. */
+        TRACE(hi.gc_wait ? "gencmd STRAY while waiting: a=its seq b=our seq" : "gencmd STRAY while idle: a=its seq b=op",
+              m->seq, hi.gc_wait ? hi.gc_seq : m->op, (const char *)m->payload);
+        return;
+    }
     if (hi.gc_resp && hi.gc_resp_sz) {
         size_t n = m->len < hi.gc_resp_sz - 1 ? m->len : hi.gc_resp_sz - 1;
         memcpy(hi.gc_resp, m->payload, n);
