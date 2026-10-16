@@ -3218,9 +3218,12 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             si_count payload word 0 (stream count)                    f2  frame f2: 0, 1, or 2 = keyframe flag
             map     PDS buffer for the video stream (0 = A, stock; 1 = B)
             reply_ms delay before the 0x60 reply        skip_disp 1 = skip the display_control probe
-            sel_wait seconds to wait for the mp_selectplay reply */
+            sel_wait seconds to wait for the mp_selectplay reply
+            pm      1 = send "pm_set_policy min" like the stock firmware does before mp_selectplay / mp_play (default 1)
+            step    1 = pause after each phase until you press a button (so you can say after which one the screen changed) */
 static int cfg_si_ts = 1000, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
-static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 20;
+static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
+static int cfg_pm = 1, cfg_step = 0;
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3247,10 +3250,12 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "reply_ms")) cfg_reply_ms = v;
         else if (!strcmp(p, "skip_disp")) cfg_skip_disp = v;
         else if (!strcmp(p, "sel_wait")) cfg_sel_wait = v;
+        else if (!strcmp(p, "pm"))       cfg_pm = v;
+        else if (!strcmp(p, "step"))     cfg_step = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
-    BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d",
-         cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait);
+    BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d",
+         cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step);
 }
 
 #define SI_WORDS 0x148
@@ -3363,6 +3368,44 @@ static void bcm_video_run(int secs)
     }
 }
 
+/* v17: the stock firmware sends "pm_set_policy min" (rt 0x1b013c, called from the mp_selectplay builder at rt 0x1fa3f0
+   and the mp_play builder at rt 0x1f8ea0, and from the TV-out code) right before those commands; v16 never did. */
+static void bcm_pm_set(void)
+{
+    char resp[256]; int r;
+    if (!cfg_pm) return;
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched("pm_set_policy min", resp, sizeof resp, 3);
+    bcm_log_text("pm_set_policy min", r, resp);
+}
+static void bcm_pm_info(void)
+{
+    char resp[256]; int r;
+    if (!cfg_pm) return;
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched("power_management get_info", resp, sizeof resp, 3);
+    bcm_log_text("power_management get_info", r, resp);
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched("pm_get_status", resp, sizeof resp, 3);
+    bcm_log_text("pm_get_status", r, resp);
+}
+static void bcm_step(const char *name)
+{
+    long end = current_tick + 30 * HZ;
+    int b;
+    if (!cfg_step) return;
+    BLOG("STEP done: %s -- look at the screen, press any button to continue (30 s)", name);
+    while (TIME_BEFORE(current_tick, end))
+    {
+        bcm_host_service();
+        if (bcm_check_dead()) return;
+        b = button_get_w_tmo(HZ / 50);
+        if (b != BUTTON_NONE && !(b & BUTTON_REL))
+            break;
+    }
+    BLOG("STEP continue: %s", name);
+}
+
 static void bcm_playback_probe(void)
 {
     char resp[256], video[192];
@@ -3425,9 +3468,14 @@ static void bcm_playback_probe(void)
             bcm_pds_set_ops(&pds_probe_ops);
         }
     }
+    bcm_step("mp_region");
+    bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay */
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, cfg_sel_wait);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
+    bcm_cmd_t0 = current_tick;
+    bcm_step("mp_selectplay");
+    bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_play */
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 10);
     bcm_log_text("mp_play", r, resp);
@@ -3511,7 +3559,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v16, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v17, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
@@ -3538,7 +3586,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v16 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v17 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3593,14 +3641,19 @@ static bool dbg_bcm_host(void)
         BLOG("truncated=%u resynced=%u", (unsigned)st->truncated, (unsigned)st->resynced);
     }
 
+    bcm_step("vmcs + mplayer.vll loaded");
+    bcm_pm_set();
+    bcm_pm_info();
+    bcm_step("pm_set_policy min / pm info");
     if (!cfg_skip_disp)
         bcm_display_probe();
+    bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v16 marker B: after display_control");
+        splash(HZ*2, "v17 marker B: after display_control");
     bcm_playback_probe();
 
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v16: sent %d video frames", v_frames);
+        splashf(HZ*3, "v17: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen)
     {
