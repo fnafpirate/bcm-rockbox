@@ -343,6 +343,15 @@ static void test_pds(void)
     CHECK(bcm_pds_send_frame(&g) == 0, "small frame");
     expect_frame_reply(0x80000005u, 100, PDS_FLAG_WHOLE, B, frame, 1, g.meta);
 
+    /* v14: stream description (opcode 0x60, rt 0x288f40): 0x520-byte payload goes out on the VCPD ring unchanged */
+    {   static uint32_t si[0x148]; struct rmsg r;
+        for (int i = 0; i < 0x148; i++) si[i] = 0x1000u + (uint32_t)i;
+        CHECK(bcm_pds_send_stream_info(si, sizeof si) == 0, "send_stream_info");
+        CHECK(vc_recv(4, &r) && r.op == 0x60 && r.len == 0x520 && !memcmp(r.payload, si, sizeof si),
+              "stream info framing (op 0x60, len 0x520, payload intact)");
+        CHECK(bcm_pds_send_stream_info(si, 0x10000) < 0, "oversize stream info refused");
+    }
+
     /* "no frame" answer: 8-byte payload of zeros, opcode 0x61, seq of the last request */
     CHECK(bcm_pds_send_empty() == 0, "send_empty");
     { struct rmsg r; CHECK(vc_recv(4, &r) && r.op == 0x61 && r.len == 8 && r.seq == 0x80000005u, "empty reply framing");

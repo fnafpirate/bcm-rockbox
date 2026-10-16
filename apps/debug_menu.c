@@ -3173,6 +3173,41 @@ static int m4_next(uint32_t *ts_ms, bool *key)
     return o ? (int)o : -1;
 }
 
+/* v14: the opcode-0x60 stream description the stock firmware sends before playback (rt 0x288f40, serialiser
+   rt 0xc8770). 0x520 bytes = 328 words:
+     w0  stream count            w1  [r4+0xc] (unknown; 0 here)     w2..w6  constants 1,0,1,1,0     w7 unused
+     w8.. one block per stream:  type (0 audio / 1 video), codec fourcc ('H264' = 0x48323634, 'MPG4' =
+          0x4d504734, 'AAC\0' = 0x414143, 'MP3\0' = 0x4d5033), word, word, N (= extradata bytes), N words
+          (one byte each), word, word, byte, byte, key-bits, 32 words key, 16 words IV, word.
+   KNOWN from disassembly: positions, type/codec words, the AES key/IV fields (zero = unencrypted).
+   GUESSED: the "word" after the fourcc (I send 1000 = timescale, and f4 timestamps are in ms to match),
+   and the two words after the extradata (I send width, height). All logged so a run can correct them. */
+#define SI_WORDS 0x148
+static uint32_t si_words[SI_WORDS];
+static int bcm_send_stream_info(void)
+{
+    uint32_t i = 8;
+    memset(si_words, 0, sizeof si_words);
+    si_words[0] = 1;                                   /* one stream in the file */
+    si_words[2] = 1; si_words[4] = 1; si_words[5] = 1; /* constants written by rt 0x288f40 (w3 = w6 = 0) */
+    si_words[i++] = 1;                                 /* type: 1 = video */
+    si_words[i++] = 0x48323634;                        /* 'H264' */
+    si_words[i++] = 1000;                              /* GUESS: timescale */
+    si_words[i++] = 0;
+    si_words[i++] = 0;                                 /* N = 0 extradata bytes (Annex B carries SPS/PPS inline) */
+    si_words[i++] = m4.width;                          /* GUESS */
+    si_words[i++] = m4.height;                         /* GUESS */
+    si_words[i++] = 1;                                 /* byte [s+0x20] (the stock code always writes 1) */
+    si_words[i++] = 0;                                 /* byte [s+0x21]: 2 only when AES-encrypted */
+    si_words[i++] = 0;                                 /* key bits (0 = none) */
+    i += 32 + 16;                                      /* key + IV, zero */
+    si_words[i++] = 0;
+    BLOG("stream info (0x60): %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
+         (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
+         (unsigned)si_words[12], (unsigned)si_words[13], (unsigned)si_words[14]);
+    return bcm_pds_send_stream_info(si_words, sizeof si_words);
+}
+
 /* v13: PDS callbacks that really feed the test video. Stream/buffer mapping, the meaning of f2/f4/meta[]
    and whether the VC wants Annex B are all UNVERIFIED (see bcm_host.h): everything the VC asks is
    logged for the first frames so the next run can correct them. Video only -- audio (AAC) is NOT fed;
@@ -3202,8 +3237,10 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
         return;
     }
     memset(&f, 0, sizeof f);
-    f.stream_id = (int16_t)(want == -1 ? id : want);
-    f.f4 = ts;                                          /* GUESS: timestamp, ms */
+    (void)id;                                           /* v14: `id` is the object id string from the 0x41 message, NOT a stream id */
+    f.stream_id = 0;                                    /* video-only file: video is stream 0 (ids count accepted streams in file order) */
+    f.f2 = key ? 1 : 0;                                 /* GUESS: stock passes a per-sample word here for video (1 for audio) */
+    f.f4 = ts;                                          /* timestamp, ms -- matches the timescale (1000) sent in the 0x60 message */
     f.length = (uint32_t)n; f.data = m4_out;
     r = bcm_pds_send_frame(&f);
     v_frames++; v_bytes += n;
@@ -3299,6 +3336,8 @@ static void bcm_playback_probe(void)
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
+            bcm_pds_map_stream(0, 1);                       /* v14: stock maps type 1 (video) -> buffer B (rt 0x288f40/0x288c14) */
+            BLOG("stream info send = %d", bcm_send_stream_info());
             BLOG("REAL VIDEO FEED enabled (video stream only, no audio)");
         }
         else
@@ -3392,7 +3431,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v13, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v14, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3418,7 +3457,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v13 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v14 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3474,11 +3513,11 @@ static bool dbg_bcm_host(void)
     }
 
     bcm_display_probe();
-    splash(HZ*2, "v13 marker B: after display_control");
+    splash(HZ*2, "v14 marker B: after display_control");
     bcm_playback_probe();
 
     if (v_live)
-        splashf(HZ*3, "v13: sent %d video frames", v_frames);
+        splashf(HZ*3, "v14: sent %d video frames", v_frames);
 out:
     if (bcm_log_fd >= 0)
         close(bcm_log_fd);

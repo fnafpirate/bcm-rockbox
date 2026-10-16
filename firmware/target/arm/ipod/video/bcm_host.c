@@ -78,6 +78,7 @@
 #define PDS_GET_FRAME     0x42
 #define PDS_SEEK          0x43
 #define PDS_STOP          0x44
+#define PDS_STREAM_INFO   0x60                /* ARM->VC stream description, built at rt 0x288f40 (header len 0x520) */
 #define PDS_FRAME_REPLY   0x61                /* rt 0x288e.. : header opcode of the 12-word reply */
 
 struct hi_chan {
@@ -592,6 +593,17 @@ int bcm_pds_send_frame(const struct bcm_pds_frame *f)
     hi.pds_pend[b].sent = 0;
     hi.pds_pend[b].active = true;
     return pds_send_chunk(b);
+}
+
+/* rt 0x288f40: before playback the stock firmware sends ONE message on the VCPD ring: header
+ * (magic, seq, op 0x60, len 0x520) + a 0x520-byte payload describing the streams (type, codec fourcc,
+ * extradata, dimensions, AES key/IV). seq is the host's own running counter (the stock value comes
+ * from a counter at rt 0x10833c84 whose origin is unknown). */
+int bcm_pds_send_stream_info(const uint32_t *words, uint32_t len)
+{
+    struct hi_chan *c = chan_by_type(CH_VCPD);
+    if (!hi.attached || !c || len > HI_MAX_PAYLOAD) return -1;
+    return hi_tx(c, PDS_STREAM_INFO, c->seq++, words, len);
 }
 
 int bcm_pds_send_empty(void)
