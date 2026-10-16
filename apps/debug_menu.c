@@ -2866,6 +2866,7 @@ extern void bcm_io_lock(void);
 extern void bcm_io_unlock(void);
 extern void bcm_io_read(unsigned vc_addr, void *dst, unsigned len);
 extern int  bcm_use_vmcs_image(const void *img, unsigned len);
+extern int  bcm_io_dead(void);        /* v16: host bus wait timed out -> the VC stopped answering */
 extern unsigned bcm_get_boot_info(unsigned snap[4]);
 
 #define BCM_VC_ROOT    "/.rockbox/vc"
@@ -2876,17 +2877,44 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
 static int bcm_log_fd = -1;
 
+static long bcm_t_start;
+static char bcm_last_line[72];
+static long bcm_last_tick;
 static void bcm_logline(const char *s, int n)
 {
+    char b[200], t[160];
+    long e;
+    int m;
     if (bcm_log_fd < 0 || n <= 0)
         return;
-    write(bcm_log_fd, s, n < 159 ? n : 159);
-    write(bcm_log_fd, "\n", 1);
+    if (n > 159) n = 159;
+    memcpy(t, s, n); t[n] = 0;
+    e = current_tick - bcm_t_start;
+    m = snprintf(b, sizeof b, "[%3ld.%02ld] %s\n", e / HZ, e % HZ, t);   /* v16: seconds since the test started */
+    write(bcm_log_fd, b, m);
     fsync(bcm_log_fd);                 /* keep the log even if the VideoCore hangs and we must hard-reset */
+    memcpy(bcm_last_line, t, sizeof bcm_last_line - 1); bcm_last_line[sizeof bcm_last_line - 1] = 0;
+    bcm_last_tick = current_tick;
 }
 #define BLOG(...) do { char _b[160]; int _n = snprintf(_b, sizeof _b, __VA_ARGS__); \
                        bcm_logline(_b, _n); } while (0)
 
+static bool bcm_dead_seen;
+static bool bcm_check_dead(void)
+{
+    int d = bcm_io_dead();
+    char last[72]; long ms;
+    if (!d) return false;
+    if (!bcm_dead_seen)
+    {
+        bcm_dead_seen = true;
+        memcpy(last, bcm_last_line, sizeof last);
+        ms = (current_tick - bcm_last_tick) * 1000 / HZ;
+        BLOG("VC BUS DEAD (code %d: 1 write-ready, 2 read-addr, 3 read-ready): no answer %ld ms after the last log line:", d, ms);
+        BLOG("  last line was: %s", last);
+    }
+    return true;
+}
 static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
 {
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
@@ -2904,6 +2932,7 @@ static int bcm_gencmd_watched(const char *cmd, char *resp, size_t resp_sz, int m
     int r = -3;
     while (r == -3) {
         r = bcm_gencmd_poll(resp, resp_sz);
+        if (bcm_check_dead()) { r = -5; break; }
         if (r != -3) break;
         if (current_tick - last_beat >= 2 * HZ) {
             BLOG("  ...still waiting (%lds)", (current_tick - t0) / HZ);
@@ -3182,26 +3211,69 @@ static int m4_next(uint32_t *ts_ms, bool *key)
    KNOWN from disassembly: positions, type/codec words, the AES key/IV fields (zero = unencrypted).
    GUESSED: the "word" after the fourcc (I send 1000 = timescale, and f4 timestamps are in ms to match),
    and the two words after the extradata (I send width, height). All logged so a run can correct them. */
+/* v16: optional /.rockbox/bcm_test.cfg, "key=value" per line, so the GUESSED fields can be varied without a
+   rebuild.  si_ts   word after the fourcc in the 0x60 block (default 1000, timestamps are sent in ms)
+            si_dim  1 = send width/height in the 0x60 block, 0 = zeros
+            si_w1   payload word 1 of 0x60 ([this+0xc], unknown)      si_last  last block word ([s+0x58])
+            si_count payload word 0 (stream count)                    f2  frame f2: 0, 1, or 2 = keyframe flag
+            map     PDS buffer for the video stream (0 = A, stock; 1 = B)
+            reply_ms delay before the 0x60 reply        skip_disp 1 = skip the display_control probe
+            sel_wait seconds to wait for the mp_selectplay reply */
+static int cfg_si_ts = 1000, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
+static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 20;
+static void bcm_load_cfg(void)
+{
+    char buf[512], *p, *nl, *eq;
+    int fd = open("/.rockbox/bcm_test.cfg", O_RDONLY), n, v;
+    if (fd < 0) { BLOG("no /.rockbox/bcm_test.cfg -- defaults"); return; }
+    n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    for (p = buf; p && *p; p = nl ? nl + 1 : NULL)
+    {
+        nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        eq = strchr(p, '=');
+        if (!eq || p[0] == '#') continue;
+        *eq = 0; v = atoi(eq + 1);
+        if      (!strcmp(p, "si_ts"))    cfg_si_ts = v;
+        else if (!strcmp(p, "si_dim"))   cfg_si_dim = v;
+        else if (!strcmp(p, "si_w1"))    cfg_si_w1 = v;
+        else if (!strcmp(p, "si_last"))  cfg_si_last = v;
+        else if (!strcmp(p, "si_count")) cfg_si_count = v;
+        else if (!strcmp(p, "f2"))       cfg_f2 = v;
+        else if (!strcmp(p, "map"))      cfg_map = v;
+        else if (!strcmp(p, "reply_ms")) cfg_reply_ms = v;
+        else if (!strcmp(p, "skip_disp")) cfg_skip_disp = v;
+        else if (!strcmp(p, "sel_wait")) cfg_sel_wait = v;
+        else BLOG("cfg: unknown key '%s'", p);
+    }
+    BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d",
+         cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait);
+}
+
 #define SI_WORDS 0x148
 static uint32_t si_words[SI_WORDS];
 static int bcm_send_stream_info(void)
 {
     uint32_t i = 8;
     memset(si_words, 0, sizeof si_words);
-    si_words[0] = 1;                                   /* one stream in the file */
+    si_words[0] = (uint32_t)cfg_si_count;              /* stream count */
+    si_words[1] = (uint32_t)cfg_si_w1;
     si_words[2] = 1; si_words[4] = 1; si_words[5] = 1; /* constants written by rt 0x288f40 (w3 = w6 = 0) */
     si_words[i++] = 1;                                 /* type: 1 = video */
     si_words[i++] = 0x48323634;                        /* 'H264' */
-    si_words[i++] = 1000;                              /* GUESS: timescale */
+    si_words[i++] = (uint32_t)cfg_si_ts;                /* GUESS: timescale */
     si_words[i++] = 0;
     si_words[i++] = 0;                                 /* N = 0 extradata bytes (Annex B carries SPS/PPS inline) */
-    si_words[i++] = m4.width;                          /* GUESS */
-    si_words[i++] = m4.height;                         /* GUESS */
+    si_words[i++] = cfg_si_dim ? m4.width : 0;         /* GUESS */
+    si_words[i++] = cfg_si_dim ? m4.height : 0;        /* GUESS */
     si_words[i++] = 1;                                 /* byte [s+0x20] (the stock code always writes 1) */
     si_words[i++] = 0;                                 /* byte [s+0x21]: 2 only when AES-encrypted */
     si_words[i++] = 0;                                 /* key bits (0 = none) */
     i += 32 + 16;                                      /* key + IV, zero */
-    si_words[i++] = 0;
+    si_words[i++] = (uint32_t)cfg_si_last;
     BLOG("stream info (0x60): %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
          (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
          (unsigned)si_words[12], (unsigned)si_words[13], (unsigned)si_words[14]);
@@ -3219,6 +3291,7 @@ static void v_start(int id, uint32_t w1)
 {
     BLOG("  PDS start: object=%d w1=%08x", id, (unsigned)w1);
     m4_rewind();
+    if (cfg_reply_ms > 0) sleep(cfg_reply_ms * HZ / 1000 ? cfg_reply_ms * HZ / 1000 : 1);
     /* v15: the 0x60 stream description is the REPLY to this 0x41 (seq echoed) -- the VC waits for it. */
     BLOG("  0x60 stream-info reply sent = %d", bcm_send_stream_info());
 }
@@ -3245,7 +3318,7 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     memset(&f, 0, sizeof f);
     (void)id;                                           /* v14: `id` is the object id string from the 0x41 message, NOT a stream id */
     f.stream_id = 0;                                    /* video-only file: video is stream 0 (ids count accepted streams in file order) */
-    f.f2 = key ? 1 : 0;                                 /* GUESS: stock passes a per-sample word here for video (1 for audio) */
+    f.f2 = cfg_f2 == 2 ? (key ? 1 : 0) : (uint16_t)cfg_f2;                                 /* GUESS: stock passes a per-sample word here for video (1 for audio) */
     f.f4 = ts;                                          /* timestamp, ms -- matches the timescale (1000) sent in the 0x60 message */
     f.length = (uint32_t)n; f.data = m4_out;
     r = bcm_pds_send_frame(&f);
@@ -3270,6 +3343,7 @@ static void bcm_video_run(int secs)
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
+        if (bcm_check_dead()) break;
         if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
         if (!TIME_BEFORE(current_tick, next_log))
         {
@@ -3342,7 +3416,7 @@ static void bcm_playback_probe(void)
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
-            bcm_pds_map_stream(0, 0);                       /* v15: type 1 (video) -> buffer A (cap 0x10000); audio would be B */
+            bcm_pds_map_stream(0, cfg_map);                 /* type 1 (video) -> buffer A (cap 0x10000, stock); audio would be B */
             BLOG("REAL VIDEO FEED enabled (video stream only, no audio)");
         }
         else
@@ -3352,7 +3426,7 @@ static void bcm_playback_probe(void)
         }
     }
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, 20);
+    r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, cfg_sel_wait);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 10);
@@ -3436,7 +3510,9 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v15, built %s %s", __DATE__, __TIME__);
+    bcm_t_start = current_tick;
+    BLOG("bcm host test v16, built %s %s", __DATE__, __TIME__);
+    bcm_load_cfg();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3462,7 +3538,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v15 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v16 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3517,13 +3593,23 @@ static bool dbg_bcm_host(void)
         BLOG("truncated=%u resynced=%u", (unsigned)st->truncated, (unsigned)st->resynced);
     }
 
-    bcm_display_probe();
-    splash(HZ*2, "v15 marker B: after display_control");
+    if (!cfg_skip_disp)
+        bcm_display_probe();
+    if (!bcm_check_dead())
+        splash(HZ*2, "v16 marker B: after display_control");
     bcm_playback_probe();
 
-    if (v_live)
-        splashf(HZ*3, "v15: sent %d video frames", v_frames);
+    if (v_live && !bcm_check_dead())
+        splashf(HZ*3, "v16: sent %d video frames", v_frames);
 out:
+    if (bcm_dead_seen)
+    {
+        /* The LCD code spins forever on a dead BCM, so do NOT touch it: save the log and reboot cleanly. */
+        BLOG("VC dead -- log saved, rebooting the iPod");
+        if (bcm_log_fd >= 0) close(bcm_log_fd);
+        bcm_log_fd = -1;
+        system_reboot();
+    }
     if (bcm_log_fd >= 0)
         close(bcm_log_fd);
     bcm_log_fd = -1;

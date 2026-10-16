@@ -24,6 +24,8 @@ void bcm_io_unlock(void);
 void bcm_io_read(uint32_t vc_addr, void *dst, size_t len);
 void bcm_io_write(uint32_t vc_addr, const void *src, size_t len);
 void bcm_io_doorbell(void); /* BCM_CONTROL = 0x31 */
+int  bcm_io_dead(void);     /* nonzero once a host bus wait timed out (VC not answering): 1 write-ready, 2 read-addr, 3 read-ready.
+                               All later bcm_io_read/write calls return at once (reads give 0xffffffff) instead of spinning forever. */
 void bcm_io_idle(void);     /* called while waiting; sleep(1) on target, so poll counts are ~10 ms units */
 
 /* Target only (lcd-video.c): replace the VideoCore OS image and power-cycle the BCM so that it

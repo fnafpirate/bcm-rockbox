@@ -347,6 +347,27 @@ void bcm_io_unlock(void)
     BCM_IO_UNLOCK();
 }
 
+/* v16: bounded variants of the bus waits for the host interface. The LCD code keeps its own unbounded
+   loops; these only exist so a VideoCore that stops answering ends the test with a log instead of a frozen iPod. */
+#define BCM_IO_SPIN 1500000            /* iterations; normal waits are microseconds */
+static volatile int bcm_io_bad;
+static inline bool bcm_io_wr_ready(void)
+{
+    unsigned n = BCM_IO_SPIN;
+    while (!(BCM_CONTROL & 0x2)) if (--n == 0) { bcm_io_bad = 1; return false; }
+    return true;
+}
+static unsigned bcm_io_read32(unsigned address)
+{
+    unsigned n = BCM_IO_SPIN;
+    while (!(BCM_RD_ADDR & 1)) if (--n == 0) { bcm_io_bad = 2; return 0xffffffffu; }
+    BCM_RD_ADDR32 = address;
+    n = BCM_IO_SPIN;
+    while (!(BCM_CONTROL & 0x10)) if (--n == 0) { bcm_io_bad = 3; return 0xffffffffu; }
+    return BCM_DATA32;
+}
+int bcm_io_dead(void) { return bcm_io_bad; }
+
 /* 32-bit aligned VC addresses and lengths only.  memcpy() keeps unaligned RAM buffers safe on
    the ARM7-class core; the compiler turns it into plain loads/stores when the buffer is aligned. */
 void bcm_io_read(unsigned vc_addr, void *dst, unsigned len)
@@ -355,7 +376,7 @@ void bcm_io_read(unsigned vc_addr, void *dst, unsigned len)
     unsigned i;
     for (i = 0; i < len; i += 4)
     {
-        unsigned v = bcm_read32(vc_addr + i);
+        unsigned v = bcm_io_bad ? 0xffffffffu : bcm_io_read32(vc_addr + i);
         memcpy(d + i, &v, 4);
     }
 }
@@ -364,9 +385,11 @@ void bcm_io_write(unsigned vc_addr, const void *src, unsigned len)
 {
     const unsigned char *s = (const unsigned char *)src;
     unsigned i;
-    if (len == 0)
+    if (len == 0 || bcm_io_bad)
         return;
-    bcm_write_addr(vc_addr);          /* latch once; the destination auto-increments */
+    BCM_WR_ADDR32 = vc_addr;          /* latch once; the destination auto-increments */
+    if (!bcm_io_wr_ready())
+        return;
     for (i = 0; i < len; i += 4)
     {
         unsigned v;

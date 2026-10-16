@@ -384,6 +384,7 @@ int bcm_gencmd_start(const char *cmd)
 
 int bcm_gencmd_poll(char *resp, size_t resp_sz)
 {
+    if (bcm_io_dead()) return -5;                    /* v16: VC bus stopped answering */
     if (!hi.gc_wait) return -1;                           /* nothing outstanding */
     hi.gc_resp = resp; hi.gc_resp_sz = resp_sz;
     if (resp && resp_sz) resp[0] = 0;
@@ -668,6 +669,7 @@ static void pds_dispatch(struct hi_chan *c, const struct hi_msg *m)
 /* --------------------------------------------------------------- service ------ */
 void bcm_host_service(void)
 {
+    if (bcm_io_dead()) return;
     if (!hi.attached) return;
 
     bcm_io_lock();

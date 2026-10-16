@@ -29,6 +29,8 @@ static int fails, checks;
 void bcm_io_lock(void) {}
 void bcm_io_unlock(void) {}
 void bcm_io_doorbell(void) { doorbells++; }
+static int mock_dead;
+int bcm_io_dead(void) { return mock_dead; }
 void bcm_io_idle(void) { if (idle_hook) idle_hook(); }
 void bcm_io_read(uint32_t a, void *d, size_t n)  { if ((a | n) & 3) { printf("BAD unaligned read %x/%zu\n", a, n); exit(2); }
     if ((uint64_t)a + n > sizeof vcram) { memset(d, 0xFF, n); return; }   /* unmapped VC address reads as ones */
