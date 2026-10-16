@@ -349,6 +349,7 @@ static void test_pds(void)
         CHECK(bcm_pds_send_stream_info(si, sizeof si) == 0, "send_stream_info");
         CHECK(vc_recv(4, &r) && r.op == 0x60 && r.len == 0x520 && !memcmp(r.payload, si, sizeof si),
               "stream info framing (op 0x60, len 0x520, payload intact)");
+        CHECK(r.seq == 0x80000005u, "stream info echoes the last PDS request's seq (got %08x)", r.seq);
         CHECK(bcm_pds_send_stream_info(si, 0x10000) < 0, "oversize stream info refused");
     }
 

@@ -78,7 +78,7 @@
 #define PDS_GET_FRAME     0x42
 #define PDS_SEEK          0x43
 #define PDS_STOP          0x44
-#define PDS_STREAM_INFO   0x60                /* ARM->VC stream description, built at rt 0x288f40 (header len 0x520) */
+#define PDS_STREAM_INFO   0x60                /* reply to 0x41 start: stream description, built at rt 0x288f40 (len 0x520) */
 #define PDS_FRAME_REPLY   0x61                /* rt 0x288e.. : header opcode of the 12-word reply */
 
 struct hi_chan {
@@ -595,15 +595,16 @@ int bcm_pds_send_frame(const struct bcm_pds_frame *f)
     return pds_send_chunk(b);
 }
 
-/* rt 0x288f40: before playback the stock firmware sends ONE message on the VCPD ring: header
- * (magic, seq, op 0x60, len 0x520) + a 0x520-byte payload describing the streams (type, codec fourcc,
- * extradata, dimensions, AES key/IV). seq is the host's own running counter (the stock value comes
- * from a counter at rt 0x10833c84 whose origin is unknown). */
+/* rt 0x288f40: the REPLY to the VC's PDS start request (0x41). The stock dispatcher (rt 0xff034) stores the
+ * request's seq at rt 0x10833c84, calls the start callback (0xa04f0 -> 0x20af74, media-stream setup) and that
+ * function sends this message with that same seq. Header: magic, seq (= the 0x41's), op 0x60, len16 0x520;
+ * payload = the 0x520-byte stream description. The VC blocks (and so does its mp_selectplay gencmd) until it
+ * arrives, so call this from the start() callback. */
 int bcm_pds_send_stream_info(const uint32_t *words, uint32_t len)
 {
     struct hi_chan *c = chan_by_type(CH_VCPD);
     if (!hi.attached || !c || len > HI_MAX_PAYLOAD) return -1;
-    return hi_tx(c, PDS_STREAM_INFO, c->seq++, words, len);
+    return hi_tx(c, PDS_STREAM_INFO, hi.pds_last_seq, words, len);
 }
 
 int bcm_pds_send_empty(void)

@@ -2986,7 +2986,7 @@ static void bcm_display_probe(void)
     for (i = 0; i < (int)(sizeof dc / sizeof dc[0]); i++)
     {
         bcm_cmd_t0 = current_tick;
-        r = bcm_gencmd_watched(dc[i], resp, sizeof resp, 6);
+        r = bcm_gencmd_watched(dc[i], resp, sizeof resp, 3);
         bcm_log_text(dc[i], r, resp);
     }
 }
@@ -3215,7 +3215,13 @@ static int bcm_send_stream_info(void)
 static int v_frames, v_bytes, v_getframes, v_empty, v_eos, v_seeks, v_skips;
 static bool v_stop, v_live;
 static long v_eos_tick;
-static void v_start(int id, uint32_t w1) { BLOG("  PDS start: stream=%d w1=%08x", id, (unsigned)w1); }
+static void v_start(int id, uint32_t w1)
+{
+    BLOG("  PDS start: object=%d w1=%08x", id, (unsigned)w1);
+    m4_rewind();
+    /* v15: the 0x60 stream description is the REPLY to this 0x41 (seq echoed) -- the VC waits for it. */
+    BLOG("  0x60 stream-info reply sent = %d", bcm_send_stream_info());
+}
 static void v_get_frame(int id, uint32_t w1, uint32_t w2)
 {
     uint32_t ts = 0; bool key = false; int n, tries = 0, want = (int)w2, r;
@@ -3324,7 +3330,7 @@ static void bcm_playback_probe(void)
        yuv422i is the one PROVEN to make progress (run 8: dlopen + PDS start within its window), so
        try that alone first; rgb565 can be tried again once yuv422i's timing is characterised. */
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd_watched("mp_region display=0 dest=fullscreen mode=yuv422i", resp, sizeof resp, 30);
+    r = bcm_gencmd_watched("mp_region display=0 dest=fullscreen mode=yuv422i", resp, sizeof resp, 8);
     bcm_log_text("mp_region display=0 dest=fullscreen mode=yuv422i", r, resp);
 
     {   int mr = mp4_open(video);
@@ -3336,8 +3342,7 @@ static void bcm_playback_probe(void)
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
-            bcm_pds_map_stream(0, 1);                       /* v14: stock maps type 1 (video) -> buffer B (rt 0x288f40/0x288c14) */
-            BLOG("stream info send = %d", bcm_send_stream_info());
+            bcm_pds_map_stream(0, 0);                       /* v15: type 1 (video) -> buffer A (cap 0x10000); audio would be B */
             BLOG("REAL VIDEO FEED enabled (video stream only, no audio)");
         }
         else
@@ -3347,10 +3352,10 @@ static void bcm_playback_probe(void)
         }
     }
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, 30);
+    r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, 20);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 30);
+    r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 10);
     bcm_log_text("mp_play", r, resp);
 
     if (v_live)
@@ -3431,7 +3436,7 @@ static bool dbg_bcm_host(void)
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
-    BLOG("bcm host test v14, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v15, built %s %s", __DATE__, __TIME__);
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3457,7 +3462,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v14 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v15 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3513,11 +3518,11 @@ static bool dbg_bcm_host(void)
     }
 
     bcm_display_probe();
-    splash(HZ*2, "v14 marker B: after display_control");
+    splash(HZ*2, "v15 marker B: after display_control");
     bcm_playback_probe();
 
     if (v_live)
-        splashf(HZ*3, "v14: sent %d video frames", v_frames);
+        splashf(HZ*3, "v15: sent %d video frames", v_frames);
 out:
     if (bcm_log_fd >= 0)
         close(bcm_log_fd);

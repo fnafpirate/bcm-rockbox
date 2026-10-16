@@ -80,10 +80,10 @@ struct bcm_pds_ops {
 void bcm_pds_set_ops(const struct bcm_pds_ops *ops);
 
 /* Which VC buffer a stream id uses. 0 = buffer A (payload words 2/3 of 0x41), 1 = buffer B (words 4/5).
- * Decoded from rt 0x288f40/0x288c14: the table at rt 0x10833c64 is indexed by STREAM ID (the order in
- * which the container's accepted streams appear in the file) and holds the TYPE byte of that stream's
- * description block: 0 = audio -> buffer A, 1 = video -> buffer B. So a video-only file has video stream
- * id 0 and must be mapped to buffer B: bcm_pds_map_stream(0, 1). */
+ * Decoded from rt 0xff034 / 0x288f40 / 0x288c14: the table at rt 0x10833c64 is indexed by STREAM ID (order of the
+ * accepted streams in the file) and holds the TYPE byte of the stream (0 audio, 1 video). Type 0 uses the capacity
+ * from words 4/5 (= B), type 1 the capacity from words 2/3 (= A). So **video -> A, audio -> B**, which is also
+ * the default (stream 0 -> A). Real VC values seen: A = {0x813c0, 0x10000}, B = {0x813c0, 0x4000} -- same address. */
 void bcm_pds_map_stream(int stream_id, int buffer /*0=A,1=B*/);
 
 struct bcm_pds_frame {
@@ -111,9 +111,10 @@ int  bcm_pds_send_empty(void);
  * meaning is inferred from control flow [UNVERIFIED]. */
 enum { PDS_FLAG_FIRST = 0, PDS_FLAG_MIDDLE = 1, PDS_FLAG_WHOLE = 2, PDS_FLAG_LAST = 3 };
 
-/* Stream description (opcode 0x60, rt 0x288f40): the stock firmware sends this once, at open and BEFORE
- * mp_selectplay. `words`/`len` = the 0x520-byte payload (layout in VideoCore_PDS_Findings.md).
- * Returns 0, or <0 if not attached / too long. */
+/* Stream description = the REPLY to the VC's PDS start request (0x41), opcode 0x60, seq echoed from that request
+ * (rt 0x288f40, called from the start callback rt 0xa04f0 -> 0x20af74). The VC waits for it before it asks for
+ * any frame; mp_selectplay does not complete until it has arrived. Call it from the start() callback.
+ * `words`/`len` = the 0x520-byte payload (layout in VideoCore_PDS_Findings.md). Returns 0, or <0. */
 int  bcm_pds_send_stream_info(const uint32_t *words, uint32_t len);
 
 /* ---- tracing ---------------------------------------------------------------------- */
