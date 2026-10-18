@@ -3220,10 +3220,11 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             reply_ms delay before the 0x60 reply        skip_disp 1 = skip the display_control probe
             sel_wait seconds to wait for the mp_selectplay reply
             pm      1 = send "pm_set_policy min" like the stock firmware does before mp_selectplay / mp_play (default 1)
-            step    1 = pause after each phase until you press a button (so you can say after which one the screen changed) */
+            step    1 = pause after each phase until you press a button (so you can say after which one the screen changed)
+            cmds_end 1 = send the long `commands` list at the very end (tests the oversized-reply fix; default 1) */
 static int cfg_si_ts = 1000, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
-static int cfg_pm = 1, cfg_step = 0;
+static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1;
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3252,10 +3253,11 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "sel_wait")) cfg_sel_wait = v;
         else if (!strcmp(p, "pm"))       cfg_pm = v;
         else if (!strcmp(p, "step"))     cfg_step = v;
+        else if (!strcmp(p, "cmds_end")) cfg_cmds_end = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
-    BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d",
-         cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step);
+    BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d cmds_end=%d",
+         cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step, cfg_cmds_end);
 }
 
 #define SI_WORDS 0x148
@@ -3551,15 +3553,15 @@ static bool dbg_bcm_host(void)
     static const char * const cmds[] = {
         "version", "commands", "tasks", "set_vll_dir /Resources/VideoCore/Library",
         "load_application mplayer.vll",   /* the VC opens the library over VCFS (trace shows the paths) */
-        "commands"                        /* now lists the mp_* commands if the load worked */
-        /* "tasks" removed here: it has timed out at the full 1000-poll (20s) budget in every run
-           so far with no diagnostic value, right after this same spot -- cause not found yet
-           (see report Session3 sections 20/21), not worth 20s of every future run until it is. */
+        "tasks"                           /* v18: short reply. The LONG `commands` list (540 B through the 512 B gencmd ring)
+                                             used to go here; it left the VC's gencmd task blocked, and every later command
+                                             (this same `tasks`, pm_*, display_control, mp_*) timed out. It now runs at the
+                                             very end (cfg cmds_end) once the signal-after-partial-read fix can be judged. */
     };
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v17, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v18, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
@@ -3586,7 +3588,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v17 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v18 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3649,11 +3651,20 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v17 marker B: after display_control");
+        splash(HZ*2, "v18 marker B: after display_control");
     bcm_playback_probe();
 
+    if (cfg_cmds_end && !bcm_check_dead())
+    {
+        char big[1024]; int cr;
+        bcm_cmd_t0 = current_tick;
+        cr = bcm_gencmd_watched("commands", big, sizeof big, 6);
+        bcm_log_text("commands (end of run: oversized-reply check)", cr, big);
+        { const struct bcm_host_stats *st = bcm_host_get_stats();
+          BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
+    }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v17: sent %d video frames", v_frames);
+        splashf(HZ*3, "v18: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen)
     {

@@ -315,15 +315,17 @@ static uint32_t ring_read(struct hi_chan *c, uint8_t *dst, uint32_t len)
 
 /* Pop one complete message. Returns 1 if a message was read, 0 if none.
  *
- * v5 tried to WAIT for the rest of a message that did not fit the ring in one write (a plausible
- * design, matching how the host's own hi_tx() waits for space). On real hardware this hung for
- * ~5s and then desynchronised every later reply on the channel (session 3, run 5: `commands` and
- * `set_vll_dir` both timed out, bad_magic=5). The VC does not appear to top a reply up after the
- * fact -- it either fits or it does not -- so v6 does not wait: it takes whatever is in the ring
- * right now and, if that is less than the header's declared length, delivers it as a truncated
- * message (dropping the unwritten tail) rather than discarding it and stalling the caller. This
- * matches the one known real case (a ~540-byte `commands` list through a 512-byte ring) and never
- * blocks, so a genuinely bad header (bogus length) costs one truncated message, not a 5s hang. */
+ * A message bigger than the ring (a ~540-byte `commands` list through a 512-byte ring) is written by the VC in
+ * pieces: it fills the ring and BLOCKS until the host has consumed data AND signalled it. The stock receive
+ * function (rt 0x2883d4) does exactly that: ring_read (0x288434) -> publish rx_rd (0x28850c) -> signal the channel
+ * (0x2881fc = the same toggle-a-bit-in-+0x10 signal used for tx) -> wait -> read on, until the declared length
+ * has arrived. v5 waited without ever signalling, so the VC stayed blocked (hang, then desync) and v6 gave up
+ * and delivered the head short -- which left the VC's gencmd task blocked mid-reply, so every LATER gencmd on
+ * the channel (pm_*, display_control, mp_*) went unanswered until some other signal happened to wake it (v17
+ * logs: the stale reply showed up as "gencmd STRAY ... seq 6" ~45 s later, right after the VCFS traffic of
+ * mp_selectplay). v18 publishes + signals after every partial read and waits (bounded) for the rest; if the VC
+ * never tops it up the message is still delivered short, as in v6. */
+#define HI_RX_TAIL_WAITS 60
 static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 {
     bcm_io_lock();
@@ -357,7 +359,27 @@ static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
     uint32_t declared = ld16(hdr + 12);
     uint32_t padded = (declared + 15u) & ~15u;
     if (padded > sizeof m->payload) padded = (uint32_t)sizeof m->payload;   /* never overrun our buffer */
-    uint32_t got = padded ? ring_read(c, m->payload, padded) : 0;
+    uint32_t got = 0;
+    uint32_t ring_sz = (uint32_t)(c->rx_end - c->rx_start);
+    if (padded)
+    {
+        int waits = 0;
+        for (;;)
+        {
+            got += ring_read(c, m->payload + got, padded - got);
+            if (got >= padded) break;
+            /* ring drained but the message is not complete: free the space and wake the VC producer */
+            wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
+            chan_kick(c);
+            bcm_io_unlock();
+            bcm_io_idle();
+            bcm_io_lock();
+            if (bcm_io_dead() || ++waits > HI_RX_TAIL_WAITS) break;
+            c->rx_wr = rd16(hi.base + c->desc + D_RX_WR);
+        }
+        if (got >= padded && padded + HI_HDR > ring_sz / 2)
+            { wr16(hi.base + c->desc + D_RX_RD, c->rx_rd); chan_kick(c); }   /* big message: tell the VC the space is free */
+    }
     if (got < padded) {
         hi.st.truncated++;                                /* delivered short, not dropped -- see comment above */
         memset(m->payload + got, 0, padded - got);

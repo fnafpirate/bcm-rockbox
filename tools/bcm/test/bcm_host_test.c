@@ -455,6 +455,43 @@ static void test_truncated_reply(void)
     RING = 0x1000; vc_init(); q_reset();
 }
 
+/* v18: the VC fills the ring, then BLOCKS until the host consumed data and signalled it; it then writes the rest. */
+static const uint8_t *tu_ptr; static uint32_t tu_left; static int tu_db0;
+static void topup_hook(void)
+{
+    if (tu_left && doorbells > tu_db0)
+    {
+        uint32_t n = vc_ring_put_some(0, tu_ptr, tu_left);
+        tu_ptr += n; tu_left -= n; tu_db0 = doorbells;
+        vcram[BASE + 0x21] ^= 1;
+    }
+}
+static void test_oversized_reply_topup(void)
+{
+    static uint8_t pl[704];
+    RING = 0x200; vc_init(); q_reset();
+    CHECK(bcm_host_attach() == 0, "attach with 0x200 rings");
+    for (int i = 0; i < 700; i++) pl[i] = (uint8_t)('a' + i % 26);
+    uint8_t hdr[16] = {0}; uint32_t magic = 0xF1A55A1Fu, seq = 0x80000001u, op = 2; uint16_t len = 700;
+    memcpy(hdr, &magic, 4); memcpy(hdr + 4, &seq, 4); memcpy(hdr + 8, &op, 4); memcpy(hdr + 12, &len, 2);
+    uint32_t w = vc_ring_put_some(0, hdr, 16);
+    uint32_t wp = vc_ring_put_some(0, pl, 704);
+    (void)w;
+    tu_ptr = pl + wp; tu_left = 704 - wp; tu_db0 = doorbells;
+    CHECK(tu_left > 0, "the first pass really did not fit (%u left)", tu_left);
+    vcram[BASE + 0x21] ^= 1;
+    idle_hook = topup_hook;
+    const struct bcm_host_stats *st = bcm_host_get_stats();
+    uint32_t trunc0 = st->truncated, rx0 = st->rx_msgs;
+    int db0 = doorbells;
+    bcm_host_service();
+    CHECK(tu_left == 0, "the host signalled the VC and the VC finished the message (%u bytes still unsent)", tu_left);
+    CHECK(st->truncated == trunc0, "message delivered complete, not truncated (%u -> %u)", trunc0, st->truncated);
+    CHECK(st->rx_msgs == rx0 + 1, "exactly one message popped (%u -> %u)", rx0, st->rx_msgs);
+    CHECK(doorbells > db0, "host rang the doorbell after freeing ring space");
+    idle_hook = NULL; RING = 0x1000; vc_init(); q_reset();
+}
+
 static void gencmd_idle_truncate_commands(void)
 {
     struct rmsg m;
@@ -608,6 +645,7 @@ int main(int argc, char **argv)
     printf("[attach variants]\n"); fflush(stdout); test_attach_variants();
     printf("[high directory offsets]\n"); fflush(stdout); test_high_directory();
     printf("[truncated reply]\n"); fflush(stdout); test_truncated_reply();
+    printf("[oversized reply topped up after signal]\n"); fflush(stdout); test_oversized_reply_topup();
     printf("[gencmd survives truncation]\n"); fflush(stdout); test_gencmd_after_truncation();
     printf("[resync after stray bytes]\n"); fflush(stdout); test_resync_after_stray_bytes();
     printf("[vchr]\n"); fflush(stdout); test_vchr_reply();
