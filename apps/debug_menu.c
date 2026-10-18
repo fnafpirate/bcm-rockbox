@@ -2998,27 +2998,6 @@ static const struct bcm_pds_ops pds_probe_ops = {
    "rgb565" and "yuv422i" are real mode strings found in this vmcs.bin (0x1ccd80-ish); nothing
    else about the mp_region/mp_selectplay argument syntax has been confirmed on hardware yet, so
    this logs whatever gencmd replies come back, error or not. */
-/* v12: display bring-up probe. Stock ARM firmware never sends vmcs_display_enable; the only display
-   power/model command in the ARM image is "display_control <id> model=<1|2> power=<n>" (builder at rt
-   0x164e9c; model = 2 when the SysInfo hw word is 0x000b00xx with xx >= 0x10, i.e. 5.5G -- inference).
-   The display id (ctx+4) was NOT resolved, so try 0 then 1. Every reply (or error=... string) is logged.
-   Short 6s budget each: the VC answers display commands quickly or not at all. */
-static void bcm_display_probe(void)
-{
-    static const char * const dc[] = {
-        "display_control 0 model=2 power=1",
-        "display_control 1 model=2 power=1",
-        "display_control 0 model=1 power=1",
-    };
-    char resp[256];
-    int i, r;
-    for (i = 0; i < (int)(sizeof dc / sizeof dc[0]); i++)
-    {
-        bcm_cmd_t0 = current_tick;
-        r = bcm_gencmd_watched(dc[i], resp, sizeof resp, 3);
-        bcm_log_text(dc[i], r, resp);
-    }
-}
 
 /* ---- v13: minimal streaming MP4 (H.264) reader -------------------------------------------------
    Nothing is loaded into RAM except what one frame needs: the sample/chunk/time tables are read
@@ -3221,10 +3200,16 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             sel_wait seconds to wait for the mp_selectplay reply
             pm      1 = send "pm_set_policy min" like the stock firmware does before mp_selectplay / mp_play (default 1)
             step    1 = pause after each phase until you press a button (so you can say after which one the screen changed)
-            cmds_end 1 = send the long `commands` list at the very end (tests the oversized-reply fix; default 1) */
+            cmds_end 1 = send the long `commands` list at the very end (tests the oversized-reply fix; default 1)
+            region_when bitmask of when to send mp_region: 1 before mp_selectplay, 2 after it, 4 after mp_play (default 3)
+            region_mode 0 = mode=fill, 1 = mode=letterbox pixel="1 1"  (the only two strings in the stock firmware)
+            region_w / region_h  destination size (default 320 x 240)
+            pm_play 1 = send pm_set_policy min before mp_play too (default 0: the second one hung the VC in v18)
+            disp_all 1 = also try display_control 1 / model=1 (default 0: only "display_control 0 model=2 power=1") */
 static int cfg_si_ts = 1000, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
 static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1;
+static int cfg_region_when = 3, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3254,8 +3239,15 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "pm"))       cfg_pm = v;
         else if (!strcmp(p, "step"))     cfg_step = v;
         else if (!strcmp(p, "cmds_end")) cfg_cmds_end = v;
+        else if (!strcmp(p, "region_when")) cfg_region_when = v;
+        else if (!strcmp(p, "region_mode")) cfg_region_mode = v;
+        else if (!strcmp(p, "region_w")) cfg_region_w = v;
+        else if (!strcmp(p, "region_h")) cfg_region_h = v;
+        else if (!strcmp(p, "pm_play"))  cfg_pm_play = v;
+        else if (!strcmp(p, "disp_all")) cfg_disp_all = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
+    BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
     BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d cmds_end=%d",
          cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step, cfg_cmds_end);
 }
@@ -3364,6 +3356,9 @@ static void bcm_video_run(int secs)
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_stats video", resp, sizeof resp, 1);
             bcm_log_text("mp_get_stats video", r, resp);
+            bcm_cmd_t0 = current_tick;
+            r = bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 1);
+            bcm_log_text("mp_get_status", r, resp);
             next_stat += 5 * HZ;
         }
         sleep(HZ / 100);
@@ -3408,6 +3403,42 @@ static void bcm_step(const char *name)
     BLOG("STEP continue: %s", name);
 }
 
+/* v12: display bring-up probe. Stock ARM firmware never sends vmcs_display_enable; the only display
+   power/model command in the ARM image is "display_control <id> model=<1|2> power=<n>" (builder at rt
+   0x164e9c; model = 2 when the SysInfo hw word is 0x000b00xx with xx >= 0x10, i.e. 5.5G -- inference).
+   The display id (ctx+4) was NOT resolved, so try 0 then 1. Every reply (or error=... string) is logged.
+   Short 6s budget each: the VC answers display commands quickly or not at all. */
+static void bcm_display_probe(void)
+{
+    static const char * const dc[] = {
+        "display_control 0 model=2 power=1",
+        "display_control 1 model=2 power=1",
+        "display_control 0 model=1 power=1",
+    };
+    char resp[256];
+    int i, r;
+    for (i = 0; i < (int)(sizeof dc / sizeof dc[0]) && (i == 0 || cfg_disp_all); i++)
+    {
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd_watched(dc[i], resp, sizeof resp, 3);
+        bcm_log_text(dc[i], r, resp);
+    }
+}
+
+/* v19: mp_region as the stock firmware builds it (rt 0x1f9354): display=0, dest="x y w h", and mode=fill or
+   mode=letterbox pixel="1 1" -- those are the ONLY mode strings in the firmware. v18's "dest=fullscreen mode=yuv422i"
+   was answered with error=2 "bad parameters". */
+static void bcm_region(const char *when)
+{
+    char cmd[96], resp[256]; int r;
+    snprintf(cmd, sizeof cmd, "mp_region display=0 dest=\"0 0 %d %d\" mode=%s", cfg_region_w, cfg_region_h,
+             cfg_region_mode ? "letterbox pixel=\"1 1\"" : "fill");
+    BLOG("mp_region (%s)", when);
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched(cmd, resp, sizeof resp, 4);
+    bcm_log_text(cmd, r, resp);
+}
+
 static void bcm_playback_probe(void)
 {
     char resp[256], video[192];
@@ -3436,21 +3467,7 @@ static void bcm_playback_probe(void)
     }
     BLOG("test video opened OK");
 
-    /* Run 8: mp_region (mode=yuv422i) made the VC dlopen passthruhandler.vll over VCFS -- 27 file
-       ops, each read done one 32-bit word at a time (the only proven-correct read path so far)
-       -- and that alone ran past the old 300-poll (~3s) budget, so "-2" there most likely means
-       "still working", not "rejected". Budget raised to 3000 (~30s worst case) for every command
-       from here on; bcm_host_service() keeps running and logging PDS/VCFS traffic throughout
-       regardless of what any single gencmd's own result says, so nothing is missed even if a
-       budget is still too short. */
-    /* rgb565 timed out at its full 30s budget with no logged VC activity at all in run 9, then the
-       device produced nothing further in run 10 right after this same command was sent -- either
-       still slow or a freeze, indistinguishable without a heartbeat, which run 10 did not have.
-       yuv422i is the one PROVEN to make progress (run 8: dlopen + PDS start within its window), so
-       try that alone first; rgb565 can be tried again once yuv422i's timing is characterised. */
-    bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd_watched("mp_region display=0 dest=fullscreen mode=yuv422i", resp, sizeof resp, 8);
-    bcm_log_text("mp_region display=0 dest=fullscreen mode=yuv422i", r, resp);
+    if (cfg_region_when & 1) bcm_region("before mp_selectplay");
 
     {   int mr = mp4_open(video);
         if (mr == 0)
@@ -3477,10 +3494,12 @@ static void bcm_playback_probe(void)
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
     bcm_step("mp_selectplay");
-    bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_play */
+    if (cfg_region_when & 2) bcm_region("after mp_selectplay");
+    if (cfg_pm_play) bcm_pm_set();                     /* v18: a second pm_set_policy min after selectplay never got a reply and blocked mp_play behind it */
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_play", resp, sizeof resp, 10);
     bcm_log_text("mp_play", r, resp);
+    if (cfg_region_when & 4) bcm_region("after mp_play");
 
     if (v_live)
     {
@@ -3496,10 +3515,10 @@ static void bcm_playback_probe(void)
     BLOG("PDS probe: starts=%d frames=%d seeks=%d stops=%d", pds_probe_starts, pds_probe_frames, pds_probe_seeks, pds_probe_stops);
 
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd("mp_get_status", resp, sizeof resp, 3000);
+    r = bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 3);
     bcm_log_text("mp_get_status", r, resp);
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd("mp_stop", resp, sizeof resp, 3000);
+    r = bcm_gencmd_watched("mp_stop", resp, sizeof resp, 3);
     bcm_log_text("mp_stop", r, resp);
 }
 
@@ -3561,7 +3580,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v18, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v19, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
@@ -3588,7 +3607,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v18 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v19 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3651,7 +3670,7 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v18 marker B: after display_control");
+        splash(HZ*2, "v19 marker B: after display_control");
     bcm_playback_probe();
 
     if (cfg_cmds_end && !bcm_check_dead())
@@ -3664,7 +3683,7 @@ static bool dbg_bcm_host(void)
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v18: sent %d video frames", v_frames);
+        splashf(HZ*3, "v19: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen)
     {

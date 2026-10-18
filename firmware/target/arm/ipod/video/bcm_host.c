@@ -325,7 +325,7 @@ static uint32_t ring_read(struct hi_chan *c, uint8_t *dst, uint32_t len)
  * logs: the stale reply showed up as "gencmd STRAY ... seq 6" ~45 s later, right after the VCFS traffic of
  * mp_selectplay). v18 publishes + signals after every partial read and waits (bounded) for the rest; if the VC
  * never tops it up the message is still delivered short, as in v6. */
-#define HI_RX_TAIL_WAITS 60
+#define HI_RX_TAIL_WAITS 15   /* v18 logs: 60 cost ~0.6 s on each short message; a real top-up follows the signal within a few ticks */
 static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
 {
     bcm_io_lock();
