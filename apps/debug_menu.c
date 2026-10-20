@@ -3110,6 +3110,7 @@ static void m4_rewind(void)
 }
 
 static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; }
+static uint32_t m4_dur_ms, m4_br;            /* v20: duration (ms) and average bit rate (bit/s) of the whole file */
 
 /* 0 = ok, <0 = reason */
 static int mp4_open(const char *path)
@@ -3126,7 +3127,16 @@ static int mp4_open(const char *path)
     if (!moov_e) { m4_close(); return -3; }
     pos = moov_s;
     while (m4_box(&pos, moov_e, &t, &ps, &pe))
-        if (t == FOURCC('t','r','a','k') && m4_trak(ps, pe)) { m4_rewind(); return 0; }
+        if (t == FOURCC('t','r','a','k') && m4_trak(ps, pe))
+        {
+            uint64_t ticks = 0; uint32_t i;
+            for (i = 0; i < m4.stts_n && i < 100000; i++)
+                ticks += (uint64_t)m4_u32(m4.stts + 8 * i) * m4_u32(m4.stts + 8 * i + 4);
+            m4_dur_ms = (uint32_t)(ticks * 1000ULL / m4.timescale);
+            m4_br = m4_dur_ms ? (uint32_t)((uint64_t)fsz * 8000ULL / m4_dur_ms) : 0;
+            m4_rewind();
+            return 0;
+        }
     m4_close();
     return -4;                                   /* no usable H.264 (avc1) video track */
 }
@@ -3191,7 +3201,9 @@ static int m4_next(uint32_t *ts_ms, bool *key)
    GUESSED: the "word" after the fourcc (I send 1000 = timescale, and f4 timestamps are in ms to match),
    and the two words after the extradata (I send width, height). All logged so a run can correct them. */
 /* v16: optional /.rockbox/bcm_test.cfg, "key=value" per line, so the GUESSED fields can be varied without a
-   rebuild.  si_ts   word after the fourcc in the 0x60 block (default 1000, timestamps are sent in ms)
+   rebuild.  si_w8   word after the fourcc in the 0x60 block: the stream BIT RATE in bit/s (default -1 = measured from the file;
+                     mplayer.vll's property names for the handler info are type/bit_rate/height/width, duration, num_streams)
+            si_dur  payload word 1 = duration in ms (default -1 = measured)      si_hw  1 = send height,width instead of width,height
             si_dim  1 = send width/height in the 0x60 block, 0 = zeros
             si_w1   payload word 1 of 0x60 ([this+0xc], unknown)      si_last  last block word ([s+0x58])
             si_count payload word 0 (stream count)                    f2  frame f2: 0, 1, or 2 = keyframe flag
@@ -3206,10 +3218,10 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             region_w / region_h  destination size (default 320 x 240)
             pm_play 1 = send pm_set_policy min before mp_play too (default 0: the second one hung the VC in v18)
             disp_all 1 = also try display_control 1 / model=1 (default 0: only "display_control 0 model=2 power=1") */
-static int cfg_si_ts = 1000, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
+static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
-static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1;
-static int cfg_region_when = 3, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
+static int cfg_pm = 0, cfg_step = 0, cfg_cmds_end = 1;
+static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3226,7 +3238,10 @@ static void bcm_load_cfg(void)
         eq = strchr(p, '=');
         if (!eq || p[0] == '#') continue;
         *eq = 0; v = atoi(eq + 1);
-        if      (!strcmp(p, "si_ts"))    cfg_si_ts = v;
+        if      (!strcmp(p, "si_ts"))    BLOG("cfg: si_ts is obsolete (the word is the bit rate; use si_w8)");
+        else if (!strcmp(p, "si_w8"))    cfg_si_w8 = v;
+        else if (!strcmp(p, "si_dur"))   cfg_si_dur = v;
+        else if (!strcmp(p, "si_hw"))    cfg_si_hw = v;
         else if (!strcmp(p, "si_dim"))   cfg_si_dim = v;
         else if (!strcmp(p, "si_w1"))    cfg_si_w1 = v;
         else if (!strcmp(p, "si_last"))  cfg_si_last = v;
@@ -3248,8 +3263,8 @@ static void bcm_load_cfg(void)
         else BLOG("cfg: unknown key '%s'", p);
     }
     BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
-    BLOG("cfg: si_ts=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d cmds_end=%d",
-         cfg_si_ts, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step, cfg_cmds_end);
+    BLOG("cfg: si_w8=%d si_dur=%d si_hw=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d cmds_end=%d",
+         cfg_si_w8, cfg_si_dur, cfg_si_hw, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step, cfg_cmds_end);
 }
 
 #define SI_WORDS 0x148
@@ -3258,23 +3273,24 @@ static int bcm_send_stream_info(void)
 {
     uint32_t i = 8;
     memset(si_words, 0, sizeof si_words);
-    si_words[0] = (uint32_t)cfg_si_count;              /* stream count */
-    si_words[1] = (uint32_t)cfg_si_w1;
+    si_words[0] = (uint32_t)cfg_si_count;              /* stream count (#handler.num_streams) */
+    si_words[1] = cfg_si_dur >= 0 ? (uint32_t)cfg_si_dur : m4_dur_ms;   /* GUESS: duration, ms (#handler.duration; stock [this+0xc]) */
+    (void)cfg_si_w1;
     si_words[2] = 1; si_words[4] = 1; si_words[5] = 1; /* constants written by rt 0x288f40 (w3 = w6 = 0) */
     si_words[i++] = 1;                                 /* type: 1 = video */
     si_words[i++] = 0x48323634;                        /* 'H264' */
-    si_words[i++] = (uint32_t)cfg_si_ts;                /* GUESS: timescale */
+    si_words[i++] = cfg_si_w8 >= 0 ? (uint32_t)cfg_si_w8 : m4_br;   /* GUESS: bit rate, bit/s (#video.bit_rate) */
     si_words[i++] = 0;
     si_words[i++] = 0;                                 /* N = 0 extradata bytes (Annex B carries SPS/PPS inline) */
-    si_words[i++] = cfg_si_dim ? m4.width : 0;         /* GUESS */
-    si_words[i++] = cfg_si_dim ? m4.height : 0;        /* GUESS */
+    si_words[i++] = cfg_si_dim ? (cfg_si_hw ? m4.height : m4.width) : 0;    /* GUESS (the handler lists height before width) */
+    si_words[i++] = cfg_si_dim ? (cfg_si_hw ? m4.width : m4.height) : 0;
     si_words[i++] = 1;                                 /* byte [s+0x20] (the stock code always writes 1) */
     si_words[i++] = 0;                                 /* byte [s+0x21]: 2 only when AES-encrypted */
     si_words[i++] = 0;                                 /* key bits (0 = none) */
     i += 32 + 16;                                      /* key + IV, zero */
     si_words[i++] = (uint32_t)cfg_si_last;
-    BLOG("stream info (0x60): %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
-         (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
+    BLOG("stream info (0x60): duration_ms=%u bit_rate=%u; %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
+         (unsigned)si_words[1], (unsigned)si_words[10], (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
          (unsigned)si_words[12], (unsigned)si_words[13], (unsigned)si_words[14]);
     return bcm_pds_send_stream_info(si_words, sizeof si_words);
 }
@@ -3439,6 +3455,58 @@ static void bcm_region(const char *when)
     bcm_log_text(cmd, r, resp);
 }
 
+static void bcm_dump(const char *what, unsigned vc_addr, unsigned len);   /* defined further down */
+/* v20 diagnostics: after mp_selectplay the VC stops answering. Is its host interface dead, or only some tasks blocked? */
+static void bcm_hi_dump(const char *tag)
+{
+    const struct bcm_host_diag *g = bcm_host_get_diag();
+    BLOG("---- host-interface state: %s", tag);
+    bcm_dump("hdr +0x10 (signal bytes: tx_sig, rx_ack, ... +0x20 ack, +0x21 VC signal)", g->w1fc + 0x10, 0x20);
+    bcm_dump("ch0 (gencmd) descriptor", g->w1fc + g->dir[0], 0x50);
+    bcm_dump("ch3 (PDS)    descriptor", g->w1fc + g->dir[3], 0x50);
+}
+static void bcm_diag_cmd(const char *cmd, int secs)
+{
+    char resp[200]; int r;
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched(cmd, resp, sizeof resp, secs);
+    bcm_log_text(cmd, r, resp);
+}
+/* Find words in VC RAM that change by themselves (tick counters) while the VC is healthy, so that we can tell later
+   whether the VC core still runs. */
+#define BCM_CNT_MAX 24
+static unsigned bcm_cnt_addr[BCM_CNT_MAX], bcm_cnt_n;
+static void bcm_find_counters(void)
+{
+    static uint32_t a[1024], b[1024];
+    unsigned base, i;
+    bcm_cnt_n = 0;
+    for (base = 0x1f000; base < 0x2c000 && bcm_cnt_n < BCM_CNT_MAX; base += 0x1000)
+    {
+        bcm_io_lock(); bcm_io_read(base, a, sizeof a); bcm_io_unlock();
+        sleep(HZ / 20);
+        bcm_io_lock(); bcm_io_read(base, b, sizeof b); bcm_io_unlock();
+        for (i = 0; i < 1024 && bcm_cnt_n < BCM_CNT_MAX; i++)
+            if (b[i] > a[i] && b[i] - a[i] < 100000u)
+                bcm_cnt_addr[bcm_cnt_n++] = base + 4 * i;
+    }
+    BLOG("VC liveness: %u counter-like words found in VC RAM 0x1f000..0x2c000 (first: %05x %05x %05x)", bcm_cnt_n,
+         bcm_cnt_n > 0 ? bcm_cnt_addr[0] : 0, bcm_cnt_n > 1 ? bcm_cnt_addr[1] : 0, bcm_cnt_n > 2 ? bcm_cnt_addr[2] : 0);
+}
+static void bcm_check_counters(const char *tag)
+{
+    unsigned i, adv = 0; uint32_t x, y;
+    if (!bcm_cnt_n) return;
+    for (i = 0; i < bcm_cnt_n; i++)
+    {
+        bcm_io_lock(); bcm_io_read(bcm_cnt_addr[i], &x, 4); bcm_io_unlock();
+        sleep(HZ / 20);
+        bcm_io_lock(); bcm_io_read(bcm_cnt_addr[i], &y, 4); bcm_io_unlock();
+        if (y != x) adv++;
+    }
+    BLOG("VC liveness (%s): %u of %u counter words still changing -> VC core %s", tag, adv, bcm_cnt_n, adv ? "RUNNING" : "looks STOPPED");
+}
+
 static void bcm_playback_probe(void)
 {
     char resp[256], video[192];
@@ -3488,12 +3556,20 @@ static void bcm_playback_probe(void)
         }
     }
     bcm_step("mp_region");
-    bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay */
+    bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay (cfg pm, default off since v20) */
+    bcm_find_counters();
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, cfg_sel_wait);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
     bcm_step("mp_selectplay");
+    bcm_hi_dump("right after mp_selectplay");
+    bcm_check_counters("after mp_selectplay");
+    bcm_diag_cmd("version", 2);
+    bcm_diag_cmd("tasks", 2);
+    bcm_diag_cmd("pm_get_status", 2);
+    bcm_diag_cmd("mp_get_status", 2);
+    bcm_hi_dump("after the four diagnostic commands");
     if (cfg_region_when & 2) bcm_region("after mp_selectplay");
     if (cfg_pm_play) bcm_pm_set();                     /* v18: a second pm_set_policy min after selectplay never got a reply and blocked mp_play behind it */
     bcm_cmd_t0 = current_tick;
@@ -3525,7 +3601,7 @@ static void bcm_playback_probe(void)
 /* Hex dump of BCM memory into the log, 16 bytes per line. */
 static void bcm_dump(const char *what, unsigned vc_addr, unsigned len)
 {
-    static unsigned char d[64] __attribute__((aligned(4)));
+    static unsigned char d[96] __attribute__((aligned(4)));
     unsigned i, j;
     if (len > sizeof d) len = sizeof d;
     bcm_io_lock();
@@ -3580,7 +3656,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v19, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v20, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
@@ -3607,7 +3683,7 @@ static bool dbg_bcm_host(void)
          snap[0], snap[1], snap[2], snap[3]);
     if (r != 0)
         goto out;
-    splash(HZ*2, "v19 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v20 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3670,7 +3746,7 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v19 marker B: after display_control");
+        splash(HZ*2, "v20 marker B: after display_control");
     bcm_playback_probe();
 
     if (cfg_cmds_end && !bcm_check_dead())
@@ -3683,7 +3759,7 @@ static bool dbg_bcm_host(void)
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v19: sent %d video frames", v_frames);
+        splashf(HZ*3, "v20: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen)
     {
