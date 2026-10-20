@@ -3216,11 +3216,14 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             region_when bitmask of when to send mp_region: 1 before mp_selectplay, 2 after it, 4 after mp_play (default 3)
             region_mode 0 = mode=fill, 1 = mode=letterbox pixel="1 1"  (the only two strings in the stock firmware)
             region_w / region_h  destination size (default 320 x 240)
+            reboot_end 1 = when the test is over, close the log and reboot the iPod (default 1): the new VC image has no
+                     legacy LCD protocol, so Rockbox's own screen is dead afterwards and a second run in the same power
+                     session booted the VC badly (v20 log)
             pm_play 1 = send pm_set_policy min before mp_play too (default 0: the second one hung the VC in v18)
             disp_all 1 = also try display_control 1 / model=1 (default 0: only "display_control 0 model=2 power=1") */
 static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
-static int cfg_pm = 0, cfg_step = 0, cfg_cmds_end = 1;
+static int cfg_pm = 0, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static void bcm_load_cfg(void)
 {
@@ -3254,6 +3257,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "pm"))       cfg_pm = v;
         else if (!strcmp(p, "step"))     cfg_step = v;
         else if (!strcmp(p, "cmds_end")) cfg_cmds_end = v;
+        else if (!strcmp(p, "reboot_end")) cfg_reboot_end = v;
         else if (!strcmp(p, "region_when")) cfg_region_when = v;
         else if (!strcmp(p, "region_mode")) cfg_region_mode = v;
         else if (!strcmp(p, "region_w")) cfg_region_w = v;
@@ -3644,6 +3648,7 @@ static bool dbg_bcm_host(void)
     unsigned snap[4], boots;
     uint32_t w[4];
     int fd, r, i;
+    unsigned vmcs_len;
     const struct bcm_host_diag *dg;
     static const char * const cmds[] = {
         "version", "commands", "tasks", "set_vll_dir /Resources/VideoCore/Library",
@@ -3656,7 +3661,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v20, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v21, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
@@ -3676,14 +3681,37 @@ static bool dbg_bcm_host(void)
     BLOG("vmcs.bin %d bytes", r);
 
     splash(0, "Booting VideoCore from file...");
-    r = bcm_use_vmcs_image(bcm_vmcs_buf, (unsigned)r);
+    vmcs_len = (unsigned)r;
+    r = bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);
     boots = bcm_get_boot_info(snap);
     BLOG("bcm_use_vmcs_image = %d (0 ok, -1 no NOR vmcs, -2 BCM not rebooted); boots so far %u", r, boots);
     BLOG("VC[1F0..1FC] right after boot = %08x %08x %08x %08x",
          snap[0], snap[1], snap[2], snap[3]);
-    if (r != 0)
-        goto out;
-    splash(HZ*2, "v20 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    /* v21: the v20 run that produced a one-line log booted "successfully" in 0.09 s (normal: 0.8 s) with
+       VC[1F8]=fff70008 VC[1FC]=0 instead of 00000001 fe000ca0 -- the VC never started the image -- and then the
+       marker-A splash below (legacy LCD path, unbounded bus waits) froze the iPod. A good boot has VC[1F8]==1 and a
+       non-zero host-interface pointer in VC[1FC]. Retry the boot, and if it still is not good, leave without touching
+       the LCD and reboot the iPod. */
+    {
+        int tries;
+        for (tries = 0; tries < 2 && (r != 0 || snap[2] != 1 || snap[3] == 0); tries++)
+        {
+            BLOG("BAD BOOT (r=%d, VC[1F8]=%08x VC[1FC]=%08x): retrying the VC boot (%d/2)", r, snap[2], snap[3], tries + 1);
+            sleep(HZ);
+            r = bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);
+            boots = bcm_get_boot_info(snap);
+            BLOG("retry: bcm_use_vmcs_image = %d; boots so far %u; VC[1F0..1FC] = %08x %08x %08x %08x", r, boots,
+                 snap[0], snap[1], snap[2], snap[3]);
+        }
+        if (r != 0 || snap[2] != 1 || snap[3] == 0)
+        {
+            BLOG("BAD BOOT: the VideoCore did not start the uploaded image. Not touching the LCD; rebooting the iPod -- run the test again.");
+            if (bcm_log_fd >= 0) close(bcm_log_fd);
+            bcm_log_fd = -1;
+            system_reboot();
+        }
+    }
+    splash(HZ*2, "v21 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3746,7 +3774,7 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v20 marker B: after display_control");
+        splash(HZ*2, "v21 marker B: after display_control");
     bcm_playback_probe();
 
     if (cfg_cmds_end && !bcm_check_dead())
@@ -3759,12 +3787,12 @@ static bool dbg_bcm_host(void)
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v20: sent %d video frames", v_frames);
+        splashf(HZ*3, "v21: sent %d video frames", v_frames);
 out:
-    if (bcm_dead_seen)
+    if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
     {
         /* The LCD code spins forever on a dead BCM, so do NOT touch it: save the log and reboot cleanly. */
-        BLOG("VC dead -- log saved, rebooting the iPod");
+        BLOG(bcm_dead_seen ? "VC dead -- log saved, rebooting the iPod" : "test finished -- log saved, rebooting the iPod (cfg reboot_end=0 to stay)");
         if (bcm_log_fd >= 0) close(bcm_log_fd);
         bcm_log_fd = -1;
         system_reboot();
