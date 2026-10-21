@@ -3016,6 +3016,7 @@ static struct {
     uint32_t timescale, width, height;
     uint8_t  profile, level, nal_len;
     uint8_t  ps[512]; uint32_t ps_len;                  /* SPS+PPS, Annex B */
+    uint8_t  avcc[128]; uint32_t avcc_len;              /* raw avcC record (v22: candidate "extradata" for the 0x60 block) */
     uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n;
     bool     co64;
     uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first;   /* sample cursor */
@@ -3072,6 +3073,8 @@ static bool m4_trak(uint32_t ps, uint32_t pe)
             if (m4_u32(ent + 4) != FOURCC('a','v','c','1') || esz < 86 + 8) return false;
             m4.width = m4_u16(ent + 32); m4.height = m4_u16(ent + 34);
             if (!m4_find(ent + 86, ent + esz, FOURCC('a','v','c','C'), &cs, &ce) || ce - cs < 7) return false;
+            m4.avcc_len = (ce - cs) <= sizeof m4.avcc ? (ce - cs) : 0;
+            if (m4.avcc_len && !m4_rd(cs, m4.avcc, m4.avcc_len)) m4.avcc_len = 0;
             m4.profile = (uint8_t)m4_u8(cs + 1); m4.level = (uint8_t)m4_u8(cs + 3);
             m4.nal_len = (uint8_t)((m4_u8(cs + 4) & 3) + 1);
             {   uint32_t p = cs + 6, i, n = m4_u8(cs + 5) & 0x1f; int pass;
@@ -3216,6 +3219,10 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             region_when bitmask of when to send mp_region: 1 before mp_selectplay, 2 after it, 4 after mp_play (default 3)
             region_mode 0 = mode=fill, 1 = mode=letterbox pixel="1 1"  (the only two strings in the stock firmware)
             region_w / region_h  destination size (default 320 x 240)
+            variant N = a preset of the 0x60 experiments below (0..5), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
+                     the test increments on every run (so just run the test again and again and send all the logs)
+            si_extra 0 none / 1 raw avcC record / 2 SPS+PPS (Annex B) as the "extradata" of the 0x60 stream block
+            si_b20   the byte at [s+0x20] (stock always 1)    noreply 1 = do NOT answer the VC's 0x41 start    minimal 1 = 0x60 with zero streams
             reboot_end 1 = when the test is over, close the log and reboot the iPod (default 1): the new VC image has no
                      legacy LCD protocol, so Rockbox's own screen is dead afterwards and a second run in the same power
                      session booted the VC badly (v20 log)
@@ -3224,6 +3231,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
 static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
 static int cfg_pm = 0, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1;
+static int cfg_si_extra = 0, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static void bcm_load_cfg(void)
 {
@@ -3258,6 +3266,11 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "step"))     cfg_step = v;
         else if (!strcmp(p, "cmds_end")) cfg_cmds_end = v;
         else if (!strcmp(p, "reboot_end")) cfg_reboot_end = v;
+        else if (!strcmp(p, "si_extra")) cfg_si_extra = v;
+        else if (!strcmp(p, "si_b20"))   cfg_si_b20 = v;
+        else if (!strcmp(p, "noreply"))  cfg_noreply = v;
+        else if (!strcmp(p, "minimal"))  cfg_minimal = v;
+        else if (!strcmp(p, "variant"))  cfg_variant = (eq[1] == 'a') ? 99 : v;     /* "auto" = 99 */
         else if (!strcmp(p, "region_when")) cfg_region_when = v;
         else if (!strcmp(p, "region_mode")) cfg_region_mode = v;
         else if (!strcmp(p, "region_w")) cfg_region_w = v;
@@ -3271,6 +3284,46 @@ static void bcm_load_cfg(void)
          cfg_si_w8, cfg_si_dur, cfg_si_hw, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step, cfg_cmds_end);
 }
 
+/* v22: the v21 log shows the VC core stops right after it consumes our 0x60 reply (selectplay is answered within 1 ms, then
+   nothing: no further gencmd is read, its ack bits for ch0/ch2/ch3 never toggle, none of 6 RAM tick counters moves).
+   Which part of the payload kills it is unknown, so each run can try one preset. */
+#define BCM_NVARIANTS 6
+static const char * const bcm_variant_name[BCM_NVARIANTS] = {
+    "0: baseline (as v21: no extradata, b20=1)",
+    "1: extradata = raw avcC record",
+    "2: extradata = SPS+PPS Annex B",
+    "3: raw avcC extradata + byte[s+0x20]=0",
+    "4: do NOT answer the 0x41 (does the VC survive without our 0x60?)",
+    "5: 0x60 with zero streams (all-zero payload)"
+};
+static void bcm_apply_variant(void)
+{
+    int v = cfg_variant;
+    if (v == 99)                                   /* auto: counter file */
+    {
+        char c = '0'; int fd = open("/.rockbox/bcm_variant.cnt", O_RDONLY);
+        if (fd >= 0) { if (read(fd, &c, 1) != 1) c = '0'; close(fd); }
+        v = (c >= '0' && c <= '9') ? c - '0' : 0;
+        v %= BCM_NVARIANTS;
+        c = (char)('0' + (v + 1) % BCM_NVARIANTS);
+        fd = open("/.rockbox/bcm_variant.cnt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) { write(fd, &c, 1); close(fd); }
+    }
+    if (v < 0) return;
+    if (v >= BCM_NVARIANTS) v = 0;
+    cfg_si_extra = 0; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0;
+    switch (v)
+    {
+    case 1: cfg_si_extra = 1; break;
+    case 2: cfg_si_extra = 2; break;
+    case 3: cfg_si_extra = 1; cfg_si_b20 = 0; break;
+    case 4: cfg_noreply = 1; break;
+    case 5: cfg_minimal = 1; break;
+    default: break;
+    }
+    BLOG("VARIANT %s", bcm_variant_name[v]);
+}
+
 #define SI_WORDS 0x148
 static uint32_t si_words[SI_WORDS];
 static int bcm_send_stream_info(void)
@@ -3280,20 +3333,32 @@ static int bcm_send_stream_info(void)
     si_words[0] = (uint32_t)cfg_si_count;              /* stream count (#handler.num_streams) */
     si_words[1] = cfg_si_dur >= 0 ? (uint32_t)cfg_si_dur : m4_dur_ms;   /* GUESS: duration, ms (#handler.duration; stock [this+0xc]) */
     (void)cfg_si_w1;
+    if (cfg_minimal)                                   /* variant 5: zero streams, everything else zero */
+    {
+        memset(si_words, 0, sizeof si_words);
+        BLOG("stream info (0x60): MINIMAL (zero streams, all-zero payload)");
+        return bcm_pds_send_stream_info(si_words, sizeof si_words);
+    }
     si_words[2] = 1; si_words[4] = 1; si_words[5] = 1; /* constants written by rt 0x288f40 (w3 = w6 = 0) */
     si_words[i++] = 1;                                 /* type: 1 = video */
     si_words[i++] = 0x48323634;                        /* 'H264' */
     si_words[i++] = cfg_si_w8 >= 0 ? (uint32_t)cfg_si_w8 : m4_br;   /* GUESS: bit rate, bit/s (#video.bit_rate) */
     si_words[i++] = 0;
-    si_words[i++] = 0;                                 /* N = 0 extradata bytes (Annex B carries SPS/PPS inline) */
+    {   const uint8_t *ex = NULL; uint32_t exn = 0, k;                  /* N, then N words (one byte each) of extradata */
+        if (cfg_si_extra == 1 && m4.avcc_len) { ex = m4.avcc; exn = m4.avcc_len; }
+        else if (cfg_si_extra == 2)           { ex = m4.ps;   exn = m4.ps_len; }
+        si_words[i++] = exn;
+        for (k = 0; k < exn && i < SI_WORDS - 70; k++) si_words[i++] = ex[k];
+    }
     si_words[i++] = cfg_si_dim ? (cfg_si_hw ? m4.height : m4.width) : 0;    /* GUESS (the handler lists height before width) */
     si_words[i++] = cfg_si_dim ? (cfg_si_hw ? m4.width : m4.height) : 0;
-    si_words[i++] = 1;                                 /* byte [s+0x20] (the stock code always writes 1) */
+    si_words[i++] = (uint32_t)cfg_si_b20;              /* byte [s+0x20] (the stock code always writes 1) */
     si_words[i++] = 0;                                 /* byte [s+0x21]: 2 only when AES-encrypted */
     si_words[i++] = 0;                                 /* key bits (0 = none) */
     i += 32 + 16;                                      /* key + IV, zero */
     si_words[i++] = (uint32_t)cfg_si_last;
-    BLOG("stream info (0x60): duration_ms=%u bit_rate=%u; %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
+    BLOG("stream info (0x60): extradata=%u bytes (si_extra=%d) b20=%d; duration_ms=%u bit_rate=%u; %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
+         (unsigned)m4.avcc_len * (cfg_si_extra == 1) + (unsigned)m4.ps_len * (cfg_si_extra == 2), cfg_si_extra, cfg_si_b20,
          (unsigned)si_words[1], (unsigned)si_words[10], (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
          (unsigned)si_words[12], (unsigned)si_words[13], (unsigned)si_words[14]);
     return bcm_pds_send_stream_info(si_words, sizeof si_words);
@@ -3312,6 +3377,7 @@ static void v_start(int id, uint32_t w1)
     m4_rewind();
     if (cfg_reply_ms > 0) sleep(cfg_reply_ms * HZ / 1000 ? cfg_reply_ms * HZ / 1000 : 1);
     /* v15: the 0x60 stream description is the REPLY to this 0x41 (seq echoed) -- the VC waits for it. */
+    if (cfg_noreply) { BLOG("  VARIANT: NOT sending the 0x60 reply"); return; }
     BLOG("  0x60 stream-info reply sent = %d", bcm_send_stream_info());
 }
 static void v_get_frame(int id, uint32_t w1, uint32_t w2)
@@ -3661,8 +3727,9 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v21, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v22, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
+    bcm_apply_variant();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
     if (fd < 0)
@@ -3711,7 +3778,7 @@ static bool dbg_bcm_host(void)
             system_reboot();
         }
     }
-    splash(HZ*2, "v21 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v22 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3774,7 +3841,7 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v21 marker B: after display_control");
+        splash(HZ*2, "v22 marker B: after display_control");
     bcm_playback_probe();
 
     if (cfg_cmds_end && !bcm_check_dead())
@@ -3787,7 +3854,7 @@ static bool dbg_bcm_host(void)
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v21: sent %d video frames", v_frames);
+        splashf(HZ*3, "v22: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
     {
