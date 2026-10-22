@@ -368,6 +368,16 @@ static unsigned bcm_io_read32(unsigned address)
 }
 int bcm_io_dead(void) { return bcm_io_bad; }
 
+/* v24: snapshot of the bus status registers (BCM_CONTROL, BCM_RD_ADDR, BCM_ALT_CONTROL, BCM_ALT_RD_ADDR). The wait loops use
+   BCM_CONTROL bits 0x02 / 0x10 / 0x40 / 0x80 and BCM_RD_ADDR bit 0; logging them before/after the VC stops shows
+   whether the BCM bus itself changed state (sleep / power-down) or only the VideoCore firmware did. */
+void bcm_io_status(unsigned v[4])
+{
+    BCM_IO_LOCK();
+    v[0] = BCM_CONTROL; v[1] = BCM_RD_ADDR; v[2] = BCM_ALT_CONTROL; v[3] = BCM_ALT_RD_ADDR;
+    BCM_IO_UNLOCK();
+}
+
 /* 32-bit aligned VC addresses and lengths only.  memcpy() keeps unaligned RAM buffers safe on
    the ARM7-class core; the compiler turns it into plain loads/stores when the buffer is aligned. */
 void bcm_io_read(unsigned vc_addr, void *dst, unsigned len)

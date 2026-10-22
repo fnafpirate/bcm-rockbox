@@ -2867,6 +2867,8 @@ extern void bcm_io_unlock(void);
 extern void bcm_io_read(unsigned vc_addr, void *dst, unsigned len);
 extern int  bcm_use_vmcs_image(const void *img, unsigned len);
 extern int  bcm_io_dead(void);        /* v16: host bus wait timed out -> the VC stopped answering */
+extern void bcm_io_doorbell(void);    /* v23: BCM_CONTROL = 0x31, the wake/notify write */
+extern void bcm_io_status(unsigned v[4]);   /* v24: bus status registers */
 extern unsigned bcm_get_boot_info(unsigned snap[4]);
 
 #define BCM_VC_ROOT    "/.rockbox/vc"
@@ -3221,6 +3223,8 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             region_w / region_h  destination size (default 320 x 240)
             variant N = a preset of the 0x60 experiments below (0..5), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
                      the test increments on every run (so just run the test again and again and send all the logs)
+            fix1f8   1 (default) = write 1 back into VC[0x1F8] after boot. The stock attach (rt 0x288058) requires VC[0x1F8]==1 and
+                     never writes it; Rockbox's own first LCD update (lcd_awake) leaves 0xffff0000 there (the "now" log line)
             si_extra 0 none / 1 raw avcC record / 2 SPS+PPS (Annex B) as the "extradata" of the 0x60 stream block
             si_b20   the byte at [s+0x20] (stock always 1)    noreply 1 = do NOT answer the VC's 0x41 start    minimal 1 = 0x60 with zero streams
             reboot_end 1 = when the test is over, close the log and reboot the iPod (default 1): the new VC image has no
@@ -3231,7 +3235,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
 static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
 static int cfg_pm = 0, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1;
-static int cfg_si_extra = 0, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1;
+static int cfg_si_extra = 0, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1, cfg_fix1f8 = 1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static void bcm_load_cfg(void)
 {
@@ -3267,6 +3271,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "cmds_end")) cfg_cmds_end = v;
         else if (!strcmp(p, "reboot_end")) cfg_reboot_end = v;
         else if (!strcmp(p, "si_extra")) cfg_si_extra = v;
+        else if (!strcmp(p, "fix1f8"))   cfg_fix1f8 = v;
         else if (!strcmp(p, "si_b20"))   cfg_si_b20 = v;
         else if (!strcmp(p, "noreply"))  cfg_noreply = v;
         else if (!strcmp(p, "minimal"))  cfg_minimal = v;
@@ -3531,6 +3536,10 @@ static void bcm_hi_dump(const char *tag)
 {
     const struct bcm_host_diag *g = bcm_host_get_diag();
     BLOG("---- host-interface state: %s", tag);
+    {   unsigned st[4]; uint32_t f8 = 0;
+        bcm_io_status(st);
+        bcm_io_lock(); bcm_io_read(0x1F8, &f8, 4); bcm_io_unlock();
+        BLOG("bus status: BCM_CONTROL=%04x RD_ADDR=%04x ALT_CONTROL=%04x ALT_RD_ADDR=%04x;  VC[1F8]=%08x", st[0], st[1], st[2], st[3], (unsigned)f8); }
     bcm_dump("hdr +0x10 (signal bytes: tx_sig, rx_ack, ... +0x20 ack, +0x21 VC signal)", g->w1fc + 0x10, 0x20);
     bcm_dump("ch0 (gencmd) descriptor", g->w1fc + g->dir[0], 0x50);
     bcm_dump("ch3 (PDS)    descriptor", g->w1fc + g->dir[3], 0x50);
@@ -3563,10 +3572,10 @@ static void bcm_find_counters(void)
     BLOG("VC liveness: %u counter-like words found in VC RAM 0x1f000..0x2c000 (first: %05x %05x %05x)", bcm_cnt_n,
          bcm_cnt_n > 0 ? bcm_cnt_addr[0] : 0, bcm_cnt_n > 1 ? bcm_cnt_addr[1] : 0, bcm_cnt_n > 2 ? bcm_cnt_addr[2] : 0);
 }
-static void bcm_check_counters(const char *tag)
+static int bcm_check_counters(const char *tag)
 {
     unsigned i, adv = 0; uint32_t x, y;
-    if (!bcm_cnt_n) return;
+    if (!bcm_cnt_n) return -1;
     for (i = 0; i < bcm_cnt_n; i++)
     {
         bcm_io_lock(); bcm_io_read(bcm_cnt_addr[i], &x, 4); bcm_io_unlock();
@@ -3575,6 +3584,32 @@ static void bcm_check_counters(const char *tag)
         if (y != x) adv++;
     }
     BLOG("VC liveness (%s): %u of %u counter words still changing -> VC core %s", tag, adv, bcm_cnt_n, adv ? "RUNNING" : "looks STOPPED");
+    return (int)adv;
+}
+
+/* v23: where did the VC put our stream description? Search VC RAM (0x1f000..0x92000, covers the PDS buffers at 0x813c0)
+   for two consecutive words (fourcc 'H264', bit rate) and print the neighbourhood: shows how far the VC's copy got and how
+   it laid the fields out. */
+static bool bcm_vc_stopped;
+static void bcm_scan_vc_ram(uint32_t w0, uint32_t w1)
+{
+    static uint32_t buf[1024];
+    unsigned base, i; int hits = 0;
+    if (!w0 || !w1) return;
+    BLOG("scanning VC RAM for the stream info words %08x %08x ...", (unsigned)w0, (unsigned)w1);
+    for (base = 0x1f000; base < 0x92000 && hits < 4; base += 0x1000)
+    {
+        bcm_io_lock(); bcm_io_read(base, buf, sizeof buf); bcm_io_unlock();
+        for (i = 0; i + 1 < 1024 && hits < 4; i++)
+            if (buf[i] == w0 && buf[i + 1] == w1)
+            {
+                unsigned at = base + 4 * i, from = at >= 0x20 ? at - 0x20 : 0;
+                BLOG("  HIT at VC 0x%05x", at);
+                bcm_dump("  context", from, 0x60);
+                hits++;
+            }
+    }
+    if (!hits) BLOG("  no hit (the VC never copied it, or copied it differently)");
 }
 
 static void bcm_playback_probe(void)
@@ -3628,13 +3663,32 @@ static void bcm_playback_probe(void)
     bcm_step("mp_region");
     bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay (cfg pm, default off since v20) */
     bcm_find_counters();
+    bcm_hi_dump("just before mp_selectplay");
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, cfg_sel_wait);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
     bcm_step("mp_selectplay");
     bcm_hi_dump("right after mp_selectplay");
-    bcm_check_counters("after mp_selectplay");
+    {
+        int adv = bcm_check_counters("after mp_selectplay");
+        if (adv == 0)
+        {
+            int k;
+            BLOG("VC STOPPED after mp_selectplay: ringing the doorbell (BCM_CONTROL=0x31) 3 times to see whether it only sleeps");
+            for (k = 0; k < 3; k++) { bcm_io_doorbell(); sleep(HZ / 20); }
+            adv = bcm_check_counters("after 3 doorbells");
+            bcm_scan_vc_ram(si_words[9], si_words[10]);
+            if (adv == 0)
+            {
+                bcm_vc_stopped = true;
+                BLOG("VC is dead for this payload variant -- ending the run early (log + reboot) so the next variant can be tried");
+                bcm_diag_cmd("version", 1);
+                bcm_hi_dump("final");
+                return;
+            }
+        }
+    }
     bcm_diag_cmd("version", 2);
     bcm_diag_cmd("tasks", 2);
     bcm_diag_cmd("pm_get_status", 2);
@@ -3727,7 +3781,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v22, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v24, built %s %s", __DATE__, __TIME__);
     bcm_load_cfg();
     bcm_apply_variant();
 
@@ -3778,11 +3832,20 @@ static bool dbg_bcm_host(void)
             system_reboot();
         }
     }
-    splash(HZ*2, "v22 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v24 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
          (unsigned)w[0], (unsigned)w[1], (unsigned)w[2], (unsigned)w[3]);
+
+    if (cfg_fix1f8)
+    {
+        uint32_t one = 1, chk = 0;
+        bcm_io_lock(); bcm_io_write(0x1F8, &one, 4); bcm_io_read(0x1F8, &chk, 4); bcm_io_unlock();
+        BLOG("fix1f8: VC[1F8] written back to 1, reads %08x", (unsigned)chk);
+    }
+    {   unsigned st[4]; bcm_io_status(st);
+        BLOG("bus status after boot: BCM_CONTROL=%04x RD_ADDR=%04x ALT_CONTROL=%04x ALT_RD_ADDR=%04x", st[0], st[1], st[2], st[3]); }
 
     bcm_verify_upload((unsigned)(sizeof bcm_vmcs_buf < 201376 ? sizeof bcm_vmcs_buf : 201376));
     bcm_dump("build string in VC RAM", 0x1F540, 64);
@@ -3841,10 +3904,10 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v22 marker B: after display_control");
+        splash(HZ*2, "v24 marker B: after display_control");
     bcm_playback_probe();
 
-    if (cfg_cmds_end && !bcm_check_dead())
+    if (cfg_cmds_end && !bcm_check_dead() && !bcm_vc_stopped)
     {
         char big[1024]; int cr;
         bcm_cmd_t0 = current_tick;
@@ -3854,7 +3917,7 @@ static bool dbg_bcm_host(void)
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v22: sent %d video frames", v_frames);
+        splashf(HZ*3, "v24: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
     {

@@ -29,6 +29,7 @@ static int fails, checks;
 void bcm_io_lock(void) {}
 void bcm_io_unlock(void) {}
 void bcm_io_doorbell(void) { doorbells++; }
+void bcm_io_status(unsigned v[4]) { v[0] = v[1] = v[2] = v[3] = 0; }
 static int mock_dead;
 int bcm_io_dead(void) { return mock_dead; }
 void bcm_io_idle(void) { if (idle_hook) idle_hook(); }
