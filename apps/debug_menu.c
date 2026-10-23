@@ -2882,6 +2882,18 @@ static int bcm_log_fd = -1;
 static long bcm_t_start;
 static char bcm_last_line[72];
 static long bcm_last_tick;
+/* v25: software watchdog. The v24 log stops right after "vmcs.bin ... bytes", i.e. inside the VC boot, and the iPod sat
+   there. lcd-video.c's own bus waits have no timeout, so a hang there never returns. A tick task (it runs even when the
+   main thread spins) reboots the iPod if no log line has been written for BCM_WD_SECS; the log written so far stays. */
+#define BCM_WD_SECS 45
+static volatile long bcm_wd_last;
+static volatile int  bcm_wd_on;
+static long bcm_last_sync;
+static void bcm_wd_tick(void)
+{
+    if (bcm_wd_on && (long)(current_tick - bcm_wd_last) > BCM_WD_SECS * HZ)
+        system_reboot();
+}
 static void bcm_logline(const char *s, int n)
 {
     char b[200], t[160];
@@ -2894,7 +2906,14 @@ static void bcm_logline(const char *s, int n)
     e = current_tick - bcm_t_start;
     m = snprintf(b, sizeof b, "[%3ld.%02ld] %s\n", e / HZ, e % HZ, t);   /* v16: seconds since the test started */
     write(bcm_log_fd, b, m);
-    fsync(bcm_log_fd);                 /* keep the log even if the VideoCore hangs and we must hard-reset */
+    /* v25: fsync is slow on this 2 TB FAT32 volume right after a boot (0.3-1 s per line in the v24 log). Lines that start with
+       a space (VCFS traces, dumps, list items) are flushed at most twice a second; everything else is flushed at once. */
+    if (t[0] != ' ' || (long)(current_tick - bcm_last_sync) >= HZ / 2)
+    {
+        fsync(bcm_log_fd);             /* keep the log even if the VideoCore hangs and we must hard-reset */
+        bcm_last_sync = current_tick;
+    }
+    bcm_wd_last = current_tick;
     memcpy(bcm_last_line, t, sizeof bcm_last_line - 1); bcm_last_line[sizeof bcm_last_line - 1] = 0;
     bcm_last_tick = current_tick;
 }
@@ -3301,6 +3320,17 @@ static const char * const bcm_variant_name[BCM_NVARIANTS] = {
     "4: do NOT answer the 0x41 (does the VC survive without our 0x60?)",
     "5: 0x60 with zero streams (all-zero payload)"
 };
+static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
+static void bcm_variant_commit(void)
+{
+    char c;
+    int fd;
+    if (bcm_variant_next < 0) return;
+    c = (char)('0' + bcm_variant_next);
+    bcm_variant_next = -1;
+    fd = open("/.rockbox/bcm_variant.cnt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) { write(fd, &c, 1); close(fd); }
+}
 static void bcm_apply_variant(void)
 {
     int v = cfg_variant;
@@ -3310,9 +3340,7 @@ static void bcm_apply_variant(void)
         if (fd >= 0) { if (read(fd, &c, 1) != 1) c = '0'; close(fd); }
         v = (c >= '0' && c <= '9') ? c - '0' : 0;
         v %= BCM_NVARIANTS;
-        c = (char)('0' + (v + 1) % BCM_NVARIANTS);
-        fd = open("/.rockbox/bcm_variant.cnt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd >= 0) { write(fd, &c, 1); close(fd); }
+        bcm_variant_next = (v + 1) % BCM_NVARIANTS;     /* committed in v_start: a run that dies before the 0x60 does not use up a variant */
     }
     if (v < 0) return;
     if (v >= BCM_NVARIANTS) v = 0;
@@ -3382,6 +3410,7 @@ static void v_start(int id, uint32_t w1)
     m4_rewind();
     if (cfg_reply_ms > 0) sleep(cfg_reply_ms * HZ / 1000 ? cfg_reply_ms * HZ / 1000 : 1);
     /* v15: the 0x60 stream description is the REPLY to this 0x41 (seq echoed) -- the VC waits for it. */
+    bcm_variant_commit();
     if (cfg_noreply) { BLOG("  VARIANT: NOT sending the 0x60 reply"); return; }
     BLOG("  0x60 stream-info reply sent = %d", bcm_send_stream_info());
 }
@@ -3781,7 +3810,10 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v24, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v25, built %s %s", __DATE__, __TIME__);
+    BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
+    bcm_wd_last = current_tick; bcm_wd_on = 1;
+    tick_add_task(bcm_wd_tick);
     bcm_load_cfg();
     bcm_apply_variant();
 
@@ -3801,7 +3833,9 @@ static bool dbg_bcm_host(void)
     }
     BLOG("vmcs.bin %d bytes", r);
 
+    BLOG("booting the VC from vmcs.bin now (about 1 s; if the log stops here the boot hung: the watchdog reboots after %d s)", BCM_WD_SECS);
     splash(0, "Booting VideoCore from file...");
+    BLOG("boot splash shown; calling bcm_use_vmcs_image");
     vmcs_len = (unsigned)r;
     r = bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);
     boots = bcm_get_boot_info(snap);
@@ -3832,7 +3866,7 @@ static bool dbg_bcm_host(void)
             system_reboot();
         }
     }
-    splash(HZ*2, "v24 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    splash(HZ*2, "v25 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3904,7 +3938,7 @@ static bool dbg_bcm_host(void)
         bcm_display_probe();
     bcm_step("display_control probe");
     if (!bcm_check_dead())
-        splash(HZ*2, "v24 marker B: after display_control");
+        splash(HZ*2, "v25 marker B: after display_control");
     bcm_playback_probe();
 
     if (cfg_cmds_end && !bcm_check_dead() && !bcm_vc_stopped)
@@ -3917,7 +3951,7 @@ static bool dbg_bcm_host(void)
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
     if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v24: sent %d video frames", v_frames);
+        splashf(HZ*3, "v25: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
     {
@@ -3927,6 +3961,8 @@ out:
         bcm_log_fd = -1;
         system_reboot();
     }
+    bcm_wd_on = 0;
+    tick_remove_task(bcm_wd_tick);
     if (bcm_log_fd >= 0)
         close(bcm_log_fd);
     bcm_log_fd = -1;
