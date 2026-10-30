@@ -2869,6 +2869,7 @@ extern int  bcm_use_vmcs_image(const void *img, unsigned len);
 extern int  bcm_io_dead(void);        /* v16: host bus wait timed out -> the VC stopped answering */
 extern void bcm_io_doorbell(void);    /* v23: BCM_CONTROL = 0x31, the wake/notify write */
 extern void bcm_io_status(unsigned v[4]);   /* v24: bus status registers */
+extern void bcm_lcd_freeze(bool on);        /* v26: no more legacy LCD traffic to the BCM */
 extern unsigned bcm_get_boot_info(unsigned snap[4]);
 
 #define BCM_VC_ROOT    "/.rockbox/vc"
@@ -3027,6 +3028,7 @@ static const struct bcm_pds_ops pds_probe_ops = {
    h264dec.vll exports the JM-style GetAnnexbNALU/InterpretSPS/InterpretPPS -- i.e. it parses an
    Annex-B byte stream, not MP4's length-prefixed samples. The PDS frame payload being raw Annex B
    is therefore an inference from those symbols, not something seen on hardware yet. */
+static int cfg_frame_avcc = 1;     /* v27: 1 = send MP4 samples unchanged (AVCC, length-prefixed) like the stock firmware; 0 = convert to Annex B (v13-v26) */
 #define M4_RAW_MAX 61440
 #define M4_OUT_MAX 65536
 #define FOURCC(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
@@ -3202,6 +3204,12 @@ static int m4_next(uint32_t *ts_ms, bool *key)
         if ((m4_raw[p + m4.nal_len] & 0x1f) == 5) idr = true;
         p += m4.nal_len + n;
     }
+    if (cfg_frame_avcc)                                                  /* v27: stock-style AVCC sample, no conversion */
+    {
+        memcpy(m4_out, m4_raw, size);
+        *key = idr;
+        return (int)size;
+    }
     if ((first || idr) && m4.ps_len) { memcpy(m4_out, m4.ps, m4.ps_len); o = m4.ps_len; }
     for (p = 0; p + m4.nal_len <= size; )                               /* pass 2: length-prefixed -> Annex B */
     {
@@ -3242,6 +3250,12 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             region_w / region_h  destination size (default 320 x 240)
             variant N = a preset of the 0x60 experiments below (0..5), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
                      the test increments on every run (so just run the test again and again and send all the logs)
+            audio    1 (default) = send "audio_enable 1" before mp_selectplay (the stock mp_selectplay path does: rt 0x1fa3dc -> 0x1f90f4)
+            frame_avcc 1 (default) = hand the VC the MP4 samples unchanged (length-prefixed AVCC, as the stock does; the RAM snapshot
+                     shows avcC extradata + "NAL length size - 1 = 3" in the 0x60 block); 0 = Annex B conversion (v13-v26)
+            nolcd    1 (default) = after the VC boot freeze the legacy LCD driver (no splash markers, no lcd_tick kicks):
+                     the v25 logs show VC[1F8] = 0xffff0000 (BCMCMD_LCD_UPDATE) again right before mp_selectplay, written
+                     by Rockbox's own LCD code after marker B; the stock firmware never touches that word
             fix1f8   1 (default) = write 1 back into VC[0x1F8] after boot. The stock attach (rt 0x288058) requires VC[0x1F8]==1 and
                      never writes it; Rockbox's own first LCD update (lcd_awake) leaves 0xffff0000 there (the "now" log line)
             si_extra 0 none / 1 raw avcC record / 2 SPS+PPS (Annex B) as the "extradata" of the 0x60 stream block
@@ -3251,10 +3265,10 @@ static int m4_next(uint32_t *ts_ms, bool *key)
                      session booted the VC badly (v20 log)
             pm_play 1 = send pm_set_policy min before mp_play too (default 0: the second one hung the VC in v18)
             disp_all 1 = also try display_control 1 / model=1 (default 0: only "display_control 0 model=2 power=1") */
-static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = 0, cfg_si_count = 1;
+static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = -1, cfg_si_count = 1;
 static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel_wait = 12;
-static int cfg_pm = 0, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1;
-static int cfg_si_extra = 0, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1, cfg_fix1f8 = 1;
+static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1, cfg_audio = 1;
+static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1, cfg_fix1f8 = 1, cfg_nolcd = 1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static void bcm_load_cfg(void)
 {
@@ -3291,6 +3305,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "reboot_end")) cfg_reboot_end = v;
         else if (!strcmp(p, "si_extra")) cfg_si_extra = v;
         else if (!strcmp(p, "fix1f8"))   cfg_fix1f8 = v;
+        else if (!strcmp(p, "nolcd"))    cfg_nolcd = v;
+        else if (!strcmp(p, "audio"))    cfg_audio = v;
+        else if (!strcmp(p, "frame_avcc")) cfg_frame_avcc = v;
         else if (!strcmp(p, "si_b20"))   cfg_si_b20 = v;
         else if (!strcmp(p, "noreply"))  cfg_noreply = v;
         else if (!strcmp(p, "minimal"))  cfg_minimal = v;
@@ -3304,7 +3321,7 @@ static void bcm_load_cfg(void)
         else BLOG("cfg: unknown key '%s'", p);
     }
     BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
-    BLOG("cfg: si_w8=%d si_dur=%d si_hw=%d si_dim=%d si_w1=%d si_last=%d si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d cmds_end=%d",
+    BLOG("cfg: si_w8=%d si_dur=%d si_hw=%d si_dim=%d si_w1=%d si_last=%d(-1=auto) si_count=%d f2=%d map=%d reply_ms=%d skip_disp=%d sel_wait=%d pm=%d step=%d cmds_end=%d",
          cfg_si_w8, cfg_si_dur, cfg_si_hw, cfg_si_dim, cfg_si_w1, cfg_si_last, cfg_si_count, cfg_f2, cfg_map, cfg_reply_ms, cfg_skip_disp, cfg_sel_wait, cfg_pm, cfg_step, cfg_cmds_end);
 }
 
@@ -3313,10 +3330,10 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 6
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: baseline (as v21: no extradata, b20=1)",
-    "1: extradata = raw avcC record",
-    "2: extradata = SPS+PPS Annex B",
-    "3: raw avcC extradata + byte[s+0x20]=0",
+    "0: STOCK-LIKE (avcC extradata, NAL size-1 word, AVCC frames, audio_enable, pm_set_policy)",
+    "1: old baseline (no extradata, last word 0, Annex B frames)",
+    "2: extradata = SPS+PPS Annex B, Annex B frames",
+    "3: stock-like but byte[s+0x20]=0",
     "4: do NOT answer the 0x41 (does the VC survive without our 0x60?)",
     "5: 0x60 with zero streams (all-zero payload)"
 };
@@ -3344,12 +3361,12 @@ static void bcm_apply_variant(void)
     }
     if (v < 0) return;
     if (v >= BCM_NVARIANTS) v = 0;
-    cfg_si_extra = 0; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0;
+    cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0;
     switch (v)
     {
-    case 1: cfg_si_extra = 1; break;
-    case 2: cfg_si_extra = 2; break;
-    case 3: cfg_si_extra = 1; cfg_si_b20 = 0; break;
+    case 1: cfg_si_extra = 0; cfg_si_last = 0; cfg_frame_avcc = 0; break;
+    case 2: cfg_si_extra = 2; cfg_frame_avcc = 0; break;
+    case 3: cfg_si_b20 = 0; break;
     case 4: cfg_noreply = 1; break;
     case 5: cfg_minimal = 1; break;
     default: break;
@@ -3389,7 +3406,7 @@ static int bcm_send_stream_info(void)
     si_words[i++] = 0;                                 /* byte [s+0x21]: 2 only when AES-encrypted */
     si_words[i++] = 0;                                 /* key bits (0 = none) */
     i += 32 + 16;                                      /* key + IV, zero */
-    si_words[i++] = (uint32_t)cfg_si_last;
+    si_words[i++] = cfg_si_last >= 0 ? (uint32_t)cfg_si_last : (uint32_t)(m4.nal_len - 1);   /* stock: avcC lengthSizeMinusOne (3) */
     BLOG("stream info (0x60): extradata=%u bytes (si_extra=%d) b20=%d; duration_ms=%u bit_rate=%u; %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
          (unsigned)m4.avcc_len * (cfg_si_extra == 1) + (unsigned)m4.ps_len * (cfg_si_extra == 2), cfg_si_extra, cfg_si_b20,
          (unsigned)si_words[1], (unsigned)si_words[10], (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
@@ -3494,6 +3511,15 @@ static void bcm_pm_set(void)
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("pm_set_policy min", resp, sizeof resp, 3);
     bcm_log_text("pm_set_policy min", r, resp);
+}
+/* v27: the stock mp_selectplay path starts with "audio_enable 1" (function 0x1f90f4, called at 0x1fa3dc), then pm_set_policy min, then mp_selectplay. */
+static void bcm_audio_enable(void)
+{
+    char resp[200]; int r;
+    if (!cfg_audio) return;
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched("audio_enable 1", resp, sizeof resp, 3);
+    bcm_log_text("audio_enable 1", r, resp);
 }
 static void bcm_pm_info(void)
 {
@@ -3690,6 +3716,7 @@ static void bcm_playback_probe(void)
         }
     }
     bcm_step("mp_region");
+    bcm_audio_enable();                                /* v27: stock order: audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay (cfg pm, default off since v20) */
     bcm_find_counters();
     bcm_hi_dump("just before mp_selectplay");
@@ -3810,7 +3837,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v25, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v27, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
@@ -3866,7 +3893,13 @@ static bool dbg_bcm_host(void)
             system_reboot();
         }
     }
-    splash(HZ*2, "v25 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
+    if (cfg_nolcd)
+    {
+        bcm_lcd_freeze(true);
+        BLOG("nolcd: legacy LCD driver frozen (no splash markers, no lcd_tick kicks of VC[1F8] / BCM_CONTROL=0x31)");
+    }
+    else
+        splash(HZ*2, "v26 marker A: VC booted from file");   /* legacy LCD path: visible or black? */
 
     bcm_io_lock(); bcm_io_read(0x1F0, w, 16); bcm_io_unlock();
     BLOG("VC[1F0..1FC] now              = %08x %08x %08x %08x",
@@ -3937,8 +3970,8 @@ static bool dbg_bcm_host(void)
     if (!cfg_skip_disp)
         bcm_display_probe();
     bcm_step("display_control probe");
-    if (!bcm_check_dead())
-        splash(HZ*2, "v25 marker B: after display_control");
+    if (!cfg_nolcd && !bcm_check_dead())
+        splash(HZ*2, "v26 marker B: after display_control");
     bcm_playback_probe();
 
     if (cfg_cmds_end && !bcm_check_dead() && !bcm_vc_stopped)
@@ -3950,8 +3983,8 @@ static bool dbg_bcm_host(void)
         { const struct bcm_host_stats *st = bcm_host_get_stats();
           BLOG("end stats: rx=%u tx=%u truncated=%u resynced=%u bad_magic=%u", st->rx_msgs, st->tx_msgs, st->truncated, st->resynced, st->bad_magic); }
     }
-    if (v_live && !bcm_check_dead())
-        splashf(HZ*3, "v25: sent %d video frames", v_frames);
+    if (v_live && !cfg_nolcd && !bcm_check_dead())
+        splashf(HZ*3, "v26: sent %d video frames", v_frames);
 out:
     if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
     {

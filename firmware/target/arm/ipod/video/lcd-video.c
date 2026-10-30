@@ -206,6 +206,11 @@ static void continue_lcd_awake(void)
 }
 #endif
 
+/* v26: while set, the legacy LCD driver does not touch the BCM at all (no lcd_tick kicks = no writes of 0xffff0000 to VC[0x1F8]
+   and no BCM_CONTROL=0x31 doorbells, no lcd_update*). The stock firmware never uses that mailbox with this VC image. */
+static volatile bool bcm_lcd_frozen;
+void bcm_lcd_freeze(bool on) { bcm_lcd_frozen = on; }
+
 #ifndef BOOTLOADER
 static void lcd_tick(void)
 {
@@ -214,7 +219,7 @@ static void lcd_tick(void)
     corelock_lock(&lcd_state.cl);
 #endif
 
-    if (!lcd_state.blocked && lcd_state.state >= LCD_NEED_UPDATE)
+    if (!lcd_state.blocked && !bcm_lcd_frozen && lcd_state.state >= LCD_NEED_UPDATE)
     {
         unsigned data = bcm_read32(BCMA_COMMAND);
         bool bcm_is_busy = (data == BCMCMD_LCD_UPDATE || data == 0xFFFF);
@@ -527,6 +532,7 @@ void lcd_init_device(void)
 /* Update a fraction of the display. */
 void lcd_update_rect(int x, int y, int width, int height)
 {
+    if (bcm_lcd_frozen) return;
     const fb_data *addr;
     unsigned bcmaddr;
 
@@ -579,6 +585,7 @@ void lcd_update_rect(int x, int y, int width, int height)
    This must be called after all other LCD functions that change the display. */
 void lcd_update(void)
 {
+    if (bcm_lcd_frozen) return;
     lcd_update_rect(0, 0, LCD_WIDTH, LCD_HEIGHT);
 }
 
