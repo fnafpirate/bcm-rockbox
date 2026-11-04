@@ -562,6 +562,9 @@ static int parse_dec(const char *s, size_t max)
 
 /* Announce/continue one chunk of a frame (rt 0x288c14): write data into the VC buffer, then
  * send the 12-word reply (header opcode 0x61, seq echoed from the last PDS request). */
+static int pds_flags_legacy = 0;
+void bcm_host_set_pds_flags_legacy(int on) { pds_flags_legacy = on ? 1 : 0; }
+
 static int pds_send_chunk(int b)
 {
     struct hi_chan *c = chan_by_type(CH_VCPD);
@@ -574,6 +577,8 @@ static int pds_send_chunk(int b)
     bool first = (hi.pds_pend[b].sent == 0), last = (n == remaining);
     uint32_t flag = first ? (last ? PDS_FLAG_WHOLE : PDS_FLAG_FIRST)
                           : (last ? PDS_FLAG_LAST  : PDS_FLAG_MIDDLE);
+    if (pds_flags_legacy)          /* pre-v29 numbering (A/B test only) */
+        flag = first ? (last ? 2u : 0u) : (last ? 3u : 1u);
 
     /* rt 0x287be8(dst=VC buffer, src, len rounded up to 16, port 0) */
     uint32_t padded = (n + 15u) & ~15u;

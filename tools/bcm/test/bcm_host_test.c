@@ -341,6 +341,8 @@ static void test_pds(void)
     pds_req(0x42, 0x80000005u, 0, 0, 0, 0, 0, NULL);
     expect_frame_reply(0x80000005u, 1808, PDS_FLAG_LAST, A, frame + 8192, 0, f.meta);
 
+    /* v29: the numeric values are the stock ones (bit0 = first chunk, bit1 = last chunk; whole frame = 3) */
+    CHECK(PDS_FLAG_WHOLE == 3 && PDS_FLAG_FIRST == 1 && PDS_FLAG_LAST == 2 && PDS_FLAG_MIDDLE == 0, "chunk flag values are the stock ones");
     /* a small frame on stream 1 -> buffer B, whole-frame flag, 100 bytes padded to 112 */
     memset(vcram + B, 0xEE, 256);
     struct bcm_pds_frame g = { .stream_id = 1, .f2 = 0, .f4 = 99, .length = 100, .meta = {1, 2, 3, 4}, .data = frame };

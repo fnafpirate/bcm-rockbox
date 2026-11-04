@@ -3248,7 +3248,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             region_when bitmask of when to send mp_region: 1 before mp_selectplay, 2 after it, 4 after mp_play (default 3)
             region_mode 0 = mode=fill, 1 = mode=letterbox pixel="1 1"  (the only two strings in the stock firmware)
             region_w / region_h  destination size (default 320 x 240)
-            variant N = a preset of the 0x60 experiments below (0..7), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
+            variant N = a preset of the frame experiments below (0..3), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
                      the test increments on every run (so just run the test again and again and send all the logs)
             audio    1 (default) = send "audio_enable 1" before mp_selectplay (the stock mp_selectplay path does: rt 0x1fa3dc -> 0x1f90f4)
             frame_avcc 1 (default) = hand the VC the MP4 samples unchanged (length-prefixed AVCC, as the stock does; the RAM snapshot
@@ -3268,6 +3268,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             setvol   v28: 1 (default) = send "mp_setvol 0" right before audio_enable (stock rt 0x1f9158 does this at the start of
                      every mp_selectplay; mplayer.vll does not list the command, so the VC will probably answer "error")
             vchr47   v28: 0 (default) = answer VCHR op 0x47 with a zero-length payload like the stock (rt 0xfa0a8); 1 = the old 4 bytes
+            flags_legacy v29: 1 = the pre-v29 chunk flag numbering (whole frame = 2); default 0 = stock (whole frame = 3)
             freeze   v28: 1 = send "display_control 0 freeze=0" right after the VC boot (stock rt 0x164788 does after bring-up)
 */
 static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = -1, cfg_si_count = 1;
@@ -3275,7 +3276,7 @@ static int cfg_f2 = 2, cfg_map = 0, cfg_reply_ms = 0, cfg_skip_disp = 0, cfg_sel
 static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1, cfg_audio = 1;
 static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1, cfg_fix1f8 = 1, cfg_nolcd = 1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
-static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0;
+static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3327,6 +3328,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "setvol"))   cfg_setvol = v;
         else if (!strcmp(p, "vchr47"))   cfg_vchr47 = v;
         else if (!strcmp(p, "freeze"))   cfg_freeze = v;
+        else if (!strcmp(p, "flags_legacy")) cfg_flags_legacy = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
     BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
@@ -3337,16 +3339,12 @@ static void bcm_load_cfg(void)
 /* v22: the v21 log shows the VC core stops right after it consumes our 0x60 reply (selectplay is answered within 1 ms, then
    nothing: no further gencmd is read, its ack bits for ch0/ch2/ch3 never toggle, none of 6 RAM tick counters moves).
    Which part of the payload kills it is unknown, so each run can try one preset. */
-#define BCM_NVARIANTS 8
+#define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: STOCK-LIKE (avcC extradata, NAL size-1 word, AVCC frames, audio_enable, pm_set_policy)",
-    "1: old baseline (no extradata, last word 0, Annex B frames)",
-    "2: extradata = SPS+PPS Annex B, Annex B frames",
-    "3: stock-like but byte[s+0x20]=0",
-    "4: do NOT answer the 0x41 (does the VC survive without our 0x60?)",
-    "5: 0x60 with zero streams (all-zero payload)",
-    "6: stock-like but the OLD 4-byte reply to VCHR op 0x47 (A/B test of the v28 fix)",
-    "7: stock-like but without mp_setvol 0 and with display_control 0 freeze=0 after the boot"
+    "0: STOCK-LIKE incl. chunk flag 3 for a whole frame (v29 fix of the lost_frame_assert_packetorder)",
+    "1: stock-like but the OLD chunk flag numbering (whole frame = 2): A/B test, expect packetorder errors",
+    "2: stock-like, frame f2 = 0",
+    "3: stock-like, frame f2 = 1"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3372,16 +3370,12 @@ static void bcm_apply_variant(void)
     }
     if (v < 0) return;
     if (v >= BCM_NVARIANTS) v = 0;
-    cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0;
+    cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
     switch (v)
     {
-    case 1: cfg_si_extra = 0; cfg_si_last = 0; cfg_frame_avcc = 0; break;
-    case 2: cfg_si_extra = 2; cfg_frame_avcc = 0; break;
-    case 3: cfg_si_b20 = 0; break;
-    case 4: cfg_noreply = 1; break;
-    case 5: cfg_minimal = 1; break;
-    case 6: cfg_vchr47 = 1; break;
-    case 7: cfg_setvol = 0; cfg_freeze = 1; break;
+    case 1: cfg_flags_legacy = 1; break;
+    case 2: cfg_f2 = 0; break;
+    case 3: cfg_f2 = 1; break;
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3488,7 +3482,7 @@ static const struct bcm_pds_ops pds_video_ops = { v_start, v_get_frame, v_seek, 
 static void bcm_video_run(int secs)
 {
     long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
-    char resp[256];
+    static char resp[1400];                           /* v29: the v28 logs cut mp_get_stats at 256 bytes (lost_frame_assert_d...) */
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
@@ -3874,7 +3868,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v28, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v29, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
@@ -3979,7 +3973,8 @@ static bool dbg_bcm_host(void)
 
     bcm_vfs_set_root(BCM_VC_ROOT);
     bcm_host_set_trace(bcm_trace_cb);
-    bcm_host_set_vchr47_len((uint32_t)cfg_vchr47);       /* v28: 0 = stock zero-length reply to VCHR op 0x47 */
+    bcm_host_set_vchr47_len((uint32_t)cfg_vchr47);
+    bcm_host_set_pds_flags_legacy(cfg_flags_legacy);       /* v29: stock chunk flags unless flags_legacy=1 */       /* v28: 0 = stock zero-length reply to VCHR op 0x47 */
     for (i = 0; i < (int)(sizeof cmds / sizeof cmds[0]); i++)
     {
         bcm_cmd_t0 = current_tick;

@@ -107,9 +107,13 @@ int  bcm_pds_send_frame(const struct bcm_pds_frame *f);
  * 0x61 reply of two zero words). Presumably end-of-stream / no frame available [I]. */
 int  bcm_pds_send_empty(void);
 
-/* Chunk flag byte in the 0x61 reply (payload word 6). Values decoded from rt 0x288c14 but the
- * meaning is inferred from control flow [UNVERIFIED]. */
-enum { PDS_FLAG_FIRST = 0, PDS_FLAG_MIDDLE = 1, PDS_FLAG_WHOLE = 2, PDS_FLAG_LAST = 3 };
+/* Chunk flag byte in the 0x61 reply (payload word 6).  v29: the stock hand-off (rt 0x288c14) has a per-stream "state" word
+ * S ([0x10833c4c+4] video, +8 audio; set to 1 by the 0x41 start).  Whole frame: S==1 -> 3, S==0 -> 2 and S:=1.  Frame that does not fit
+ * the PDS buffer: first chunk S==1 -> 1 and S:=0; middle chunks (S==0) -> 0; last chunk (S==0, fits) -> 2 and S:=1.  So bit0 = "first
+ * chunk of a frame", bit1 = "last chunk of a frame", and a complete frame is 3.  v14-v28 sent 2 for a whole frame, i.e. "last chunk
+ * without a first one" -- the VC counted every frame as lost_frame_assert_packetorder (v28 logs). */
+enum { PDS_FLAG_MIDDLE = 0, PDS_FLAG_FIRST = 1, PDS_FLAG_LAST = 2, PDS_FLAG_WHOLE = 3 };
+void bcm_host_set_pds_flags_legacy(int on);     /* A/B test: 1 = the pre-v29 values (first 0, middle 1, whole 2, last 3) */
 
 /* Stream description = the REPLY to the VC's PDS start request (0x41), opcode 0x60, seq echoed from that request
  * (rt 0x288f40, called from the start callback rt 0xa04f0 -> 0x20af74). The VC waits for it before it asks for
