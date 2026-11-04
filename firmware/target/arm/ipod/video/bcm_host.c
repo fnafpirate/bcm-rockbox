@@ -688,6 +688,10 @@ static void pds_dispatch(struct hi_chan *c, const struct hi_msg *m)
     }
 }
 
+/* v28: payload length of the reply to VCHR op 0x47. Stock = 0 (default); 4 = the pre-v28 behaviour. */
+static uint32_t vchr47_len = 0;
+void bcm_host_set_vchr47_len(uint32_t n) { vchr47_len = n ? 4 : 0; }
+
 /* --------------------------------------------------------------- service ------ */
 void bcm_host_service(void)
 {
@@ -718,6 +722,18 @@ void bcm_host_service(void)
             case CH_VCPD:   pds_dispatch(c, &m); break;
             case CH_VCHR:                                 /* hostreq: stock op 0x46 calls a stub returning 0 and replies */
                 hi.st.unknown_ops++;
+                if (m.op == 0x47) {
+                    /* v28: stock dispatcher rt 0xf9ca0, op 0x47 = event notification {id, arg}: the host calls the
+                     * callback registered for `id` (default stub: bx lr) and replies with op 0 and a ZERO-LENGTH
+                     * payload (r8 stays 0 on this path, rt 0xfa0a8). Earlier versions sent 4 payload bytes. */
+                    uint32_t w0 = 0, w1 = 0;
+                    if (m.len >= 4) memcpy(&w0, m.payload, 4);
+                    if (m.len >= 8) memcpy(&w1, m.payload + 4, 4);
+                    TRACE("vchr 0x47 event (id, arg)", w0, w1, NULL);
+                    if (vchr47_len) { uint32_t z = 0; reply(c, &m, 0, &z, 4); }
+                    else reply(c, &m, 0, NULL, 0);
+                    break;
+                }
                 TRACE("vchr op", m.op, m.len, NULL);
                 if (m.op != 0x61) { uint32_t z = 0; reply(c, &m, 0, &z, 4); }
                 break;

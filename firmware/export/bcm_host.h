@@ -121,6 +121,7 @@ int  bcm_pds_send_stream_info(const uint32_t *words, uint32_t len);
 /* Optional. Called for every VCFS operation, PDS opcode and any message on a channel the module
  * does not serve (VCHR, graphics), so first-hardware runs show what the VideoCore actually asks
  * for. `s` is a path or NULL. Do not call back into bcm_host from the callback. */
+void bcm_host_set_vchr47_len(uint32_t n);      /* v28: 0 = stock zero-length reply to VCHR op 0x47 (default), nonzero = old 4-byte payload */
 void bcm_host_set_trace(void (*fn)(const char *tag, uint32_t a, uint32_t b, const char *s));
 
 /* ---- diagnostics ---------------------------------------------------------------- */

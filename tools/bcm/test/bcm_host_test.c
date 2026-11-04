@@ -591,6 +591,17 @@ static void test_vchr_reply(void)
     struct rmsg r;
     CHECK(vc_recv(3, &r) && r.op == 0 && r.len == 4 && r.seq == 0x80000abcu, "VCHR op 0x46 is answered with result 0 and a 4-byte payload");
     uint32_t z = 1; memcpy(&z, r.payload, 4); CHECK(z == 0, "payload is 0");
+
+    /* v28: op 0x47 (event notification {id, arg}) is answered with op 0 and a ZERO-LENGTH payload like the stock rt 0xfa0a8 path */
+    uint32_t ev[2] = { 3, 0x11 };
+    vc_send(3, 0x47, 0x80000abdu, ev, 8);
+    bcm_host_service();
+    CHECK(vc_recv(3, &r) && r.op == 0 && r.len == 0 && r.seq == 0x80000abdu, "VCHR op 0x47 is answered with op 0 and a zero-length payload (len=%u)", (unsigned)r.len);
+    bcm_host_set_vchr47_len(1);
+    vc_send(3, 0x47, 0x80000abeu, ev, 8);
+    bcm_host_service();
+    CHECK(vc_recv(3, &r) && r.op == 0 && r.len == 4 && r.seq == 0x80000abeu, "vchr47_len=1 restores the old 4-byte reply");
+    bcm_host_set_vchr47_len(0);
 }
 
 /* attach() must not depend on VC[0x1F8]==1, and must reject a nonsense info pointer ------------ */
