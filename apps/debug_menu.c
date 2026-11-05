@@ -3245,10 +3245,10 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             pm      1 = send "pm_set_policy min" like the stock firmware does before mp_selectplay / mp_play (default 1)
             step    1 = pause after each phase until you press a button (so you can say after which one the screen changed)
             cmds_end 1 = send the long `commands` list at the very end (tests the oversized-reply fix; default 1)
-            region_when bitmask of when to send mp_region: 1 before mp_selectplay, 2 after it, 4 after mp_play (default 3)
+            region_when bitmask of when to send mp_region: 1 before mp_selectplay, 2 after it, 4 after mp_play (default 1; variants 1/2 use 7, variant 3 uses 0)
             region_mode 0 = mode=fill, 1 = mode=letterbox pixel="1 1"  (the only two strings in the stock firmware)
             region_w / region_h  destination size (default 320 x 240)
-            variant N = a preset of the frame experiments below (0..3), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
+            variant N = a preset of the mp_region experiments below (0..3), or  variant=auto : use /.rockbox/bcm_variant.cnt, which
                      the test increments on every run (so just run the test again and again and send all the logs)
             audio    1 (default) = send "audio_enable 1" before mp_selectplay (the stock mp_selectplay path does: rt 0x1fa3dc -> 0x1f90f4)
             frame_avcc 1 (default) = hand the VC the MP4 samples unchanged (length-prefixed AVCC, as the stock does; the RAM snapshot
@@ -3341,10 +3341,10 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: STOCK-LIKE incl. chunk flag 3 for a whole frame (v29 fix of the lost_frame_assert_packetorder)",
-    "1: stock-like but the OLD chunk flag numbering (whole frame = 2): A/B test, expect packetorder errors",
-    "2: stock-like, frame f2 = 0",
-    "3: stock-like, frame f2 = 1"
+    "0: video, mp_region fill BEFORE mp_selectplay only (= the v29 run)",
+    "1: video, mp_region fill before mp_selectplay + after mp_selectplay + after mp_play",
+    "2: video, mp_region mode=letterbox pixel=\"1 1\" at all three points",
+    "3: video, NO mp_region at all"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3371,11 +3371,12 @@ static void bcm_apply_variant(void)
     if (v < 0) return;
     if (v >= BCM_NVARIANTS) v = 0;
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
+    cfg_region_when = 1; cfg_region_mode = 0;
     switch (v)
     {
-    case 1: cfg_flags_legacy = 1; break;
-    case 2: cfg_f2 = 0; break;
-    case 3: cfg_f2 = 1; break;
+    case 1: cfg_region_when = 7; break;
+    case 2: cfg_region_when = 7; cfg_region_mode = 1; break;
+    case 3: cfg_region_when = 0; break;
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3868,7 +3869,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v29, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v30, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
