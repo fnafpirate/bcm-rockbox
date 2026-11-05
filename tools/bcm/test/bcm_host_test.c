@@ -167,6 +167,26 @@ static void test_gencmd(void)
     CHECK(doorbells >= 2, "doorbell rung");
 }
 
+static void gfx_idle(void)                         /* mock VC graphics service: op 8 -> (handle, address), others -> 0 */
+{
+    struct rmsg m;
+    if (vc_recv(1, &m)) {
+        uint32_t pl[4] = { 0x1234, 0, 0, 0 };
+        if (m.op == 8) { pl[0] = 0x77; pl[1] = 0x00120000; CHECK(m.payload[4] == 1, "fmt byte"); }
+        vc_send(1, 0, m.seq, pl, 16);
+    }
+}
+static void test_gfx(void)
+{
+    uint32_t out[4] = { 0 }, rop = 99, in[8] = { 0 };
+    idle_hook = gfx_idle;
+    CHECK(bcm_gfx_rpc(1, NULL, 0, out, &rop, 100) == 0 && out[0] == 0x1234 && rop == 0, "gfx op 1");
+    ((uint8_t *)in)[4] = 1; in[2] = 320; in[3] = 240; in[4] = 640;
+    CHECK(bcm_gfx_rpc(8, in, 0x20, out, &rop, 100) == 0 && out[0] == 0x77 && out[1] == 0x00120000, "gfx op 8 reply %x %x", out[0], out[1]);
+    idle_hook = NULL;
+    CHECK(bcm_gfx_rpc(2, NULL, 0, out, &rop, 5) == -2, "gfx timeout without a reply");
+}
+
 static uint32_t vcfs_call(uint32_t op, uint32_t p0, uint32_t p1, uint32_t p2, const void *data, uint16_t dlen,
                           struct rmsg *out)
 {
@@ -664,6 +684,7 @@ int main(int argc, char **argv)
     printf("[gencmd survives truncation]\n"); fflush(stdout); test_gencmd_after_truncation();
     printf("[resync after stray bytes]\n"); fflush(stdout); test_resync_after_stray_bytes();
     printf("[vchr]\n"); fflush(stdout); test_vchr_reply();
+    printf("[gfx]\n"); fflush(stdout); test_gfx();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",
            st->rx_msgs, st->tx_msgs, st->vcfs_ops, st->pds_ops, st->bad_magic, st->unknown_ops);

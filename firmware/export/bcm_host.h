@@ -53,6 +53,7 @@ int  bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls);
  *                                             arrived, or -3 if still waiting. Does not sleep.
  * Typical use: bcm_gencmd_start(cmd); then loop calling bcm_gencmd_poll() with your own sleep and
  * progress logging between calls until it returns something other than -3. */
+int  bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls); /* v34: graphics channel */
 int  bcm_gencmd_start(const char *cmd);
 int  bcm_gencmd_poll(char *resp, size_t resp_sz);
 

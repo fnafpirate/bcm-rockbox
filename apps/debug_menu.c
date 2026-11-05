@@ -2865,6 +2865,7 @@ static bool view_ram_info(void)
 extern void bcm_io_lock(void);
 extern void bcm_io_unlock(void);
 extern void bcm_io_read(unsigned vc_addr, void *dst, unsigned len);
+extern void bcm_io_write(unsigned vc_addr, const void *src, unsigned len);
 extern int  bcm_use_vmcs_image(const void *img, unsigned len);
 extern int  bcm_io_dead(void);        /* v16: host bus wait timed out -> the VC stopped answering */
 extern void bcm_io_doorbell(void);    /* v23: BCM_CONTROL = 0x31, the wake/notify write */
@@ -3270,6 +3271,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             vchr47   v28: 0 (default) = answer VCHR op 0x47 with a zero-length payload like the stock (rt 0xfa0a8); 1 = the old 4 bytes
             flags_legacy v29: 1 = the pre-v29 chunk flag numbering (whole frame = 2); default 0 = stock (whole frame = 3)
             dc_seq v31: 0 = display_control power=1 only; 1 = power=-2 first, then 1; 2 = power=2 first, then 1
+            lcdtest v33: 1 = draw colour bars into the VC LCD framebuffer and kick the legacy update mailbox; freeze 2 = freeze=0 before AND after display_control; dump_sdram (default 1): 4 MB snapshots of VC 0xC0000000; dump_sram (default 0)
             dump v32 (default 1 in variant 0): snapshots of VC 0..dump_len (default 0x140000) at dump_at1/dump_at2 seconds into playback -> /.rockbox/vcdump_play1.bin, _play2.bin
             vde v32: 1 = send vmcs_display_enable 1, 2 = vmcs_display_clear first
             probe_at v31: seconds into playback for the one-shot mp_region/mp_paint probe (default 30, 0 = off)
@@ -3282,6 +3284,8 @@ static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, c
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_gfx = 0;                                                            /* v34 */
+static int cfg_lcdtest = 0, cfg_dump_sdram = 1, cfg_dump_sram = 0;                /* v33 */
 static int cfg_dump = 1, cfg_dump_len = 0x140000, cfg_dump_at1 = 20, cfg_dump_at2 = 35, cfg_vde = 0;   /* v32: VC RAM snapshots, vmcs_display_* probe */       /* v31: display_control power sequence; mid-play probe time in s (0 = off) */
 static void bcm_load_cfg(void)
 {
@@ -3342,6 +3346,10 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "dump_at1")) cfg_dump_at1 = v;
         else if (!strcmp(p, "dump_at2")) cfg_dump_at2 = v;
         else if (!strcmp(p, "vde"))      cfg_vde = v;
+        else if (!strcmp(p, "lcdtest"))  cfg_lcdtest = v;
+        else if (!strcmp(p, "gfx"))      cfg_gfx = v;
+        else if (!strcmp(p, "dump_sdram")) cfg_dump_sdram = v;
+        else if (!strcmp(p, "dump_sram")) cfg_dump_sram = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
     BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
@@ -3352,12 +3360,14 @@ static void bcm_load_cfg(void)
 /* v22: the v21 log shows the VC core stops right after it consumes our 0x60 reply (selectplay is answered within 1 ms, then
    nothing: no further gencmd is read, its ack bits for ch0/ch2/ch3 never toggle, none of 6 RAM tick counters moves).
    Which part of the payload kills it is unknown, so each run can try one preset. */
-#define BCM_NVARIANTS 4
+#define BCM_NVARIANTS 6
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: baseline + VC RAM snapshots (/.rockbox/vcdump_*.bin) -- send me these files",
-    "1: + vmcs_display_enable 1 after display_control",
-    "2: + vmcs_display_clear, then vmcs_display_enable 1",
-    "3: legacy Rockbox LCD updates ACTIVE (nolcd=0): does the video overlay show over the Rockbox UI?"
+    "0: baseline + SDRAM snapshots (/.rockbox/vcdump_sd1.bin, _sd2.bin = VC 0xC0000000, 4 MB each)",
+    "1: display_control freeze=0 before and after power=1, legacy Rockbox LCD updates ACTIVE",
+    "2: freeze=0 + our own LCD test pattern (VC FB 0xE0000 + legacy update kick), legacy driver frozen",
+    "3: same LCD test pattern but WITHOUT any freeze command (control for 2)",
+    "4: v34 GRAPHICS-CHANNEL probe: alloc a 320x240 RGB565 image on the VC, draw bars into it, add a window (3 arg guesses)",
+    "5: same graphics probe + display_control freeze=0 (legacy LCD driver frozen)"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3385,11 +3395,14 @@ static void bcm_apply_variant(void)
     if (v >= BCM_NVARIANTS) v = 0;
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
     cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0; cfg_vde = 0; cfg_dump = (v == 0); cfg_nolcd = 1;
+    cfg_freeze = 0; cfg_lcdtest = 0; cfg_gfx = 0;
     switch (v)
     {
-    case 1: cfg_vde = 1; break;
-    case 2: cfg_vde = 2; break;
-    case 3: cfg_nolcd = 0; break;
+    case 1: cfg_freeze = 2; cfg_nolcd = 0; break;
+    case 2: cfg_freeze = 2; cfg_lcdtest = 1; break;
+    case 3: cfg_lcdtest = 1; break;
+    case 4: cfg_gfx = 1; break;
+    case 5: cfg_freeze = 2; cfg_gfx = 1; break;
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3519,7 +3532,7 @@ static void bcm_map_probe(void)
 {
     static const uint32_t cand[] = { 0x00000200, 0xFE000200, 0xC0000200, 0x80000200, 0x40000200, 0x013FFFFC, 0x00200000, 0x003FFFFC, 0x00400000, 0x007FFFFC, 0x00800000 };
     unsigned i;
-    if (!cfg_dump) return;
+    if (!cfg_dump || 1) return;   /* v33: map known (SDRAM at 0xC0000000, mirrored every 2 MB below) */
     BLOG("---- VC address map probe");
     for (i = 0; i < sizeof cand / sizeof cand[0]; i++)
     {
@@ -3549,6 +3562,115 @@ static void bcm_vde(void)
         r = bcm_gencmd_watched("vmcs_display_enable 1", resp, sizeof resp, 3);
         bcm_log_text("vmcs_display_enable 1", r, resp);
     }
+}
+
+/* v33: the legacy LCD path.  Rockbox's lcd driver writes RGB565 rows (pitch 640 B) to VC 0xE0000 and then writes BCM_CMD(0) =
+   0xFFFF0000 to VC[0x1F8]; the VC is supposed to copy the frame to the panel and change the word.  In every run so far
+   VC[0x1F8] stays 0xFFFF0000, i.e. the VC ignores the kick.  This draws colour bars and kicks once, then polls the word. */
+static void bcm_lcd_test(void)
+{
+    static uint16_t row[320];
+    uint32_t cmd = 0xFFFF0000u, w = 0, one = 1;
+    int x, y, i;
+    if (!cfg_lcdtest || bcm_io_dead()) return;
+    BLOG("---- LCD test: drawing colour bars into VC 0xE0000 (RGB565, 320x240)");
+    for (y = 0; y < 240; y++)
+    {
+        for (x = 0; x < 320; x++)
+        {
+            int bar = x / 40;
+            static const uint16_t col[8] = { 0xF800, 0x07E0, 0x001F, 0xFFE0, 0xF81F, 0x07FF, 0xFFFF, 0x0000 };
+            row[x] = (y < 24) ? (uint16_t)(((x * 31 / 319) << 11) | ((x * 63 / 319) << 5) | (x * 31 / 319)) : col[bar];
+        }
+        bcm_io_lock(); bcm_io_write(0xE0000 + 640 * (unsigned)y, row, sizeof row); bcm_io_unlock();
+        if ((y & 31) == 31) bcm_host_service();
+    }
+    bcm_io_lock(); bcm_io_read(0x1F8, &w, 4); bcm_io_unlock();
+    BLOG("  VC[1F8] before kick = %08x", (unsigned)w);
+    bcm_io_lock(); bcm_io_write(0x1F8, &cmd, 4); bcm_io_doorbell(); bcm_io_unlock();
+    for (i = 0; i < 20; i++)
+    {
+        long t = current_tick + HZ / 10;
+        while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); sleep(HZ / 100); }
+        bcm_io_lock(); bcm_io_read(0x1F8, &w, 4); bcm_io_unlock();
+        if (i < 3 || i == 19 || w != cmd) BLOG("  +%d ms: VC[1F8] = %08x", (i + 1) * 100, (unsigned)w);
+        if (w != cmd) break;
+    }
+    BLOG("  >>> LOOK AT THE SCREEN NOW: colour bars (red green blue yellow magenta cyan white black, gradient on top)? (5 s)");
+    {   long t = current_tick + 5 * HZ;
+        while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); sleep(HZ / 100); } }
+    bcm_io_lock(); bcm_io_write(0x1F8, &one, 4); bcm_io_unlock();
+    BLOG("---- end of LCD test");
+}
+
+/* v34: the stock firmware does not use the legacy LCD mailbox with this VC image.  Its display class (rt 0x164450..)
+   allocates an image on the VC (graphics channel op 8 -> handle + VC address), copies the pixel rows to that address
+   over the bus, and shows the image as a "window" (ops 1 = update start, 3 = add window, 2 = update end; 4 = remove
+   window, 9 = free image).  The argument meanings of op 3 are only partly known, so this tries three guesses. */
+static int bcm_gfx_call(const char *tag, uint32_t op, const void *in, uint32_t inlen, uint32_t out[4])
+{
+    uint32_t o[4] = { 0, 0, 0, 0 }, rop = 0xdeadbeef;
+    int r = bcm_gfx_rpc(op, in, inlen, o, &rop, 300);
+    BLOG("  gfx op %u (%s): r=%d reply-op=%08x payload=%08x %08x %08x %08x", (unsigned)op, tag, r, (unsigned)rop,
+         (unsigned)o[0], (unsigned)o[1], (unsigned)o[2], (unsigned)o[3]);
+    if (out) memcpy(out, o, sizeof o);
+    return r;
+}
+static void bcm_hold_ms(int ms)
+{
+    long t = current_tick + (HZ * ms) / 1000;
+    while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); sleep(HZ / 100); }
+}
+static void bcm_gfx_probe(void)
+{
+    static uint16_t row[320];
+    uint32_t o[4], img = 0, vcaddr = 0, win = 0, pl[8];
+    int x, y, g;
+    if (!cfg_gfx || bcm_io_dead()) return;
+    BLOG("---- GFX probe (graphics channel type 2)");
+    bcm_gfx_call("update start?", 1, NULL, 0, o);
+    bcm_gfx_call("update end?", 2, NULL, 0, o);
+    memset(pl, 0, sizeof pl);
+    ((uint8_t *)pl)[4] = 1;                    /* format 1 = RGB565 */
+    pl[2] = 320; pl[3] = 240; pl[4] = 640;     /* width, height, pitch; pl[6] = VC address 0 -> allocate */
+    ((uint8_t *)pl)[0x1c] = 1;
+    if (bcm_gfx_call("create image 320x240 RGB565", 8, pl, 0x20, o) != 0) { BLOG("  no reply to op 8 -> stop"); return; }
+    img = o[0]; vcaddr = o[1];
+    BLOG("  image handle %08x, VC address %08x", (unsigned)img, (unsigned)vcaddr);
+    if (!img || vcaddr < 0x1000) { BLOG("  unusable handle/address -> stop"); return; }
+    for (y = 0; y < 240; y++)
+    {
+        static const uint16_t col[8] = { 0xF800, 0x07E0, 0x001F, 0xFFE0, 0xF81F, 0x07FF, 0xFFFF, 0x0000 };
+        for (x = 0; x < 320; x++)
+            row[x] = (y < 24) ? (uint16_t)(((x * 31 / 319) << 11) | ((x * 63 / 319) << 5) | (x * 31 / 319)) : col[x / 40];
+        bcm_io_lock(); bcm_io_write(vcaddr + 640u * (unsigned)y, row, sizeof row); bcm_io_unlock();
+        if ((y & 31) == 31) bcm_host_service();
+    }
+    BLOG("  pixels written to VC %08x", (unsigned)vcaddr);
+    bcm_gfx_call("touch image?", 0x10, (uint32_t[]){ img, 0 }, 8, o);
+    for (g = 0; g < 3; g++)
+    {
+        memset(pl, 0, sizeof pl);
+        pl[3] = img;
+        if (g == 0)      { pl[0] = 0; pl[1] = 0;   ((uint16_t *)pl)[8] = 0;   ((uint16_t *)pl)[9] = 0;   ((uint16_t *)pl)[12] = 320; ((uint16_t *)pl)[13] = 240; }
+        else if (g == 1) { pl[0] = 1; pl[1] = 255; ((uint16_t *)pl)[8] = 0;   ((uint16_t *)pl)[9] = 0;   ((uint16_t *)pl)[12] = 320; ((uint16_t *)pl)[13] = 240; }
+        else             { pl[0] = 0; pl[1] = 0;   ((uint16_t *)pl)[8] = 320; ((uint16_t *)pl)[9] = 240; ((uint16_t *)pl)[12] = 0;   ((uint16_t *)pl)[13] = 0; }
+        BLOG("  -- window guess %d", g);
+        bcm_gfx_call("update start?", 1, NULL, 0, o);
+        if (bcm_gfx_call("add window", 3, pl, 0x20, o) == 0) win = o[0]; else win = 0;
+        bcm_gfx_call("update end?", 2, NULL, 0, o);
+        BLOG("  >>> LOOK AT THE SCREEN: guess %d, window handle %08x (3 s)", g, (unsigned)win);
+        bcm_hold_ms(3000);
+        if (win)
+        {
+            uint32_t w4[4] = { win, 0, 0, 0 };
+            bcm_gfx_call("update start?", 1, NULL, 0, o);
+            bcm_gfx_call("remove window", 4, w4, 0x10, o);
+            bcm_gfx_call("update end?", 2, NULL, 0, o);
+        }
+    }
+    bcm_gfx_call("free image", 9, (uint32_t[]){ img, 0, 0, 0 }, 0x10, o);
+    BLOG("---- end of GFX probe");
 }
 
 /* v31: one-shot probe while frames flow.  The v30 logs show mp_region always answers debug="region 0 0 0 0 0", even after
@@ -3596,8 +3718,8 @@ static void bcm_video_run(int secs)
                  v_getframes, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips);
             next_log += 2 * HZ;
         }
-        if (dump1 && !TIME_BEFORE(current_tick, dump1)) { dump1 = 0; bcm_vc_dump("play1", 0, (uint32_t)cfg_dump_len); }
-        if (dump2 && !TIME_BEFORE(current_tick, dump2)) { dump2 = 0; bcm_vc_dump("play2", 0, (uint32_t)cfg_dump_len); }
+        if (dump1 && !TIME_BEFORE(current_tick, dump1)) { dump1 = 0; if (cfg_dump_sram) bcm_vc_dump("play1", 0, (uint32_t)cfg_dump_len); if (cfg_dump_sdram) bcm_vc_dump("sd1", 0xC0000000u, 0x400000u); }
+        if (dump2 && !TIME_BEFORE(current_tick, dump2)) { dump2 = 0; if (cfg_dump_sram) bcm_vc_dump("play2", 0, (uint32_t)cfg_dump_len); if (cfg_dump_sdram) bcm_vc_dump("sd2", 0xC0000000u, 0x400000u); }
         if (probe_tick && !TIME_BEFORE(current_tick, probe_tick))
         {
             probe_tick = 0;
@@ -3987,7 +4109,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v32, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v34, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
@@ -4123,6 +4245,9 @@ static bool dbg_bcm_host(void)
     if (!cfg_skip_disp)
         bcm_display_probe();
     bcm_vde();
+    if (cfg_freeze >= 2) bcm_freeze0();
+    bcm_lcd_test();
+    bcm_gfx_probe();
     bcm_step("display_control probe");
     if (!cfg_nolcd && !bcm_check_dead())
         splash(HZ*2, "v26 marker B: after display_control");

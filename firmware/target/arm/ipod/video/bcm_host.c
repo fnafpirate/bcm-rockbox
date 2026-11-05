@@ -106,6 +106,8 @@ static struct {
     bool     gc_wait;  uint32_t gc_seq;  bool gc_done;  int gc_result;
     char     *gc_resp; size_t gc_resp_sz;
     uint32_t gc_pending_cmd_seq;   /* unused beyond bookkeeping; kept for future diagnostics */
+    /* v34: graphics channel (type 2) RPC */
+    bool     gfx_wait; uint32_t gfx_seq; bool gfx_done; uint32_t gfx_op; uint16_t gfx_len; uint8_t gfx_pl[48];
     /* VCFS */
     char     vfs_root[96];
     int      vfs_fd[8];
@@ -447,6 +449,31 @@ static void gencmd_rx(const struct hi_msg *m)
     hi.gc_done = true;
 }
 
+/* ------------------------------------------------------------------ graphics --- */
+/* v34: the stock display class (rt 0x164450..0x165160) talks to a dispman-like service on the type-2 channel with
+ * rt 0x28861c(chan, op, len, payload): ops 1 (update start), 2 (update end), 3 (add window), 4 (remove window),
+ * 8 (create image: reply = handle, VC address), 9 (free image), 0x10 (image touch).  Replies: header op + 16 payload bytes. */
+int bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls)
+{
+    struct hi_chan *c = chan_by_type(CH_GRAPHICS);
+    if (!hi.attached || !c) return -1;
+    c->seq = (c->seq + 1) & 0x7fffffffu;
+    hi.gfx_wait = true; hi.gfx_done = false; hi.gfx_seq = c->seq;
+    if (hi_tx(c, op, c->seq, in, inlen) < 0) { hi.gfx_wait = false; return -1; }
+    for (int i = 0; i < max_polls; i++)
+    {
+        if (bcm_io_dead()) { hi.gfx_wait = false; return -5; }
+        bcm_host_service();
+        if (hi.gfx_done) break;
+        bcm_io_idle();
+    }
+    hi.gfx_wait = false;
+    if (!hi.gfx_done) return -2;
+    if (out) memcpy(out, hi.gfx_pl, 16);
+    if (res_op) *res_op = hi.gfx_op;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ VCFS ------ */
 void bcm_vfs_set_root(const char *root)
 {
@@ -743,6 +770,17 @@ void bcm_host_service(void)
                 if (m.op != 0x61) { uint32_t z = 0; reply(c, &m, 0, &z, 4); }
                 break;
             case CH_GRAPHICS:
+                if (hi.gfx_wait && m.seq == hi.gfx_seq)   /* v34: reply to bcm_gfx_rpc() */
+                {
+                    uint32_t n = m.len < sizeof hi.gfx_pl ? m.len : (uint32_t)sizeof hi.gfx_pl;
+                    memset(hi.gfx_pl, 0, sizeof hi.gfx_pl);
+                    memcpy(hi.gfx_pl, m.payload, n);
+                    hi.gfx_op = m.op; hi.gfx_len = m.len; hi.gfx_done = true;
+                    break;
+                }
+                hi.st.unknown_ops++;
+                TRACE("gfx stray (a=seq b=op)", m.seq, m.op, NULL);
+                break;
             default:        hi.st.unknown_ops++;
                             TRACE(c->type == CH_VCHR ? "vchr op" : "chan op", m.op, m.len, NULL);
                             break;
