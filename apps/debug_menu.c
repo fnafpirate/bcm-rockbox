@@ -3270,6 +3270,8 @@ static int m4_next(uint32_t *ts_ms, bool *key)
             vchr47   v28: 0 (default) = answer VCHR op 0x47 with a zero-length payload like the stock (rt 0xfa0a8); 1 = the old 4 bytes
             flags_legacy v29: 1 = the pre-v29 chunk flag numbering (whole frame = 2); default 0 = stock (whole frame = 3)
             dc_seq v31: 0 = display_control power=1 only; 1 = power=-2 first, then 1; 2 = power=2 first, then 1
+            dump v32 (default 1 in variant 0): snapshots of VC 0..dump_len (default 0x140000) at dump_at1/dump_at2 seconds into playback -> /.rockbox/vcdump_play1.bin, _play2.bin
+            vde v32: 1 = send vmcs_display_enable 1, 2 = vmcs_display_clear first
             probe_at v31: seconds into playback for the one-shot mp_region/mp_paint probe (default 30, 0 = off)
             freeze   v28: 1 = send "display_control 0 freeze=0" right after the VC boot (stock rt 0x164788 does after bring-up)
 */
@@ -3279,7 +3281,8 @@ static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1, cfg_a
 static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1, cfg_fix1f8 = 1, cfg_nolcd = 1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
-static int cfg_dc_seq = 0, cfg_probe_at = 30;       /* v31: display_control power sequence; mid-play probe time in s (0 = off) */
+static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_dump = 1, cfg_dump_len = 0x140000, cfg_dump_at1 = 20, cfg_dump_at2 = 35, cfg_vde = 0;   /* v32: VC RAM snapshots, vmcs_display_* probe */       /* v31: display_control power sequence; mid-play probe time in s (0 = off) */
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3334,6 +3337,11 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "flags_legacy")) cfg_flags_legacy = v;
         else if (!strcmp(p, "dc_seq"))   cfg_dc_seq = v;
         else if (!strcmp(p, "probe_at")) cfg_probe_at = v;
+        else if (!strcmp(p, "dump"))     cfg_dump = v;
+        else if (!strcmp(p, "dump_len")) cfg_dump_len = v;
+        else if (!strcmp(p, "dump_at1")) cfg_dump_at1 = v;
+        else if (!strcmp(p, "dump_at2")) cfg_dump_at2 = v;
+        else if (!strcmp(p, "vde"))      cfg_vde = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
     BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
@@ -3346,10 +3354,10 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: control (= v29/v30 variant 0): display_control 0 model=2 power=1 only",
-    "1: display_control power=-2 (stock state 1 with the first-time flag) then power=1",
-    "2: display_control power=2 (stock state 1) then power=1",
-    "3: display_control power=2, power=1, then mp_region fill at all three points"
+    "0: baseline + VC RAM snapshots (/.rockbox/vcdump_*.bin) -- send me these files",
+    "1: + vmcs_display_enable 1 after display_control",
+    "2: + vmcs_display_clear, then vmcs_display_enable 1",
+    "3: legacy Rockbox LCD updates ACTIVE (nolcd=0): does the video overlay show over the Rockbox UI?"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3376,12 +3384,12 @@ static void bcm_apply_variant(void)
     if (v < 0) return;
     if (v >= BCM_NVARIANTS) v = 0;
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
-    cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0;
+    cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0; cfg_vde = 0; cfg_dump = (v == 0); cfg_nolcd = 1;
     switch (v)
     {
-    case 1: cfg_dc_seq = 1; break;
-    case 2: cfg_dc_seq = 2; break;
-    case 3: cfg_dc_seq = 2; cfg_region_when = 7; break;
+    case 1: cfg_vde = 1; break;
+    case 2: cfg_vde = 2; break;
+    case 3: cfg_nolcd = 0; break;
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3485,6 +3493,64 @@ static void v_stopcb(void) { BLOG("  PDS stop (frames sent so far: %d)", v_frame
 static const struct bcm_pds_ops pds_video_ops = { v_start, v_get_frame, v_seek, v_stopcb };
 
 /* Service loop while the VC plays: ~100 Hz, status line every 2 s, mp_get_stats every 5 s. */
+/* v32: copy VC memory to a file in 4 KB pieces, servicing the host interface between pieces so that frames keep flowing. */
+static void bcm_vc_dump(const char *tag, uint32_t start, uint32_t len)
+{
+    static uint32_t dbuf[1024];
+    char path[48]; int fd; uint32_t a; long t0 = current_tick; unsigned n = 0;
+    if (!cfg_dump || bcm_io_dead()) return;
+    snprintf(path, sizeof path, "/.rockbox/vcdump_%s.bin", tag);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) { BLOG("dump: cannot create %s", path); return; }
+    for (a = start; a < start + len; a += sizeof dbuf, n++)
+    {
+        bcm_io_lock(); bcm_io_read(a, dbuf, sizeof dbuf); bcm_io_unlock();
+        if (bcm_io_dead()) { BLOG("dump %s: bus died at VC 0x%08x", tag, (unsigned)a); break; }
+        if (write(fd, dbuf, sizeof dbuf) != (ssize_t)sizeof dbuf) { BLOG("dump %s: write failed", tag); break; }
+        if ((n & 3) == 3) bcm_host_service();
+    }
+    close(fd);
+    BLOG("dump %s: VC 0x%08x..0x%08x -> %s (%u ms)", tag, (unsigned)start, (unsigned)a, path, (unsigned)((current_tick - t0) * 1000 / HZ));
+}
+
+/* v32: where is the rest of VC memory?  Read single words at candidate bases (aliases first; an unmapped read may time out and
+   kill the bus, so this runs at the very end of the run).  VC[0x200] is compared with the aliases. */
+static void bcm_map_probe(void)
+{
+    static const uint32_t cand[] = { 0x00000200, 0xFE000200, 0xC0000200, 0x80000200, 0x40000200, 0x013FFFFC, 0x00200000, 0x003FFFFC, 0x00400000, 0x007FFFFC, 0x00800000 };
+    unsigned i;
+    if (!cfg_dump) return;
+    BLOG("---- VC address map probe");
+    for (i = 0; i < sizeof cand / sizeof cand[0]; i++)
+    {
+        uint32_t w = 0;
+        BLOG("  reading VC 0x%08x ...", (unsigned)cand[i]);
+        bcm_io_lock(); bcm_io_read(cand[i], &w, 4); bcm_io_unlock();
+        if (bcm_io_dead()) { BLOG("  bus died on that read -- stop"); break; }
+        BLOG("  VC[0x%08x] = %08x", (unsigned)cand[i], (unsigned)w);
+    }
+    BLOG("---- end of map probe");
+}
+
+/* v32: display_control power/model is all the stock ARM code ever sends, but vmcs.bin also registers vmcs_display_clear and
+   vmcs_display_enable (never sent by the stock ARM image).  Variants 1/2 try them. */
+static void bcm_vde(void)
+{
+    char resp[200]; int r;
+    if (cfg_vde == 2)
+    {
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd_watched("vmcs_display_clear", resp, sizeof resp, 3);
+        bcm_log_text("vmcs_display_clear", r, resp);
+    }
+    if (cfg_vde)
+    {
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd_watched("vmcs_display_enable 1", resp, sizeof resp, 3);
+        bcm_log_text("vmcs_display_enable 1", r, resp);
+    }
+}
+
 /* v31: one-shot probe while frames flow.  The v30 logs show mp_region always answers debug="region 0 0 0 0 0", even after
    mp_play, and the display stage (last_displayed_frame, Disp ...) never moves.  Send a few differently-shaped mp_region
    commands (the replies tell us what the five numbers mean) plus mp_paint, then dump mp_get_stats again. */
@@ -3516,6 +3582,8 @@ static void bcm_video_run(int secs)
 {
     long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
     long probe_tick = cfg_probe_at > 0 ? current_tick + cfg_probe_at * HZ : 0;
+    long dump1 = cfg_dump && cfg_dump_at1 > 0 ? current_tick + cfg_dump_at1 * HZ : 0;
+    long dump2 = cfg_dump && cfg_dump_at2 > 0 ? current_tick + cfg_dump_at2 * HZ : 0;
     static char resp[1400];                           /* v29: the v28 logs cut mp_get_stats at 256 bytes (lost_frame_assert_d...) */
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
@@ -3528,6 +3596,8 @@ static void bcm_video_run(int secs)
                  v_getframes, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips);
             next_log += 2 * HZ;
         }
+        if (dump1 && !TIME_BEFORE(current_tick, dump1)) { dump1 = 0; bcm_vc_dump("play1", 0, (uint32_t)cfg_dump_len); }
+        if (dump2 && !TIME_BEFORE(current_tick, dump2)) { dump2 = 0; bcm_vc_dump("play2", 0, (uint32_t)cfg_dump_len); }
         if (probe_tick && !TIME_BEFORE(current_tick, probe_tick))
         {
             probe_tick = 0;
@@ -3546,6 +3616,7 @@ static void bcm_video_run(int secs)
         }
         sleep(HZ / 100);
     }
+    bcm_map_probe();
 }
 
 /* v17: the stock firmware sends "pm_set_policy min" (rt 0x1b013c, called from the mp_selectplay builder at rt 0x1fa3f0
@@ -3916,7 +3987,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v31, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v32, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
@@ -4051,6 +4122,7 @@ static bool dbg_bcm_host(void)
     bcm_step("pm_set_policy min / pm info");
     if (!cfg_skip_disp)
         bcm_display_probe();
+    bcm_vde();
     bcm_step("display_control probe");
     if (!cfg_nolcd && !bcm_check_dead())
         splash(HZ*2, "v26 marker B: after display_control");
