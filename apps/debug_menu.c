@@ -3269,6 +3269,8 @@ static int m4_next(uint32_t *ts_ms, bool *key)
                      every mp_selectplay; mplayer.vll does not list the command, so the VC will probably answer "error")
             vchr47   v28: 0 (default) = answer VCHR op 0x47 with a zero-length payload like the stock (rt 0xfa0a8); 1 = the old 4 bytes
             flags_legacy v29: 1 = the pre-v29 chunk flag numbering (whole frame = 2); default 0 = stock (whole frame = 3)
+            dc_seq v31: 0 = display_control power=1 only; 1 = power=-2 first, then 1; 2 = power=2 first, then 1
+            probe_at v31: seconds into playback for the one-shot mp_region/mp_paint probe (default 30, 0 = off)
             freeze   v28: 1 = send "display_control 0 freeze=0" right after the VC boot (stock rt 0x164788 does after bring-up)
 */
 static int cfg_si_w8 = -1, cfg_si_dur = -1, cfg_si_hw = 0, cfg_si_dim = 1, cfg_si_w1 = 0, cfg_si_last = -1, cfg_si_count = 1;
@@ -3277,6 +3279,7 @@ static int cfg_pm = 1, cfg_step = 0, cfg_cmds_end = 1, cfg_reboot_end = 1, cfg_a
 static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, cfg_variant = -1, cfg_fix1f8 = 1, cfg_nolcd = 1;
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
+static int cfg_dc_seq = 0, cfg_probe_at = 30;       /* v31: display_control power sequence; mid-play probe time in s (0 = off) */
 static void bcm_load_cfg(void)
 {
     char buf[512], *p, *nl, *eq;
@@ -3329,6 +3332,8 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "vchr47"))   cfg_vchr47 = v;
         else if (!strcmp(p, "freeze"))   cfg_freeze = v;
         else if (!strcmp(p, "flags_legacy")) cfg_flags_legacy = v;
+        else if (!strcmp(p, "dc_seq"))   cfg_dc_seq = v;
+        else if (!strcmp(p, "probe_at")) cfg_probe_at = v;
         else BLOG("cfg: unknown key '%s'", p);
     }
     BLOG("cfg2: region_when=%d region_mode=%d region=%dx%d pm_play=%d disp_all=%d", cfg_region_when, cfg_region_mode, cfg_region_w, cfg_region_h, cfg_pm_play, cfg_disp_all);
@@ -3341,10 +3346,10 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: video, mp_region fill BEFORE mp_selectplay only (= the v29 run)",
-    "1: video, mp_region fill before mp_selectplay + after mp_selectplay + after mp_play",
-    "2: video, mp_region mode=letterbox pixel=\"1 1\" at all three points",
-    "3: video, NO mp_region at all"
+    "0: control (= v29/v30 variant 0): display_control 0 model=2 power=1 only",
+    "1: display_control power=-2 (stock state 1 with the first-time flag) then power=1",
+    "2: display_control power=2 (stock state 1) then power=1",
+    "3: display_control power=2, power=1, then mp_region fill at all three points"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3371,12 +3376,12 @@ static void bcm_apply_variant(void)
     if (v < 0) return;
     if (v >= BCM_NVARIANTS) v = 0;
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
-    cfg_region_when = 1; cfg_region_mode = 0;
+    cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0;
     switch (v)
     {
-    case 1: cfg_region_when = 7; break;
-    case 2: cfg_region_when = 7; cfg_region_mode = 1; break;
-    case 3: cfg_region_when = 0; break;
+    case 1: cfg_dc_seq = 1; break;
+    case 2: cfg_dc_seq = 2; break;
+    case 3: cfg_dc_seq = 2; cfg_region_when = 7; break;
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3480,9 +3485,37 @@ static void v_stopcb(void) { BLOG("  PDS stop (frames sent so far: %d)", v_frame
 static const struct bcm_pds_ops pds_video_ops = { v_start, v_get_frame, v_seek, v_stopcb };
 
 /* Service loop while the VC plays: ~100 Hz, status line every 2 s, mp_get_stats every 5 s. */
+/* v31: one-shot probe while frames flow.  The v30 logs show mp_region always answers debug="region 0 0 0 0 0", even after
+   mp_play, and the display stage (last_displayed_frame, Disp ...) never moves.  Send a few differently-shaped mp_region
+   commands (the replies tell us what the five numbers mean) plus mp_paint, then dump mp_get_stats again. */
+static void bcm_mid_probe(void)
+{
+    static const char * const pc[] = {
+        "mp_region display=0 dest=\"0 0 320 240\" mode=fill",
+        "mp_region display=0 dest=\"10 20 100 50\" mode=fill",
+        "mp_region display=0 src=\"0 0 320 240\" dest=\"0 0 320 240\" mode=fill",
+        "mp_region display=0 dest=fullscreen mode=fill",
+        "mp_region display=0 dest=fullscreen mode=letterbox pixel=\"1 1\"",
+        "mp_region display=0 dest=\"0 0 320 240\"",
+        "mp_paint",
+        "mp_get_stats video",
+    };
+    static char resp[1400];
+    unsigned i; int r;
+    BLOG("---- mid-play display probe");
+    for (i = 0; i < sizeof pc / sizeof pc[0]; i++)
+    {
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd_watched(pc[i], resp, sizeof resp, 3);
+        bcm_log_text(pc[i], r, resp);
+    }
+    BLOG("---- end of probe");
+}
+
 static void bcm_video_run(int secs)
 {
     long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
+    long probe_tick = cfg_probe_at > 0 ? current_tick + cfg_probe_at * HZ : 0;
     static char resp[1400];                           /* v29: the v28 logs cut mp_get_stats at 256 bytes (lost_frame_assert_d...) */
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
@@ -3494,6 +3527,11 @@ static void bcm_video_run(int secs)
             BLOG("  video: get_frame=%d sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d",
                  v_getframes, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips);
             next_log += 2 * HZ;
+        }
+        if (probe_tick && !TIME_BEFORE(current_tick, probe_tick))
+        {
+            probe_tick = 0;
+            bcm_mid_probe();
         }
         if (!TIME_BEFORE(current_tick, next_stat))
         {
@@ -3588,6 +3626,15 @@ static void bcm_display_probe(void)
     };
     char resp[256];
     int i, r;
+    /* v31: the stock builder (rt 0x164e9c) maps its state argument to the power= value: state 0 -> 0, state 1 -> 2 (or -2 the
+       first time, when obj[0xe] is set), states 2 and 3 -> 1.  We always sent power=1 only. */
+    if (cfg_dc_seq == 1 || cfg_dc_seq == 2)
+    {
+        const char *c = (cfg_dc_seq == 1) ? "display_control 0 model=2 power=-2" : "display_control 0 model=2 power=2";
+        bcm_cmd_t0 = current_tick;
+        r = bcm_gencmd_watched(c, resp, sizeof resp, 3);
+        bcm_log_text(c, r, resp);
+    }
     for (i = 0; i < (int)(sizeof dc / sizeof dc[0]) && (i == 0 || cfg_disp_all); i++)
     {
         bcm_cmd_t0 = current_tick;
@@ -3869,7 +3916,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v30, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v31, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
