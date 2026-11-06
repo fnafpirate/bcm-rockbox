@@ -3284,6 +3284,7 @@ static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, c
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_dc_model = 0, cfg_dc_final = 99, cfg_dc_noinit = 0, cfg_gfx_quick = 1, cfg_pm27 = 1;   /* v37 */
 static int cfg_gfx_screen = 1;                                                     /* v36 */
 static int cfg_gfx = 0;                                                            /* v34 */
 static int cfg_lcdtest = 0, cfg_dump_sdram = 1, cfg_dump_sram = 0;                /* v33 */
@@ -3350,6 +3351,11 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "lcdtest"))  cfg_lcdtest = v;
         else if (!strcmp(p, "gfx"))      cfg_gfx = v;
         else if (!strcmp(p, "gfx_screen")) cfg_gfx_screen = v;
+        else if (!strcmp(p, "dc_model")) cfg_dc_model = v;
+        else if (!strcmp(p, "dc_final")) cfg_dc_final = v;
+        else if (!strcmp(p, "dc_noinit")) cfg_dc_noinit = v;
+        else if (!strcmp(p, "gfx_quick")) cfg_gfx_quick = v;
+        else if (!strcmp(p, "pm27"))     cfg_pm27 = v;
         else if (!strcmp(p, "dump_sdram")) cfg_dump_sdram = v;
         else if (!strcmp(p, "dump_sram")) cfg_dump_sram = v;
         else BLOG("cfg: unknown key '%s'", p);
@@ -3362,14 +3368,12 @@ static void bcm_load_cfg(void)
 /* v22: the v21 log shows the VC core stops right after it consumes our 0x60 reply (selectplay is answered within 1 ms, then
    nothing: no further gencmd is read, its ack bits for ch0/ch2/ch3 never toggle, none of 6 RAM tick counters moves).
    Which part of the payload kills it is unknown, so each run can try one preset. */
-#define BCM_NVARIANTS 6
+#define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: baseline + SDRAM snapshots (/.rockbox/vcdump_sd1.bin, _sd2.bin = VC 0xC0000000, 4 MB each)",
-    "1: display_control freeze=0 before and after power=1, legacy Rockbox LCD updates ACTIVE",
-    "2: freeze=0 + our own LCD test pattern (VC FB 0xE0000 + legacy update kick), legacy driver frozen",
-    "3: same LCD test pattern but WITHOUT any freeze command (control for 2)",
-    "4: GRAPHICS-CHANNEL probe: alloc a 320x240 RGB565 image on the VC, draw bars into it, add a window (5 arg guesses)",
-    "5: same graphics probe + display_control freeze=0 (legacy LCD driver frozen)"
+    "0: STOCK ORDER: freeze=0, UI layer, THEN display_control 0 model=<from HW rev> power=-2 (no power=1 before)",
+    "1: power=1 at bring-up as before, then UI layer, then power=-2 (stock first-time 'on')",
+    "2: stock order with power=2 instead of -2",
+    "3: stock order with the OTHER model value (1<->2) and power=-2"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3397,14 +3401,12 @@ static void bcm_apply_variant(void)
     if (v >= BCM_NVARIANTS) v = 0;
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
     cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0; cfg_vde = 0; cfg_dump = (v == 0); cfg_nolcd = 1;
-    cfg_freeze = 0; cfg_lcdtest = 0; cfg_gfx = 0;
+    cfg_freeze = 2; cfg_lcdtest = 0; cfg_gfx = 1; cfg_dump = 0; cfg_dc_model = 0; cfg_dc_final = -2; cfg_dc_noinit = 1;
     switch (v)
     {
-    case 1: cfg_freeze = 2; cfg_nolcd = 0; break;
-    case 2: cfg_freeze = 2; cfg_lcdtest = 1; break;
-    case 3: cfg_lcdtest = 1; break;
-    case 4: cfg_gfx = 1; break;
-    case 5: cfg_freeze = 2; cfg_gfx = 1; break;
+    case 1: cfg_dc_noinit = 0; break;
+    case 2: cfg_dc_final = 2; break;
+    case 3: cfg_dc_model = -1; break;           /* -1 = the other model */
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3650,7 +3652,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v36 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v37 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3684,6 +3686,13 @@ static void bcm_gfx_present(void)
         {
             bcm_io_lock(); bcm_io_write(gfx_addr[back] + (unsigned)y * LCD_WIDTH * 2, fb + y * LCD_WIDTH, 16 * LCD_WIDTH * 2); bcm_io_unlock();
             bcm_host_service();
+        }
+        if (gfx_presents <= 2)
+        {
+            uint16_t rb[8];
+            bcm_io_lock(); bcm_io_read(gfx_addr[back] + 640u * 200u, rb, sizeof rb); bcm_io_unlock();
+            BLOG("    readback VC %08x (row 200): %04x %04x %04x %04x  ARM: %04x %04x %04x %04x", (unsigned)(gfx_addr[back] + 640u * 200u),
+                 rb[0], rb[1], rb[2], rb[3], fb[200 * LCD_WIDTH], fb[200 * LCD_WIDTH + 1], fb[200 * LCD_WIDTH + 2], fb[200 * LCD_WIDTH + 3]);
         }
         memset(pl, 0, sizeof pl);
         pl[1] = 0xffffffceu; pl[3] = gfx_img[back];
@@ -3728,7 +3737,7 @@ static void bcm_gfx_probe(void)
         { 0, 0u,          0 }, { 0, 0u,          1 }, { 2, 0xffffffceu, 1 }, { 0, 0xffffffceu, 1 },
         { 0, 0xffffffceu, 0 }    /* v36: exactly what the stock firmware does right after booting vmcs.bin (rt 0x1b02d8): A=0, B=-50, x=y=0, no op 2 */
     };
-    for (g = 0; g < 5; g++)
+    for (g = cfg_gfx_quick ? 4 : 0; g < 5; g++)
     {
         memset(pl, 0, sizeof pl);
         pl[0] = gt[g].a; pl[1] = gt[g].b; pl[3] = img;
@@ -3904,6 +3913,27 @@ static void bcm_step(const char *name)
    0x164e9c; model = 2 when the SysInfo hw word is 0x000b00xx with xx >= 0x10, i.e. 5.5G -- inference).
    The display id (ctx+4) was NOT resolved, so try 0 then 1. Every reply (or error=... string) is logged.
    Short 6s budget each: the VC answers display commands quickly or not at all. */
+/* v37: the stock model value (rt 0x265518): SysInfo word +0x84 (rt 0x265164 -> 0x2827b8; Rockbox reads the same word at NOR
+   0x2084 = ROM 0x20002084): model = 2 if major == 0xb and minor >= 0x10, else 1. */
+static int bcm_hw_model(int log)
+{
+    uint32_t hw = *(volatile uint32_t *)0x20002084;
+    int m = ((hw >> 16) == 0xb && (hw & 0xffff) >= 0x10) ? 2 : 1;
+    if (log) BLOG("SysInfo hw word (ROM 0x20002084) = %08lx -> stock display model %d", (unsigned long)hw, m);
+    if (cfg_dc_model == -1) m = 3 - m;
+    else if (cfg_dc_model > 0) m = cfg_dc_model;
+    return m;
+}
+static void bcm_display_final(void)
+{
+    char cmd[64], resp[200]; int r;
+    if (cfg_dc_final == 99 || bcm_io_dead()) return;
+    snprintf(cmd, sizeof cmd, "display_control 0 model=%d power=%d", bcm_hw_model(0), cfg_dc_final);
+    BLOG("---- v37 final display power command (after the UI layer exists)");
+    bcm_cmd_t0 = current_tick;
+    r = bcm_gencmd_watched(cmd, resp, sizeof resp, 3);
+    bcm_log_text(cmd, r, resp);
+}
 static void bcm_display_probe(void)
 {
     static const char * const dc[] = {
@@ -3921,6 +3951,24 @@ static void bcm_display_probe(void)
         bcm_cmd_t0 = current_tick;
         r = bcm_gencmd_watched(c, resp, sizeof resp, 3);
         bcm_log_text(c, r, resp);
+    }
+    {
+        int m = bcm_hw_model(1);
+        if (cfg_pm27)
+        {
+            bcm_cmd_t0 = current_tick;
+            r = bcm_gencmd_watched("power_management set_policy manual 27", resp, sizeof resp, 3);   /* rt 0x1b0548: sent at every vmcs.bin boot */
+            bcm_log_text("power_management set_policy manual 27", r, resp);
+        }
+        if (cfg_dc_noinit) { BLOG("dc_noinit: no display_control power command at bring-up (stock sends it later, after the UI layer)"); return; }
+        if (m != 2)
+        {
+            char c[64]; snprintf(c, sizeof c, "display_control 0 model=%d power=1", m);
+            bcm_cmd_t0 = current_tick;
+            r = bcm_gencmd_watched(c, resp, sizeof resp, 3);
+            bcm_log_text(c, r, resp);
+            return;
+        }
     }
     for (i = 0; i < (int)(sizeof dc / sizeof dc[0]) && (i == 0 || cfg_disp_all); i++)
     {
@@ -4203,7 +4251,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v36, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v37, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
@@ -4342,6 +4390,8 @@ static bool dbg_bcm_host(void)
     if (cfg_freeze >= 2) bcm_freeze0();
     bcm_lcd_test();
     bcm_gfx_probe();
+    bcm_display_final();
+    if (gfx_front >= 0) bcm_gfx_present();
     bcm_step("display_control probe");
     if (!cfg_nolcd && !bcm_check_dead())
         splash(HZ*2, "v26 marker B: after display_control");
