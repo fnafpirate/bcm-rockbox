@@ -3284,6 +3284,7 @@ static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, c
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_gfx_screen = 1;                                                     /* v36 */
 static int cfg_gfx = 0;                                                            /* v34 */
 static int cfg_lcdtest = 0, cfg_dump_sdram = 1, cfg_dump_sram = 0;                /* v33 */
 static int cfg_dump = 1, cfg_dump_len = 0x140000, cfg_dump_at1 = 20, cfg_dump_at2 = 35, cfg_vde = 0;   /* v32: VC RAM snapshots, vmcs_display_* probe */       /* v31: display_control power sequence; mid-play probe time in s (0 = off) */
@@ -3348,6 +3349,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "vde"))      cfg_vde = v;
         else if (!strcmp(p, "lcdtest"))  cfg_lcdtest = v;
         else if (!strcmp(p, "gfx"))      cfg_gfx = v;
+        else if (!strcmp(p, "gfx_screen")) cfg_gfx_screen = v;
         else if (!strcmp(p, "dump_sdram")) cfg_dump_sdram = v;
         else if (!strcmp(p, "dump_sram")) cfg_dump_sram = v;
         else BLOG("cfg: unknown key '%s'", p);
@@ -3366,7 +3368,7 @@ static const char * const bcm_variant_name[BCM_NVARIANTS] = {
     "1: display_control freeze=0 before and after power=1, legacy Rockbox LCD updates ACTIVE",
     "2: freeze=0 + our own LCD test pattern (VC FB 0xE0000 + legacy update kick), legacy driver frozen",
     "3: same LCD test pattern but WITHOUT any freeze command (control for 2)",
-    "4: v34 GRAPHICS-CHANNEL probe: alloc a 320x240 RGB565 image on the VC, draw bars into it, add a window (3 arg guesses)",
+    "4: GRAPHICS-CHANNEL probe: alloc a 320x240 RGB565 image on the VC, draw bars into it, add a window (5 arg guesses)",
     "5: same graphics probe + display_control freeze=0 (legacy LCD driver frozen)"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
@@ -3621,6 +3623,77 @@ static void bcm_hold_ms(int ms)
     long t = current_tick + (HZ * ms) / 1000;
     while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); sleep(HZ / 100); }
 }
+/* v36: a stock-like double-buffered UI layer (display class rt 0x164f44 present / rt 0x1b02d8 boot-time UI layer):
+   two VC images, each frame: op 1, op 4 (remove the front window), bulk-write the back image, op 3 (window for the back image,
+   A=0 B=-50 x=y=0), swap.  The picture is the Rockbox frame buffer, into which we draw a live status screen. */
+static uint32_t gfx_img[2], gfx_addr[2], gfx_win[2];
+static int gfx_front = -1, gfx_presents;
+static long gfx_next;
+static int bcm_gfx_alloc(uint32_t *img, uint32_t *addr)
+{
+    uint32_t pl[8], o[4];
+    memset(pl, 0, sizeof pl);
+    ((uint8_t *)pl)[4] = 1; pl[2] = LCD_WIDTH; pl[3] = LCD_HEIGHT; pl[4] = LCD_WIDTH * 2;
+    ((uint8_t *)pl)[0x1c] = 1;
+    if (bcm_gfx_call("create image", 8, pl, 0x20, o) != 0 || !o[0] || o[1] < 0x1000) return -1;
+    *img = o[0]; *addr = o[1];
+    return 0;
+}
+static void bcm_gfx_draw_status(void)
+{
+    static int phase;
+    long e = current_tick - bcm_t_start;
+    lcd_set_viewport(NULL);                 /* full screen, absolute coordinates */
+    lcd_set_backdrop(NULL);
+    lcd_set_drawmode(DRMODE_SOLID);
+    lcd_set_background(LCD_RGBPACK(0, 0, 48));
+    lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
+    lcd_clear_display();
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_putsxyf(4, 4, "bcm host test v36 - VC graphics layer");
+    lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
+    lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
+    lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
+    lcd_putsxyf(4, 52, "get_frame=%d empty=%d seeks=%d", v_getframes, v_empty, v_seeks);
+    lcd_set_foreground(LCD_RGBPACK(255, 255, 0));
+    lcd_putsxyf(4, 70, "%.52s", bcm_last_line);
+    lcd_set_foreground(LCD_RGBPACK(255, 0, 0));
+    lcd_fillrect((phase * 8) % (LCD_WIDTH - 40), 200, 40, 20);      /* moves every present: proves updates arrive */
+    phase++;
+}
+static void bcm_gfx_present(void)
+{
+    uint32_t o[4], pl[8], w4[4];
+    int back, y;
+    const fb_data *fb;
+    if (gfx_front < 0 || bcm_io_dead()) return;
+    back = 1 - gfx_front;
+    bcm_gfx_draw_status();
+    fb = FBADDR(0, 0);
+    gfx_presents++;
+    {   int verbose = gfx_presents <= 3 || (gfx_presents % 20) == 0;
+        if (verbose) BLOG("  gfx present #%d: back image %d (%08x @ VC %08x)", gfx_presents, back, (unsigned)gfx_img[back], (unsigned)gfx_addr[back]);
+        bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+        if (gfx_win[gfx_front])
+        {
+            memset(w4, 0, sizeof w4); w4[0] = gfx_win[gfx_front];
+            bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+            gfx_win[gfx_front] = 0;
+        }
+        for (y = 0; y < LCD_HEIGHT; y += 16)
+        {
+            bcm_io_lock(); bcm_io_write(gfx_addr[back] + (unsigned)y * LCD_WIDTH * 2, fb + y * LCD_WIDTH, 16 * LCD_WIDTH * 2); bcm_io_unlock();
+            bcm_host_service();
+        }
+        memset(pl, 0, sizeof pl);
+        pl[1] = 0xffffffceu; pl[3] = gfx_img[back];
+        ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = LCD_HEIGHT;
+        if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) gfx_win[back] = o[0];
+        if (verbose) BLOG("    -> window %08x", (unsigned)gfx_win[back]);
+    }
+    gfx_front = back;
+}
+
 static void bcm_gfx_probe(void)
 {
     static uint16_t row[320];
@@ -3648,27 +3721,47 @@ static void bcm_gfx_probe(void)
     }
     BLOG("  pixels written to VC %08x", (unsigned)vcaddr);
     bcm_gfx_call("touch image?", 0x10, (uint32_t[]){ img, 0 }, 8, o);
-    for (g = 0; g < 3; g++)
+    /* v35: the layer-create method (rt 0x1649ac) shows op 3 = {A, B, 0, image, x:u16, y:u16, 0, 0, w:u16, h:u16}:
+       x,y = position (updated through [layer+0x2c/0x30]), w,h = source size (layer+8/+0xc), A in {0,2}, B an int that is -50 for the
+       video-behind layer.  The stock present path sends op 1, op 3 and NO op 2; op 2 only appears in the layer release (op 1, 4, 2). */
+    static const struct { uint32_t a, b; int op2; } gt[5] = {
+        { 0, 0u,          0 }, { 0, 0u,          1 }, { 2, 0xffffffceu, 1 }, { 0, 0xffffffceu, 1 },
+        { 0, 0xffffffceu, 0 }    /* v36: exactly what the stock firmware does right after booting vmcs.bin (rt 0x1b02d8): A=0, B=-50, x=y=0, no op 2 */
+    };
+    for (g = 0; g < 5; g++)
     {
         memset(pl, 0, sizeof pl);
-        pl[3] = img;
-        if (g == 0)      { pl[0] = 0; pl[1] = 0;   ((uint16_t *)pl)[8] = 0;   ((uint16_t *)pl)[9] = 0;   ((uint16_t *)pl)[12] = 320; ((uint16_t *)pl)[13] = 240; }
-        else if (g == 1) { pl[0] = 1; pl[1] = 255; ((uint16_t *)pl)[8] = 0;   ((uint16_t *)pl)[9] = 0;   ((uint16_t *)pl)[12] = 320; ((uint16_t *)pl)[13] = 240; }
-        else             { pl[0] = 0; pl[1] = 0;   ((uint16_t *)pl)[8] = 320; ((uint16_t *)pl)[9] = 240; ((uint16_t *)pl)[12] = 0;   ((uint16_t *)pl)[13] = 0; }
-        BLOG("  -- window guess %d", g);
-        bcm_gfx_call("update start?", 1, NULL, 0, o);
+        pl[0] = gt[g].a; pl[1] = gt[g].b; pl[3] = img;
+        ((uint16_t *)pl)[8] = 0; ((uint16_t *)pl)[9] = 0;            /* x, y */
+        ((uint16_t *)pl)[12] = 320; ((uint16_t *)pl)[13] = 240;      /* w, h */
+        BLOG("  -- window guess %d: A=%u B=%d op2-after=%d", g, (unsigned)gt[g].a, (int)gt[g].b, gt[g].op2);
+        bcm_gfx_call("status", 1, NULL, 0, o);
         if (bcm_gfx_call("add window", 3, pl, 0x20, o) == 0) win = o[0]; else win = 0;
-        bcm_gfx_call("update end?", 2, NULL, 0, o);
-        BLOG("  >>> LOOK AT THE SCREEN: guess %d, window handle %08x (3 s)", g, (unsigned)win);
-        bcm_hold_ms(3000);
-        if (win)
+        if (gt[g].op2) bcm_gfx_call("op2", 2, NULL, 0, o);
+        BLOG("  >>> LOOK AT THE SCREEN: guess %d, window handle %08x (2.5 s)", g, (unsigned)win);
+        bcm_hold_ms(2500);
+        if (win && g < 4)
         {
             uint32_t w4[4] = { win, 0, 0, 0 };
-            bcm_gfx_call("update start?", 1, NULL, 0, o);
+            bcm_gfx_call("status", 1, NULL, 0, o);
             bcm_gfx_call("remove window", 4, w4, 0x10, o);
-            bcm_gfx_call("update end?", 2, NULL, 0, o);
+            bcm_gfx_call("op2", 2, NULL, 0, o);
         }
     }
+    BLOG("  last window (guess 4 = stock-exact) and the image are left in place for the playback that follows");
+    if (cfg_gfx_screen)
+    {
+        gfx_img[0] = img; gfx_addr[0] = vcaddr; gfx_win[0] = win;
+        if (bcm_gfx_alloc(&gfx_img[1], &gfx_addr[1]) == 0)
+        {
+            gfx_front = 0; gfx_next = current_tick + HZ;
+            BLOG("  gfx screen: second image %08x @ VC %08x; a status screen is presented once per second from now on",
+                 (unsigned)gfx_img[1], (unsigned)gfx_addr[1]);
+            bcm_gfx_present();
+        }
+    }
+    BLOG("---- end of GFX probe");
+    return;
     bcm_gfx_call("free image", 9, (uint32_t[]){ img, 0, 0, 0 }, 0x10, o);
     BLOG("---- end of GFX probe");
 }
@@ -3725,6 +3818,7 @@ static void bcm_video_run(int secs)
             probe_tick = 0;
             bcm_mid_probe();
         }
+        if (gfx_front >= 0 && !TIME_BEFORE(current_tick, gfx_next)) { gfx_next = current_tick + HZ; bcm_gfx_present(); }
         if (!TIME_BEFORE(current_tick, next_stat))
         {
             int r;
@@ -4109,7 +4203,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v34, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v36, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
