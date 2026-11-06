@@ -129,6 +129,7 @@ static struct mutex bcm_io_mtx;
 const fb_data *flash_vmcs_offset;
 unsigned flash_vmcs_length;
 static const fb_data *rom_vmcs_offset;      /* v47: the NOR image Rockbox normally runs, to go back to after a video */
+static bool bcm_init_failed;                /* v47.1: set by bcm_init() when the BCM did not answer the bootstrap */
 static unsigned rom_vmcs_length;
 
 #define ROM_BASE        0x20000000
@@ -454,7 +455,8 @@ int bcm_restore_rom_vmcs(void)
     tick_remove_task(&lcd_tick);
     lcd_state.display_on = false;
     lcd_state.waking = false;
-    GPO32_VAL &= ~0x4000;                              /* BCM power off */
+    GPO32_VAL &= ~0x8000;                              /* stock rt 0x289470: GPIO 0x77 (GPO32 bit 15) low, */
+    GPO32_VAL &= ~0x4000;                              /* then GPIO 0x76 (bit 14, BCM power) low */
     BCM_IO_UNLOCK();
     lcd_state.update_timeout = current_tick;
     sleep(HZ / 10);                                    /* >= 50 ms off */
@@ -465,6 +467,7 @@ int bcm_restore_rom_vmcs(void)
     lcd_state.blocked = false;
     lcd_state.state = LCD_INITIAL;
     lcd_awake();                                       /* bcm_init() + first LCD update */
+    if (bcm_init_failed) return -3;
     return lcd_state.display_on ? 0 : -2;
 }
 
@@ -717,9 +720,15 @@ const unsigned char bcm_bootstrapdata[] =
     0xA1, 0x81, 0x91, 0x02, 0x12, 0x22, 0x72, 0x62
 };
 
+/* v47.1: the waits in bcm_init() are bounded (they used to spin forever when the BCM did not come out of reset) */
+#define BCM_WAIT(cond) do { long _t = current_tick + HZ; \
+                            while ((cond) && TIME_BEFORE(current_tick, _t)) { } \
+                            if (cond) bcm_init_failed = true; } while (0)
+
 static void bcm_init(void)
 {
     int i;
+    bcm_init_failed = false;
 
     /* Power up BCM */
     GPO32_VAL |= 0x4000;
@@ -738,8 +747,9 @@ static void bcm_init(void)
 
     /* Bootstrap stage 2 */
 
-    while (BCM_ALT_CONTROL & 0x80);
-    while (!(BCM_ALT_CONTROL & 0x40));
+    BCM_WAIT(BCM_ALT_CONTROL & 0x80);
+    BCM_WAIT(!(BCM_ALT_CONTROL & 0x40));
+    if (bcm_init_failed) return;
 
     for (i = 0; i < 8; i++)
     {
@@ -751,15 +761,17 @@ static void bcm_init(void)
         BCM_ALT_CONTROL = bcm_bootstrapdata[i];
     }
 
-    while ((BCM_RD_ADDR & 1) == 0 || (BCM_ALT_RD_ADDR & 1) == 0);
+    BCM_WAIT((BCM_RD_ADDR & 1) == 0 || (BCM_ALT_RD_ADDR & 1) == 0);
+    if (bcm_init_failed) return;
 
     (void)BCM_WR_ADDR;
     (void)BCM_ALT_WR_ADDR;
 
     /* Bootstrap stage 3: upload firmware */
 
-    while (BCM_ALT_CONTROL & 0x80);
-    while (!(BCM_ALT_CONTROL & 0x40));
+    BCM_WAIT(BCM_ALT_CONTROL & 0x80);
+    BCM_WAIT(!(BCM_ALT_CONTROL & 0x40));
+    if (bcm_init_failed) return;
 
     /* Upload firmware to BCM SRAM */
     bcm_write_addr(BCMA_SRAM_BASE);
@@ -768,13 +780,18 @@ static void bcm_init(void)
     bcm_write32(BCMA_COMMAND,  0);
     bcm_write32(0x10000C00, 0xC0000000);
 
-    while (!(bcm_read32(0x10000C00) & 1));
+    BCM_WAIT(!(bcm_read32(0x10000C00) & 1));
+    if (bcm_init_failed) return;
 
     bcm_write32(0x10000C00, 0);
     bcm_write32(0x10000400, 0xA5A50002);
 
-    while (bcm_read32(BCMA_COMMAND) == 0)
-        yield();
+    {
+        long t = current_tick + 2 * HZ;
+        while (bcm_read32(BCMA_COMMAND) == 0 && TIME_BEFORE(current_tick, t))
+            yield();
+        if (bcm_read32(BCMA_COMMAND) == 0) { bcm_init_failed = true; return; }
+    }
 
     /* Diagnostics for bcm_host: what the VC published right after boot, before any LCD update */
     for (i = 0; i < 4; i++)
@@ -794,6 +811,8 @@ void lcd_awake(void)
             sleep(sleepwait);
 
         bcm_init();
+        if (bcm_init_failed)
+            return;                                    /* v47.1: leave display_on false instead of hanging */
 
         /* Start the first LCD update, which also initializes the LCD */
         lcd_state.state = LCD_INITIAL;
@@ -806,7 +825,8 @@ void lcd_awake(void)
          */
         lcd_state.waking = true;
         tick_add_task(&lcd_tick);
-        semaphore_wait(&(lcd_state.initwakeup), TIMEOUT_BLOCK);
+        semaphore_wait(&(lcd_state.initwakeup), 3 * HZ);   /* v47.1: bounded (was TIMEOUT_BLOCK) */
+        lcd_state.waking = false;
 
         send_event(LCD_EVENT_ACTIVATION, NULL);
     }

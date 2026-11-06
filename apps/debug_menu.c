@@ -3557,7 +3557,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v47 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
+    "0: v48 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3853,7 +3853,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v47 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v48 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4137,9 +4137,11 @@ static void cv_text(struct cv *c, int x, int y, const char *s)
 /* ---- windows */
 #define OSD_NS 3
 struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; };
-static uint32_t osd_cv0[40 * 36], osd_cv1[80 * 24], osd_cv2[320 * 52];
+static uint32_t osd_cv0[48 * 48], osd_cv1[80 * 24], osd_cv2[320 * 52];
 static struct osd_strip osd_s[OSD_NS] = {
-    { 12, 12, 40, 36, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0 },       /* status icon (stock box 33x33 at 15,15) */
+    /* status icon (stock box 33x33 at 15,15).  v47.1: 48x48 -- with a 40-pixel-wide image the icon came out sheared on the iPod:
+       VC images evidently want widths in multiples of 16 pixels (the 80 and 320 wide windows were fine) */
+    { 8, 8, 48, 48, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0 },
     { 232, 12, 80, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1 },      /* battery %, top right */
     { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2 },      /* stock bottom panel (y 192, h 43) */
 };
@@ -4217,24 +4219,24 @@ static int osd_alloc(int type, int w, int h, uint32_t *img, uint32_t *addr)
 /* ---- drawing (into the canvases) */
 static void osd_draw(void)
 {
-    struct cv c0 = { osd_cv0, 40, 36 }, c1 = { osd_cv1, 80, 24 }, c2 = { osd_cv2, 320, 52 };
+    struct cv c0 = { osd_cv0, 48, 48 }, c1 = { osd_cv1, 80, 24 }, c2 = { osd_cv2, 320, 52 };
     uint32_t shown = sc_active ? pl_target_ms : pl_el_ms, rem;
     char a[16], d[20], t[8];
     int fill, k, lvl = battery_level();
     cv_clear(&c0); cv_clear(&c1); cv_clear(&c2);
     /* status icon */
     k = sc_active ? (sc_dir > 0 ? VUI_FF : VUI_REW) : (pl_paused ? VUI_PAUSE : VUI_PLAY);
-    if (vui_state == 1 && vui[k].px) cv_blit(&c0, 4, 6, k, -1);
+    if (vui_state == 1 && vui[k].px) cv_blit(&c0, 8, 10, k, -1);    /* screen (16,18), centred in the stock 33x33 box */
     else
     {
         int i;
-        cv_fill(&c0, 3, 3, 33, 33, 0x80181818);
-        if (k == VUI_PAUSE) { cv_shadowed(&c0, 12, 10, 5, 17, 0xFFF4F4F4); cv_shadowed(&c0, 21, 10, 5, 17, 0xFFF4F4F4); }
-        else if (k == VUI_PLAY) for (i = 0; i < 9; i++) cv_shadowed(&c0, 13 + i, 10 + i, 1, 17 - 2 * i, 0xFFF4F4F4);
+        cv_fill(&c0, 7, 7, 33, 33, 0x80181818);
+        if (k == VUI_PAUSE) { cv_shadowed(&c0, 16, 14, 5, 17, 0xFFF4F4F4); cv_shadowed(&c0, 25, 14, 5, 17, 0xFFF4F4F4); }
+        else if (k == VUI_PLAY) for (i = 0; i < 9; i++) cv_shadowed(&c0, 17 + i, 14 + i, 1, 17 - 2 * i, 0xFFF4F4F4);
         else for (i = 0; i < 7; i++)
         {
-            int x1 = k == VUI_FF ? 9 + i : 23 - i, x2 = k == VUI_FF ? 18 + i : 14 - i;
-            cv_shadowed(&c0, x1, 12 + i, 1, 13 - 2 * i, 0xFFF4F4F4); cv_shadowed(&c0, x2, 12 + i, 1, 13 - 2 * i, 0xFFF4F4F4);
+            int x1 = k == VUI_FF ? 13 + i : 27 - i, x2 = k == VUI_FF ? 22 + i : 18 - i;
+            cv_shadowed(&c0, x1, 16 + i, 1, 13 - 2 * i, 0xFFF4F4F4); cv_shadowed(&c0, x2, 16 + i, 1, 13 - 2 * i, 0xFFF4F4F4);
         }
     }
     /* battery %, right-aligned at x 305 (mirrors the stock 15 px inset of the status icon) */
@@ -4246,6 +4248,14 @@ static void osd_draw(void)
         cv_text(&c1, x, 3, t);
         for (r = 0; r < 7; r++) for (q = 0; q < 5; q++)           /* '%' in the same white-with-shadow style */
             if (lk_font[12][r] & (16 >> q)) cv_shadowed(&c1, x + tw - pw + 1 + 2 * q, 3 + 2 + 2 * r, 2, 2, 0xFFF4F4F4);
+        cv_tint = 0xFFFFFF;
+        if (charger_inserted())
+        {   /* v47.1: charging -> a small lightning bolt left of the number */
+            static const uint8_t bolt[13] = { 0x0c, 0x18, 0x18, 0x30, 0x30, 0x7e, 0x0c, 0x18, 0x18, 0x30, 0x20, 0x40, 0x00 };
+            int bx = x - 10;
+            for (r = 0; r < 13; r++) for (q = 0; q < 8; q++)
+                if (bolt[r] & (0x80 >> q)) cv_shadowed(&c1, bx + q, 3 + r, 1, 1, 0xFFFFD21E);
+        }
     }
     cv_tint = 0xFFFFFF;
     /* bottom panel: progress bar (frame, then the fill cut at the position), elapsed left, remaining right */
@@ -4699,7 +4709,9 @@ static void bcm_video_run(int secs)
     }
     if (cfg_post == 3) { pw1 = current_tick + HZ; pw2 = current_tick + 4 * HZ; }
     int gf_last = v_getframes, gf_log = v_getframes, nstat = 0;
-    long last_req = current_tick, run_t0 = current_tick;
+    long last_req = current_tick, run_t0 = current_tick, bl_next = current_tick;
+    backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* v47.1: video at full brightness (restored when it ends) */
+    backlight_on();
     bool probed = !cfg_trickprobe;
     mon_start("mp_play (start-up pre-buffer)");
     while (TIME_BEFORE(current_tick, end) && !v_stop)
@@ -4707,6 +4719,12 @@ static void bcm_video_run(int secs)
         bcm_host_service();
         if (bcm_check_dead()) break;
         if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
+        if (!pl_paused && !TIME_BEFORE(current_tick, bl_next))
+        {   /* v47.1: backlight always on while the video plays (paused: Rockbox's own timeout and idle power-off apply) */
+            bl_next = current_tick + HZ / 2;
+            backlight_on();
+            reset_poweroff_timer();
+        }
         if (!probed && current_tick - run_t0 > 5 * HZ)
         {   /* v46: once per run, ~5 s in: measure the FF/REW candidates (buttons are not read meanwhile) */
             probed = true; mon_until = 0;
@@ -4721,8 +4739,7 @@ static void bcm_video_run(int secs)
             BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d  cache misses: tables %u data %u",
                  v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
             gf_log = v_getframes;
-            backlight_on();                            /* v42: keep the backlight on while a video plays */
-            reset_poweroff_timer();                    /* v47: and do not let Rockbox's idle power-off stop it */
+            /* v47.1: backlight + power-off timer are now kept alive below, only while the video is not paused */
             next_log += 2 * HZ;
         }
         if (dump1 && !TIME_BEFORE(current_tick, dump1)) { dump1 = 0; if (cfg_dump_sram) bcm_vc_dump("play1", 0, (uint32_t)cfg_dump_len); if (cfg_dump_sdram) bcm_vc_dump("sd1", 0xC0000000u, 0x400000u); }
@@ -5334,7 +5351,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v47, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v48, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
@@ -5503,12 +5520,41 @@ static bool bcm_run(const char *play_path)
 out:
     if (bcm_player_mode)
     {   /* v47: back to the file browser: Rockbox's own display firmware is booted again, nothing is rebooted */
-        int rr;
-        bcm_host_detach();
+        int rr = 0;
+        bcm_sync_every = 0;                            /* v47.1: every line below reaches the disk (v47 froze here, log lost) */
         bcm_wd_on = 0;
         tick_remove_task(bcm_wd_tick);
-        rr = bcm_play_path ? bcm_restore_rom_vmcs() : 0;
-        BLOG("player: display back to Rockbox (%d)", rr);
+        if (bcm_play_path)
+        {
+            /* stock VC shutdown (rt 0x289470): "power_control videocore 0", wait until VC[0x1F0] reads {0, magic},
+               then GPIO 0x77 and 0x76 low (GPO32 bits 15, 14; in bcm_restore_rom_vmcs) */
+            if (!bcm_io_dead())
+            {
+                uint32_t w1f0 = 0; long t0 = current_tick; int pr;
+                bcm_cmd_t0 = current_tick;
+                pr = bcm_gencmd_watched("power_control videocore 0", resp, sizeof resp, 2);
+                bcm_log_text("power_control videocore 0", pr, resp);
+                do {
+                    bcm_host_service();
+                    bcm_io_lock(); bcm_io_read(0x1F0, &w1f0, 4); bcm_io_unlock();
+                    if ((w1f0 & 0xffff) == 0) break;
+                    sleep(HZ / 50);
+                } while (current_tick - t0 < HZ);
+                BLOG("player: VC[0x1F0] = %08x after %ld ms (stock waits for low half 0)", (unsigned)w1f0, (current_tick - t0) * 1000 / HZ);
+            }
+            bcm_host_detach();
+            BLOG("player: GPO32 = %08lx -- powering the BCM down and booting Rockbox's display firmware", *(volatile unsigned long *)0x70000080);
+            rr = bcm_restore_rom_vmcs();
+            BLOG("player: display back to Rockbox (%d: 0 ok, -3 BCM did not boot, -2 no first update)", rr);
+            backlight_set_brightness(global_settings.brightness);
+            if (rr != 0 && rr != -2)
+            {
+                BLOG("player: the display did not come back -- rebooting instead of freezing");
+                if (bcm_log_fd >= 0) close(bcm_log_fd);
+                bcm_log_fd = -1;
+                system_reboot();
+            }
+        }
         if (bcm_log_fd >= 0) close(bcm_log_fd);
         bcm_log_fd = -1;
         bcm_sync_every = 0; bcm_player_mode = false; bcm_play_path = NULL;
