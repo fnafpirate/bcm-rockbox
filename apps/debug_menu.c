@@ -2892,6 +2892,8 @@ static long bcm_last_tick;
 static volatile long bcm_wd_last;
 static volatile int  bcm_wd_on;
 static long bcm_last_sync;
+static long bcm_sync_every;      /* v45: while a video plays, fsync at most this often (ticks; 0 = old rules) */
+static int  bcm_trace_42;        /* v45: number of PDS 0x42 trace lines written */
 static void bcm_wd_tick(void)
 {
     if (bcm_wd_on && (long)(current_tick - bcm_wd_last) > BCM_WD_SECS * HZ)
@@ -2911,7 +2913,10 @@ static void bcm_logline(const char *s, int n)
     write(bcm_log_fd, b, m);
     /* v25: fsync is slow on this 2 TB FAT32 volume right after a boot (0.3-1 s per line in the v24 log). Lines that start with
        a space (VCFS traces, dumps, list items) are flushed at most twice a second; everything else is flushed at once. */
-    if (t[0] != ' ' || (long)(current_tick - bcm_last_sync) >= HZ / 2)
+    /* v45: the v44 log shows one PDS 0x42 every ~33 ms; an fsync on this volume costs 0.1-0.6 s, so during playback
+       the log is flushed only every log_sync seconds (lines are still written at once). */
+    if (bcm_sync_every ? (long)(current_tick - bcm_last_sync) >= bcm_sync_every
+                       : (t[0] != ' ' || (long)(current_tick - bcm_last_sync) >= HZ / 2))
     {
         fsync(bcm_log_fd);             /* keep the log even if the VideoCore hangs and we must hard-reset */
         bcm_last_sync = current_tick;
@@ -2939,8 +2944,11 @@ static bool bcm_check_dead(void)
     }
     return true;
 }
+static int cfg_quiet_ref(void);
 static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
 {
+    if (a == 0x42 && !strcmp(tag, "pds op") && ++bcm_trace_42 > 24 && cfg_quiet_ref())
+        return;                                    /* v45: one line per frame request cost feed time; the first 24 are kept */
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
 }
 
@@ -2963,7 +2971,9 @@ static int bcm_gencmd_watched(const char *cmd, char *resp, size_t resp_sz, int m
             last_beat = current_tick;
         }
         if (current_tick - t0 >= max_secs * HZ) { r = -2; break; }
-        sleep(HZ / 20);
+        /* v45: was sleep(HZ/20): while a command was pending the frame feed (serviced inside the poll) dropped to 20/s.
+           Most replies arrive within 100 ms, so poll without sleeping for that long, then once per tick. */
+        if (current_tick - t0 < HZ / 10) yield(); else sleep(1);
     }
     return r;
 }
@@ -3055,9 +3065,67 @@ static bool m4_rd(uint32_t off, void *buf, uint32_t n)
     if (lseek(m4.fd, (off_t)off, SEEK_SET) != (off_t)off) return false;
     return read(m4.fd, buf, n) == (ssize_t)n;
 }
-static uint32_t m4_u32(uint32_t off) { uint8_t b[4]; return m4_rd(off, b, 4) ? m4_be32(b) : 0; }
-static uint32_t m4_u16(uint32_t off) { uint8_t b[2]; return m4_rd(off, b, 2) ? (uint32_t)((b[0]<<8)|b[1]) : 0; }
-static uint32_t m4_u8(uint32_t off)  { uint8_t b[1]; return m4_rd(off, b, 1) ? b[0] : 0; }
+/* v45: table and data caches.  Up to v44 every frame did three lseek+read pairs at unrelated file offsets (the
+   stsz entry and the stco entry in the moov box, then the sample itself in mdat).  Rockbox seeks backwards by walking
+   the FAT cluster chain from the start of the file, so each frame cost several disk reads; the v44 log shows the VC
+   asking for a frame every ~33 ms (= real time), i.e. we never got ahead and mplayer's ~380 KB start/seek pre-buffer
+   took 9-13 s to fill.  Now: table entries come from six 4 KB windows (LRU), sample data from a 64 KB read-ahead
+   window, so a frame normally needs no disk access at all. */
+static int cfg_m4cache_ref(void);
+#define M4C_WIN 4096
+#define M4C_N   6
+static struct { uint32_t base, len, use; uint8_t d[M4C_WIN]; } m4c[M4C_N];
+static uint32_t m4c_clock, m4c_miss, m4d_miss;
+static uint8_t m4d[65536];
+static uint32_t m4d_base, m4d_len;
+static void m4c_reset(void) { int i; for (i = 0; i < M4C_N; i++) { m4c[i].len = 0; m4c[i].use = 0; } m4d_len = 0; }
+static bool m4_rdc(uint32_t off, void *buf, uint32_t n)
+{
+    uint8_t *o = buf;
+    if (!cfg_m4cache_ref()) return m4_rd(off, buf, n);
+    while (n)
+    {
+        uint32_t base = off & ~(uint32_t)(M4C_WIN - 1), k, c;
+        int i, best = 0;
+        for (i = 0; i < M4C_N; i++) if (m4c[i].len && m4c[i].base == base) break;
+        if (i == M4C_N)
+        {
+            ssize_t r;
+            for (i = 1; i < M4C_N; i++) if (m4c[i].use < m4c[best].use) best = i;
+            i = best; m4c[i].len = 0; m4c_miss++;
+            if (lseek(m4.fd, (off_t)base, SEEK_SET) != (off_t)base) return false;
+            r = read(m4.fd, m4c[i].d, M4C_WIN);
+            if (r <= 0) return false;
+            m4c[i].base = base; m4c[i].len = (uint32_t)r;
+        }
+        m4c[i].use = ++m4c_clock;
+        k = off - base;
+        if (k >= m4c[i].len) return false;
+        c = m4c[i].len - k; if (c > n) c = n;
+        memcpy(o, m4c[i].d + k, c); o += c; off += c; n -= c;
+    }
+    return true;
+}
+/* sample data: served from the read-ahead window when it is inside it, else the window is refilled from there */
+static bool m4_rdd(uint32_t off, void *buf, uint32_t n)
+{
+    if (!cfg_m4cache_ref() || n > sizeof m4d / 2) return m4_rd(off, buf, n);
+    if (!(m4d_len && off >= m4d_base && off + n <= m4d_base + m4d_len))
+    {
+        uint32_t base = off & ~511u; ssize_t r;
+        m4d_len = 0; m4d_miss++;
+        if (lseek(m4.fd, (off_t)base, SEEK_SET) != (off_t)base) return false;
+        r = read(m4.fd, m4d, sizeof m4d);
+        if (r <= 0) return false;
+        m4d_base = base; m4d_len = (uint32_t)r;
+        if (off + n > m4d_base + m4d_len) return false;
+    }
+    memcpy(buf, m4d + (off - m4d_base), n);
+    return true;
+}
+static uint32_t m4_u32(uint32_t off) { uint8_t b[4]; return m4_rdc(off, b, 4) ? m4_be32(b) : 0; }
+static uint32_t m4_u16(uint32_t off) { uint8_t b[2]; return m4_rdc(off, b, 2) ? (uint32_t)((b[0]<<8)|b[1]) : 0; }
+static uint32_t m4_u8(uint32_t off)  { uint8_t b[1]; return m4_rdc(off, b, 1) ? b[0] : 0; }
 
 /* iterate the boxes in [*pos,end): payload range returned via ps and pe; false when none left or malformed */
 static bool m4_box(uint32_t *pos, uint32_t end, uint32_t *type, uint32_t *ps, uint32_t *pe)
@@ -3139,7 +3207,7 @@ static void m4_rewind(void)
     m4.stts_i = 0; m4.stts_left = m4_u32(m4.stts); m4.stts_delta = m4_u32(m4.stts + 4); m4.dts = 0;
 }
 
-static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; }
+static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; m4c_reset(); }
 
 /* v42: random access, the way the stock player does it (ARM positions its demuxer on a key frame, then sends
    "mp_seek <ms>"; the VC flushes and answers with PDS 0x43 {session, ms}; the stock 0x43 handler (rt 0x20b304)
@@ -3163,7 +3231,13 @@ static uint32_t m4_sample_at_ms(uint32_t ms)
     for (i = 0; i < m4.stts_n; i++)
     {
         uint32_t c = m4_u32(m4.stts + 8 * i), dl = m4_u32(m4.stts + 8 * i + 4);
-        if (dl && want < t + (uint64_t)c * dl) return base + (uint32_t)((want - t) / dl);
+        /* v45: nearest sample, not the one before: key-frame times are reported in whole ms (rounded down), and a
+           seek to such a time must land on that key frame, not on the one before it (FF scrubbing got stuck) */
+        if (dl && want < t + (uint64_t)c * dl)
+        {
+            uint32_t r = base + (uint32_t)((want - t + dl / 2) / dl);
+            return m4.stsz_n && r >= m4.stsz_n ? m4.stsz_n - 1 : r;
+        }
         t += (uint64_t)c * dl; base += c;
     }
     return m4.stsz_n ? m4.stsz_n - 1 : 0;
@@ -3269,7 +3343,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
     }
 
     *key = false;
-    if (size == 0 || size > M4_RAW_MAX || !m4_rd(off, m4_raw, size)) return -1;
+    if (size == 0 || size > M4_RAW_MAX || !m4_rdd(off, m4_raw, size)) return -1;
     for (p = 0; p + m4.nal_len <= size; )                               /* pass 1: is there an IDR? */
     {
         n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | m4_raw[p + k];
@@ -3358,8 +3432,12 @@ static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_reg
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
 static int cfg_osd = 1, cfg_osd_layer = 100;                                         /* v44: playback overlay */
+static int cfg_scrub_mode = 1, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
+static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
+static int cfg_quiet_ref(void) { return cfg_quiet; }
+static int cfg_m4cache_ref(void) { return cfg_m4cache; }
 static int cfg_play_secs = 0;                                                       /* v41: 0 = whole file */
-static int cfg_v40 = 1, cfg_post = 0, cfg_framedump = 1;                            /* v40 */
+static int cfg_v40 = 1, cfg_post = 0, cfg_framedump = 0;                            /* v40 (v45: frame dump off by default) */
 static int cfg_gfx_seq = 1, cfg_dc_extra = 0, cfg_fbtest = 1;                       /* v38 */
 static int cfg_dc_model = 0, cfg_dc_final = 99, cfg_dc_noinit = 0, cfg_gfx_quick = 1, cfg_pm27 = 1;   /* v37 */
 static int cfg_gfx_screen = 1;                                                     /* v36 */
@@ -3368,7 +3446,7 @@ static int cfg_lcdtest = 0, cfg_dump_sdram = 1, cfg_dump_sram = 0;              
 static int cfg_dump = 0, cfg_dump_len = 0x140000, cfg_dump_at1 = 20, cfg_dump_at2 = 35, cfg_vde = 0;   /* v32: VC RAM snapshots, vmcs_display_* probe */       /* v31: display_control power sequence; mid-play probe time in s (0 = off) */
 static void bcm_load_cfg(void)
 {
-    char buf[512], *p, *nl, *eq;
+    static char buf[2048]; char *p, *nl, *eq;           /* v45: 2 KB (512 cut longer cfg files) */
     int fd = open("/.rockbox/bcm_test.cfg", O_RDONLY), n, v;
     if (fd < 0) { BLOG("no /.rockbox/bcm_test.cfg -- defaults"); return; }
     n = read(fd, buf, sizeof buf - 1);
@@ -3379,6 +3457,7 @@ static void bcm_load_cfg(void)
     {
         nl = strchr(p, '\n');
         if (nl) *nl = 0;
+        if (nl && nl > p && nl[-1] == '\r') nl[-1] = 0;
         eq = strchr(p, '=');
         if (!eq || p[0] == '#') continue;
         *eq = 0; v = atoi(eq + 1);
@@ -3438,6 +3517,15 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "play_secs")) cfg_play_secs = v;
         else if (!strcmp(p, "osd"))      cfg_osd = v;
         else if (!strcmp(p, "osd_layer")) cfg_osd_layer = v;
+        else if (!strcmp(p, "scrub_mode")) cfg_scrub_mode = v;
+        else if (!strcmp(p, "scrub_tick")) cfg_scrub_tick = v < 100 ? 100 : v;
+        else if (!strcmp(p, "step_ms"))  cfg_step_ms = v;
+        else if (!strcmp(p, "tap_secs")) cfg_tap_secs = v;
+        else if (!strcmp(p, "ff_rate"))  cfg_ff_rate = v;
+        else if (!strcmp(p, "log_sync")) cfg_log_sync = v;
+        else if (!strcmp(p, "seekmon"))  cfg_seekmon = v;
+        else if (!strcmp(p, "quiet"))    cfg_quiet = v;
+        else if (!strcmp(p, "m4cache"))  cfg_m4cache = v;
         else if (!strcmp(p, "post"))     cfg_post = v;
         else if (!strcmp(p, "framedump")) cfg_framedump = v;
         else if (!strcmp(p, "dc_extra")) cfg_dc_extra = v;
@@ -3456,7 +3544,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v41 PLAYER: Annex B decode, power=2 twice, UI layer + status screen, video on top.  MENU = stop, PLAY = pause/resume, LEFT/RIGHT = seek -/+10 s"
+    "0: v45 PLAYER: Annex B decode, power=2 twice, video on top, stock-style overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3575,7 +3663,7 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     f.length = (uint32_t)n; f.data = m4_out;
     r = bcm_pds_send_frame(&f);
     v_frames++; v_bytes += n;
-    if (v_frames <= 12 || v_frames % 30 == 0 || r < 0)
+    if (v_frames <= 12 || v_frames % (cfg_quiet ? 900 : 30) == 0 || r < 0)
         BLOG("  frame #%d sample=%u len=%d key=%d ts=%ums send=%d", v_frames, (unsigned)m4.idx, n, key, (unsigned)ts, r);
 }
 static void v_seek(int id, uint32_t pos)
@@ -3734,7 +3822,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v44 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v45 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3892,27 +3980,73 @@ static void bcm_mid_probe(void)
     BLOG("---- end of probe");
 }
 
-/* ---------------------------------------------------------------- v44: player UI ----
-   Stock-like overlay: a 320x40 strip at the bottom (progress bar filled to elapsed/duration, elapsed and total time,
-   "PAUSED", battery %).  It is a separate VC image + window on a layer ABOVE mplayer's video element (the UI layer
-   -50 is below it), double-buffered like the stock present path (rt 0x164f44): op 1, op 4 (old window), write rows,
-   op 3 (new window), op 2.  Visible while paused / scrubbing and for 3 s after any control; hidden with op 4.
-   Scrubbing like the stock scrubber: SELECT or the wheel opens it, the wheel moves the target time (bar + time follow
-   at once), the seek is sent 0.7 s after the last wheel tick (LEFT/RIGHT step 10 s the same way). */
-#define OSD_H 40
-static uint32_t osd_img[2], osd_addr[2], osd_win[2];
-static int osd_front = -1, osd_ok = -1;
-static bool osd_visible, pl_paused, pl_scrub;
-static long osd_hide_at, osd_next, seek_at;
+/* ---------------------------------------------------------------- v45: player UI ----
+   Stock-like overlay, two strips on a layer above mplayer's video element (the UI layer -50 is below it):
+     top    (320x20): iPod title-bar look -- play / pause / FF / REW glyph, the video's name (or the scrub speed),
+                      battery % and battery icon at the top right
+     bottom (320x24): elapsed time, progress bar with a position marker, remaining time ("-1:02:03")
+   Each strip is a VC image pair, double-buffered like the stock present path (rt 0x164f44): write the back image,
+   op 1, op 4 (old windows), op 3 (new windows), op 2.  Shown while paused / scrubbing and for 3 s after a control.
+
+   FF/REW (v45, from mplayer.vll + the stock ARM image):
+     * the stock ARM only sends "mp_seek %d" (rt 0x1fa470, vtable slot 0x4c) and "mp_step %d[ no_video]" (rt 0x1fa4c4,
+       slot 0x48) -- there is no "mp_ff"/"mp_rewind" string in the ARM image.
+     * mplayer: gencmd mp_step (0x1025fc) posts message 0x36 -> mp_do_play case 0x36 -> mp_play_step(ms): stores ms in
+       [mp+0xfd0], pauses the display task, mp_clock_stc + mp_clock_start (the clock is started at once, no pre-buffer),
+       state byte [+0x179] = 3; the display task shows frames immediately while [+0xfd0] != 0.
+       gencmd mp_seek (0x1022c8) -> message 0x12 -> mp_play_seek(ms): flush, mp_clock_reset(ms), PDS 0x43 to the ARM.
+     * mp_ff / mp_rewind (0x100fac / 0x1020e0 -> 0x1002e0): "mp_ff [rate] [flag]", rate default 0xa00, rewind negates it,
+       -> mp_play_ff_rew(rate): flush, [+0xfd0] = rate, clock restarted -- mplayer's own trick mode, never used by stock.
+   So the stock scrubber is "seek to a key frame, then step" and that is scrub_mode 1:
+     hold >>| or |<<  ->  mp_pause, then every scrub_tick ms: next key frame in that direction (the jump grows the longer
+     the button is held: 2 s, 5 s, 15 s, 40 s per tick), mp_seek <key ms>, mp_step <step_ms>;  release -> mp_play.
+     A short press jumps tap_secs (default 10 s).  The click wheel does not seek any more. */
+#define OSD_TOP_H 20
+#define OSD_BOT_H 24
+struct osd_strip { int y, h; uint32_t img[2], addr[2], win[2]; int front; };
+static struct osd_strip osd_s[2] = {
+    { 0, OSD_TOP_H, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1 },
+    { LCD_HEIGHT - OSD_BOT_H, OSD_BOT_H, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1 },
+};
+static int osd_ok = -1;
+static bool osd_visible, pl_paused;
+static long osd_hide_at, osd_next;
 static uint32_t pl_dur_ms, pl_el_ms, pl_target_ms;
-static long pl_status_next;
+static char pl_title[40];
+static int pl_buffering = -1;
+/* scrubber */
+static int sc_btn, sc_dir, sc_ticks;
+static long sc_press, sc_t0, sc_next;
+static bool sc_active, sc_was_playing;
+static uint32_t sc_pos, sc_jump;
+/* post-seek monitor: how long until the picture moves again */
+static long mon_t0, mon_until, mon_next;
+static int mon_req0;
+
+static uint32_t pl_num(const char *r, const char *key)
+{
+    const char *q = strstr(r, key); uint32_t v = 0;
+    if (!q) return 0xffffffffu;
+    q += strlen(key);
+    while (*q >= '0' && *q <= '9') v = v * 10 + (uint32_t)(*q++ - '0');
+    return v;
+}
+static int pl_cmd(const char *c, bool log_ok)
+{
+    static char r[400]; int rr;
+    bcm_cmd_t0 = current_tick;
+    rr = bcm_gencmd_watched(c, r, sizeof r, 3);
+    if (log_ok || rr != 0 || strstr(r, "error")) bcm_log_text(c, rr, r);
+    return rr;
+}
 static void pl_status(void)
 {
-    static char r[400]; const char *q; int rr;
+    static char r[400]; uint32_t v; int rr;
     bcm_cmd_t0 = current_tick; rr = bcm_gencmd_watched("mp_get_status", r, sizeof r, 2);
     if (rr < 0) return;
-    if ((q = strstr(r, "duration="))) { uint32_t v = 0; q += 9; while (*q >= '0' && *q <= '9') v = v * 10 + (uint32_t)(*q++ - '0'); pl_dur_ms = v; }
-    if ((q = strstr(r, "elapsed=")))  { uint32_t v = 0; q += 8; while (*q >= '0' && *q <= '9') v = v * 10 + (uint32_t)(*q++ - '0'); pl_el_ms = v; }
+    if ((v = pl_num(r, "duration=")) != 0xffffffffu) pl_dur_ms = v;
+    if ((v = pl_num(r, "elapsed="))  != 0xffffffffu) pl_el_ms = v;
+    v = pl_num(r, "buffering="); pl_buffering = v == 0xffffffffu ? -1 : (int)v;
 }
 static void fmt_time(char *b, size_t n, uint32_t ms)
 {
@@ -3920,145 +4054,348 @@ static void fmt_time(char *b, size_t n, uint32_t ms)
     if (s >= 3600) snprintf(b, n, "%u:%02u:%02u", (unsigned)(s / 3600), (unsigned)(s / 60 % 60), (unsigned)(s % 60));
     else snprintf(b, n, "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
 }
-static int osd_alloc(uint32_t *img, uint32_t *addr)
+static int osd_alloc(int w, int h, uint32_t *img, uint32_t *addr)
 {
     uint32_t pl[8], o[4];
     memset(pl, 0, sizeof pl);
-    ((uint8_t *)pl)[4] = 1; pl[2] = LCD_WIDTH; pl[3] = OSD_H; pl[4] = LCD_WIDTH * 2; ((uint8_t *)pl)[0x1c] = 1;
+    ((uint8_t *)pl)[4] = 1; pl[2] = (uint32_t)w; pl[3] = (uint32_t)h; pl[4] = (uint32_t)w * 2; ((uint8_t *)pl)[0x1c] = 1;
     if (bcm_gfx_rpc(8, pl, 0x20, o, NULL, 300) != 0 || !o[0] || o[1] < 0x1000) return -1;
     *img = o[0]; *addr = o[1]; return 0;
 }
-static void osd_draw(void)
+/* FF (dir > 0) or REW glyph: two triangles, 5 wide, 9 high */
+static void osd_glyph_ff(int x, int y, int dir)
 {
-    /* drawn into the bottom OSD_H rows of the Rockbox frame buffer (lcd_update is frozen while the test runs) */
-    const int y0 = LCD_HEIGHT - OSD_H;
-    char a[16], d[16], t[48];
-    uint32_t shown = pl_scrub ? pl_target_ms : pl_el_ms;
-    int fill = pl_dur_ms ? (int)((uint64_t)shown * (LCD_WIDTH - 16) / pl_dur_ms) : 0;
-    lcd_set_viewport(NULL); lcd_set_backdrop(NULL); lcd_set_drawmode(DRMODE_SOLID); lcd_setfont(FONT_SYSFIXED);
-    lcd_set_foreground(LCD_RGBPACK(16, 16, 24)); lcd_fillrect(0, y0, LCD_WIDTH, OSD_H);
-    lcd_set_foreground(LCD_RGBPACK(90, 90, 100)); lcd_fillrect(8, y0 + 6, LCD_WIDTH - 16, 8);
-    lcd_set_foreground(pl_scrub ? LCD_RGBPACK(255, 200, 0) : LCD_RGBPACK(80, 160, 255));
-    if (fill > 0) lcd_fillrect(8, y0 + 6, fill > LCD_WIDTH - 16 ? LCD_WIDTH - 16 : fill, 8);
-    lcd_set_foreground(LCD_RGBPACK(255, 255, 255)); lcd_set_background(LCD_RGBPACK(16, 16, 24));
-    fmt_time(a, sizeof a, shown); fmt_time(d, sizeof d, pl_dur_ms);
-    lcd_putsxyf(8, y0 + 20, "%s / %s", a, d);
-    snprintf(t, sizeof t, "%s%d%%", pl_paused ? "PAUSED  " : (pl_scrub ? "SEEK  " : ""), battery_level());
-    lcd_putsxyf(LCD_WIDTH - 8 - 6 * (int)strlen(t), y0 + 20, "%s", t);
+    int t, i;
+    for (t = 0; t < 2; t++)
+        for (i = 0; i < 5; i++)
+        {
+            int col = dir > 0 ? x + 5 * t + i : x + 5 * t + 4 - i;
+            lcd_vline(col, y + i, y + 8 - i);
+        }
+}
+static void osd_draw_top(void)
+{
+    const int H = OSD_TOP_H;
+    int y, i, lvl = battery_level(), bx = LCD_WIDTH - 27, by = 5, tw, n;
+    char t[48];
+    for (y = 0; y < H; y++)
+    {   /* light metal gradient like the iPod title bar */
+        int c = 238 - y * 3;
+        lcd_set_foreground(LCD_RGBPACK(c, c, c + 6 > 255 ? 255 : c + 6));
+        lcd_hline(0, LCD_WIDTH - 1, y);
+    }
+    lcd_set_foreground(LCD_RGBPACK(110, 110, 118)); lcd_hline(0, LCD_WIDTH - 1, H - 1);
+    lcd_set_foreground(LCD_RGBPACK(24, 24, 28));
+    if (sc_active) osd_glyph_ff(6, 5, sc_dir);
+    else if (pl_paused) { lcd_fillrect(7, 5, 3, 10); lcd_fillrect(12, 5, 3, 10); }
+    else for (i = 0; i < 5; i++) lcd_vline(7 + i, 5 + i, 14 - i);
+    /* centre: name, or the scrub speed */
+    if (sc_active)
+    {
+        unsigned x = sc_jump * 1000u / (unsigned)(cfg_scrub_tick > 0 ? cfg_scrub_tick : 300) / 1000u;
+        snprintf(t, sizeof t, "%s  x%u", sc_dir > 0 ? "Fast Forward" : "Rewind", x ? x : 1);
+    }
+    else snprintf(t, sizeof t, "%s", pl_title[0] ? pl_title : "Now Playing");
+    n = (int)strlen(t);
+    if (n > 34) { t[33] = '.'; t[34] = 0; n = 34; }
+    tw = 6 * n;
+    lcd_set_drawmode(DRMODE_FG);
+    lcd_putsxyf((LCD_WIDTH - tw) / 2, 6, "%s", t);
+    /* battery: % then the icon, top right */
+    snprintf(t, sizeof t, "%d%%", lvl < 0 ? 0 : lvl);
+    lcd_putsxyf(bx - 4 - 6 * (int)strlen(t), 6, "%s", t);
+    lcd_set_drawmode(DRMODE_SOLID);
+    lcd_drawrect(bx, by, 22, 10);
+    lcd_fillrect(bx + 22, by + 3, 2, 4);
+    lcd_set_foreground(lvl > 20 ? LCD_RGBPACK(60, 190, 60) : LCD_RGBPACK(220, 50, 40));
+    {   int fw = (18 * (lvl > 100 ? 100 : lvl) + 50) / 100;
+        if (lvl > 0) lcd_fillrect(bx + 2, by + 2, fw > 0 ? fw : 1, 6); }
+}
+static void osd_draw_bot(void)
+{
+    const int y0 = LCD_HEIGHT - OSD_BOT_H, bx0 = 56, bx1 = LCD_WIDTH - 56, bw = bx1 - bx0, ym = y0 + 12;
+    uint32_t shown = sc_active ? pl_target_ms : pl_el_ms, rem;
+    int y, fill, i;
+    char a[16], d[20];
+    if (pl_dur_ms && shown > pl_dur_ms) shown = pl_dur_ms;
+    rem = pl_dur_ms > shown ? pl_dur_ms - shown : 0;
+    for (y = 0; y < OSD_BOT_H; y++)
+    {
+        int c = 46 - y;
+        lcd_set_foreground(LCD_RGBPACK(c, c, c + 6));
+        lcd_hline(0, LCD_WIDTH - 1, y0 + y);
+    }
+    lcd_set_foreground(LCD_RGBPACK(90, 90, 98)); lcd_hline(0, LCD_WIDTH - 1, y0);
+    fmt_time(a, sizeof a, shown);
+    d[0] = '-'; fmt_time(d + 1, sizeof d - 1, rem);
+    lcd_set_foreground(LCD_RGBPACK(235, 235, 240)); lcd_set_drawmode(DRMODE_FG);
+    lcd_putsxyf(4, y0 + 8, "%s", a);
+    lcd_putsxyf(LCD_WIDTH - 4 - 6 * (int)strlen(d), y0 + 8, "%s", d);
+    lcd_set_drawmode(DRMODE_SOLID);
+    /* bar: outline, filled part, diamond marker */
+    lcd_set_foreground(LCD_RGBPACK(150, 150, 158)); lcd_drawrect(bx0, ym - 3, bw, 7);
+    fill = pl_dur_ms ? (int)((uint64_t)shown * (uint32_t)(bw - 2) / pl_dur_ms) : 0;
+    if (fill > bw - 2) fill = bw - 2;
+    lcd_set_foreground(sc_active ? LCD_RGBPACK(255, 205, 40) : LCD_RGBPACK(225, 225, 232));
+    if (fill > 0) lcd_fillrect(bx0 + 1, ym - 2, fill, 5);
+    lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
+    for (i = -4; i <= 4; i++)
+    {
+        int h = 4 - (i < 0 ? -i : i);
+        lcd_vline(bx0 + 1 + fill + i, ym - h, ym + h);
+    }
 }
 static void osd_present(void)
 {
     uint32_t o[4], pl[8], w4[4];
-    const fb_data *fb; int back, y;
+    int k, back[2], y;
     if (osd_ok <= 0) return;
-    osd_draw();
-    fb = FBADDR(0, 0) + (LCD_HEIGHT - OSD_H) * LCD_WIDTH;
-    back = osd_front < 0 ? 0 : 1 - osd_front;
-    for (y = 0; y < OSD_H; y += 8)
-    { bcm_io_lock(); bcm_io_write(osd_addr[back] + (unsigned)y * LCD_WIDTH * 2, fb + y * LCD_WIDTH, 8 * LCD_WIDTH * 2); bcm_io_unlock(); }
+    lcd_set_viewport(NULL); lcd_set_backdrop(NULL); lcd_set_drawmode(DRMODE_SOLID); lcd_setfont(FONT_SYSFIXED);
+    osd_draw_top(); osd_draw_bot();
+    for (k = 0; k < 2; k++)
+    {
+        struct osd_strip *s = &osd_s[k];
+        const fb_data *fb = FBADDR(0, 0) + s->y * LCD_WIDTH;
+        back[k] = s->front < 0 ? 0 : 1 - s->front;
+        for (y = 0; y < s->h; y += 8)
+        {
+            int n = s->h - y < 8 ? s->h - y : 8;
+            bcm_io_lock(); bcm_io_write(s->addr[back[k]] + (unsigned)y * LCD_WIDTH * 2, fb + y * LCD_WIDTH, (unsigned)n * LCD_WIDTH * 2); bcm_io_unlock();
+        }
+        bcm_host_service();                          /* keep frames flowing while the strips are written */
+    }
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    if (osd_front >= 0 && osd_win[osd_front]) { memset(w4, 0, sizeof w4); w4[0] = osd_win[osd_front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); osd_win[osd_front] = 0; }
-    memset(pl, 0, sizeof pl);
-    pl[1] = (uint32_t)cfg_osd_layer; pl[3] = osd_img[back];
-    ((uint16_t *)pl)[8] = 0; ((uint16_t *)pl)[9] = LCD_HEIGHT - OSD_H; ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = OSD_H;
-    if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) osd_win[back] = o[0];
+    for (k = 0; k < 2; k++)
+    {
+        struct osd_strip *s = &osd_s[k];
+        if (s->front >= 0 && s->win[s->front])
+        { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
+    }
+    for (k = 0; k < 2; k++)
+    {
+        struct osd_strip *s = &osd_s[k];
+        memset(pl, 0, sizeof pl);
+        pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[back[k]];
+        ((uint16_t *)pl)[8] = 0; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = (uint16_t)s->h;
+        if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->win[back[k]] = o[0];
+        s->front = back[k];
+    }
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
-    osd_front = back; osd_visible = true;
+    osd_visible = true;
 }
 static void osd_hide(void)
 {
     uint32_t o[4], w4[4];
-    if (!osd_visible || osd_front < 0) return;
-    memset(w4, 0, sizeof w4); w4[0] = osd_win[osd_front];
+    int k;
+    if (!osd_visible) return;
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    if (w4[0]) bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+    for (k = 0; k < 2; k++)
+    {
+        struct osd_strip *s = &osd_s[k];
+        if (s->front >= 0 && s->win[s->front])
+        { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
+    }
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
-    osd_win[osd_front] = 0; osd_visible = false;
+    osd_visible = false;
 }
 static void osd_show_for(int ms)
 {
     if (!cfg_osd) return;
     if (osd_ok < 0)
     {
-        osd_ok = (osd_alloc(&osd_img[0], &osd_addr[0]) == 0 && osd_alloc(&osd_img[1], &osd_addr[1]) == 0) ? 1 : 0;
-        BLOG("  OSD: images %08x @ %08x, %08x @ %08x -> %s (layer %d)", (unsigned)osd_img[0], (unsigned)osd_addr[0],
-             (unsigned)osd_img[1], (unsigned)osd_addr[1], osd_ok ? "ok" : "FAILED", cfg_osd_layer);
+        int k, ok = 1;
+        for (k = 0; k < 2 && ok; k++)
+            ok = osd_alloc(LCD_WIDTH, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0 &&
+                 osd_alloc(LCD_WIDTH, osd_s[k].h, &osd_s[k].img[1], &osd_s[k].addr[1]) == 0;
+        osd_ok = ok;
+        BLOG("  OSD: top %08x/%08x bottom %08x/%08x -> %s (layer %d)", (unsigned)osd_s[0].img[0], (unsigned)osd_s[0].img[1],
+             (unsigned)osd_s[1].img[0], (unsigned)osd_s[1].img[1], ok ? "ok" : "FAILED", cfg_osd_layer);
     }
-    if (!pl_scrub) pl_status();
+    if (!sc_active) pl_status();
     osd_present();
-    {   static int n; if (n++ < 4) BLOG("  OSD shown: window %08x (front %d), elapsed %u / %u ms", (unsigned)(osd_front >= 0 ? osd_win[osd_front] : 0), osd_front, (unsigned)pl_el_ms, (unsigned)pl_dur_ms); }
     osd_hide_at = ms ? current_tick + (ms * HZ) / 1000 : 0;
-    osd_next = current_tick + HZ / 2;
+    osd_next = current_tick + HZ;
 }
-static uint32_t pl_key_for(uint32_t want, bool forward)
+
+/* key frames: the last one at or before ms / the first one after the sample at ms */
+static uint32_t pl_key_ms(uint32_t k) { return (uint32_t)(m4_dts_of(k) * 1000ULL / m4.timescale); }
+static uint32_t pl_key_after(uint32_t ms)
 {
-    uint32_t kms = 0;
-    m4_key_at(want, &kms);
-    if (forward && kms + 2000 < want && m4.stss && m4.stss_n)
-    {   /* the previous key frame would not move forward: take the next one */
-        uint32_t k2 = m4_key_at(want, NULL), nk = k2, i2;
-        for (i2 = 0; i2 < m4.stss_n; i2++) { uint32_t sn = m4_u32(m4.stss + 4 * i2); if (sn > k2 + 1) { nk = sn - 1; break; } }
-        kms = (uint32_t)(m4_dts_of(nk) * 1000ULL / m4.timescale);
+    uint32_t s = m4_sample_at_ms(ms), lo = 0, hi;
+    if (!m4.stss || !m4.stss_n) return s + 1 < m4.stsz_n ? s + 1 : s;
+    hi = m4.stss_n;                                   /* first sync sample number (1-based) > s+1 */
+    if (m4_u32(m4.stss + 4 * (hi - 1)) <= s + 1) return 0xffffffffu;
+    while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (m4_u32(m4.stss + 4 * mid) <= s + 1) lo = mid + 1; else hi = mid; }
+    return m4_u32(m4.stss + 4 * lo) - 1;
+}
+/* next scrub position from cur in direction dir, about `jump` ms away, always on a key frame and always moving */
+static uint32_t pl_key_step(uint32_t cur, int dir, uint32_t jump)
+{
+    uint32_t kms = cur, k;
+    if (dir > 0)
+    {
+        uint32_t want = cur + jump;
+        if (pl_dur_ms && want > pl_dur_ms) want = pl_dur_ms;
+        m4_key_at(want, &kms);
+        if (kms <= cur) { k = pl_key_after(cur); if (k != 0xffffffffu) kms = pl_key_ms(k); else kms = cur; }
+    }
+    else
+    {
+        uint32_t want = cur > jump ? cur - jump : 0;
+        if (want >= cur && cur) want = cur - 1;
+        m4_key_at(want, &kms);
     }
     return kms;
 }
+static void mon_start(const char *why)
+{
+    mon_t0 = current_tick; mon_until = current_tick + cfg_seekmon * HZ; mon_next = current_tick + HZ / 2; mon_req0 = v_getframes;
+    BLOG("  mon: %s -- watching elapsed/buffering for %d s", why, cfg_seekmon);
+}
+static void mon_tick(void)
+{
+    static char r[400];
+    uint32_t el, bu; int rr;
+    if (!mon_until || TIME_BEFORE(current_tick, mon_next)) return;
+    if (!TIME_BEFORE(current_tick, mon_until)) { mon_until = 0; return; }
+    mon_next = current_tick + HZ / 2;
+    bcm_cmd_t0 = current_tick; rr = bcm_gencmd_watched("mp_get_status", r, sizeof r, 2);
+    if (rr < 0) return;
+    el = pl_num(r, "elapsed="); bu = pl_num(r, "buffering=");
+    if (el != 0xffffffffu) pl_el_ms = el;
+    BLOG("  mon +%ld.%lds: elapsed=%u buffering=%d paused=%s frames requested since=%d (%ld/s)",
+         (current_tick - mon_t0) / HZ, (current_tick - mon_t0) % HZ / 10, (unsigned)el, bu == 0xffffffffu ? -1 : (int)bu,
+         strstr(r, "paused=yes") ? "yes" : "no", v_getframes - mon_req0,
+         (current_tick - mon_t0) > 0 ? (long)(v_getframes - mon_req0) * HZ / (current_tick - mon_t0) : 0L);
+}
+
+static void scrub_begin(int dir)
+{
+    char c[48];
+    pl_status();
+    sc_active = true; sc_dir = dir; sc_ticks = 0; sc_t0 = current_tick; sc_next = current_tick;
+    sc_pos = pl_el_ms; pl_target_ms = sc_pos; sc_jump = 2000;
+    sc_was_playing = !pl_paused;
+    BLOG("  scrub: %s held at %u ms (scrub_mode %d, tick %d ms, step %d ms)", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, cfg_scrub_mode, cfg_scrub_tick, cfg_step_ms);
+    if (cfg_scrub_mode == 3)
+    {   /* mplayer's own trick mode (never used by the stock firmware) */
+        snprintf(c, sizeof c, "%s %d", dir > 0 ? "mp_ff" : "mp_rewind", cfg_ff_rate);
+        pl_cmd(c, true);
+        mon_start(c);
+    }
+    else if (cfg_scrub_mode != 2 && sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
+    osd_show_for(0);
+}
+static void scrub_tick(void)
+{
+    char c[48];
+    long held;
+    uint32_t k;
+    if (!sc_active) return;
+    if (sc_btn && !(button_status() & sc_btn)) { /* release event lost: end anyway */ sc_btn = 0; }
+    if (TIME_BEFORE(current_tick, sc_next)) return;
+    sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
+    if (cfg_scrub_mode == 3) { pl_status(); pl_target_ms = pl_el_ms; osd_present(); return; }
+    held = current_tick - sc_t0;
+    sc_jump = held < 2 * HZ ? 2000 : held < 5 * HZ ? 5000 : held < 9 * HZ ? 15000 : 40000;
+    k = pl_key_step(sc_pos, sc_dir, sc_jump);
+    if (k == sc_pos && sc_ticks) { pl_target_ms = sc_pos; osd_present(); return; }   /* start / end of the file */
+    sc_pos = k; pl_target_ms = k;
+    snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
+    pl_cmd(c, sc_ticks < 4);
+    if (cfg_scrub_mode == 1 && cfg_step_ms > 0)
+    {
+        snprintf(c, sizeof c, "mp_step %d", cfg_step_ms);
+        pl_cmd(c, sc_ticks < 4);
+    }
+    if (sc_ticks < 6 || sc_ticks % 10 == 0)
+        BLOG("  scrub tick %d: %s to key frame %u ms (jump %u ms, held %ld.%ld s)", sc_ticks, sc_dir > 0 ? "FF" : "REW",
+             (unsigned)k, (unsigned)sc_jump, held / HZ, held % HZ / 10);
+    sc_ticks++;
+    osd_present();
+}
+static void scrub_end(void)
+{
+    sc_active = false;
+    BLOG("  scrub: released at %u ms after %d ticks", (unsigned)sc_pos, sc_ticks);
+    if (cfg_scrub_mode == 3)
+    {
+        pl_cmd("mp_play", true); pl_paused = false;
+        pl_status();
+        mon_start("after mp_ff/mp_rewind -> mp_play");
+    }
+    else
+    {
+        pl_el_ms = sc_pos;
+        if (sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
+        mon_start(sc_was_playing ? "scrub released -> mp_play" : "scrub released (paused)");
+    }
+    osd_show_for(pl_paused ? 0 : 3000);
+}
+static void pl_tap(int dir)
+{
+    char c[48]; uint32_t k;
+    if (cfg_tap_secs <= 0) return;
+    pl_status();
+    k = pl_key_step(pl_el_ms, dir, (uint32_t)cfg_tap_secs * 1000u);
+    snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
+    pl_cmd(c, true);
+    pl_el_ms = k; pl_target_ms = k;
+    mon_start(dir > 0 ? "tap >>|" : "tap |<<");
+    osd_show_for(pl_paused ? 0 : 3000);
+}
 static void bcm_osd_tick(void)
 {
-    if (seek_at && !TIME_BEFORE(current_tick, seek_at))
-    {
-        char c[48], r[200]; int rr;
-        uint32_t k = pl_key_for(pl_target_ms, pl_target_ms > pl_el_ms);
-        seek_at = 0;
-        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
-        bcm_cmd_t0 = current_tick; rr = bcm_gencmd_watched(c, r, sizeof r, 4); bcm_log_text(c, rr, r);
-        pl_scrub = false; pl_el_ms = k;
-        osd_show_for(pl_paused ? 0 : 3000);
-    }
-    if (!osd_visible) return;
-    if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused && !pl_scrub) { osd_hide(); return; }
+    if (sc_btn && !sc_active && current_tick - sc_press >= (HZ * 4) / 10 && (button_status() & sc_btn))
+        scrub_begin(sc_btn == BUTTON_RIGHT ? 1 : -1);     /* held: start scrubbing (does not wait for BUTTON_REPEAT) */
+    if (sc_active && !sc_btn) scrub_end();
+    scrub_tick();
+    mon_tick();
+    if (!osd_visible || sc_active) return;
+    if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused) { osd_hide(); return; }
     if (!TIME_BEFORE(current_tick, osd_next))
     {
         osd_next = current_tick + HZ;
-        if (!pl_scrub) pl_status();
+        pl_status();
         osd_present();
     }
 }
-/* returns 1 when the user wants to stop */
+/* returns 1 when the user wants to stop.  The wheel is ignored (no seeking with the wheel). */
 static int bcm_player_input(char *resp, size_t rn)
 {
-    int b = button_get_w_tmo(0), r2;
-    if (b == BUTTON_NONE || (b & BUTTON_REL)) return 0;
-    if (b == BUTTON_MENU) return 1;
-    if ((b & ~BUTTON_REPEAT) == BUTTON_SCROLL_FWD || (b & ~BUTTON_REPEAT) == BUTTON_SCROLL_BACK)
+    int b = button_get_w_tmo(0), base, r2;
+    if (b == BUTTON_NONE) return 0;
+    base = b & ~(BUTTON_REPEAT | BUTTON_REL);
+    if (base == BUTTON_RIGHT || base == BUTTON_LEFT)
     {
-        int step = 5000;
-        if (!pl_scrub) { pl_status(); pl_target_ms = pl_el_ms; pl_scrub = true; }
-        if ((b & ~BUTTON_REPEAT) == BUTTON_SCROLL_FWD) pl_target_ms += step;
-        else pl_target_ms = pl_target_ms > (uint32_t)step ? pl_target_ms - step : 0;
-        if (pl_dur_ms && pl_target_ms > pl_dur_ms - 1000) pl_target_ms = pl_dur_ms - 1000;
-        seek_at = current_tick + (7 * HZ) / 10;
-        osd_show_for(0); return 0;
+        if (b & BUTTON_REL)
+        {
+            if (sc_btn == base)
+            {
+                sc_btn = 0;
+                if (!sc_active) pl_tap(base == BUTTON_RIGHT ? 1 : -1);   /* short press */
+                /* a held press ends in bcm_osd_tick (sc_active && !sc_btn) */
+            }
+            return 0;
+        }
+        if (!(b & BUTTON_REPEAT) && !sc_btn) { sc_btn = base; sc_press = current_tick; }
+        else if ((b & BUTTON_REPEAT) && sc_btn == base && !sc_active && current_tick - sc_press >= (HZ * 4) / 10)
+            scrub_begin(base == BUTTON_RIGHT ? 1 : -1);
+        return 0;
     }
-    if (b & BUTTON_REPEAT)
-    {   /* holding LEFT/RIGHT keeps stepping (frames resume after release) */
-        if ((b & ~BUTTON_REPEAT) != BUTTON_LEFT && (b & ~BUTTON_REPEAT) != BUTTON_RIGHT) return 0;
-        b &= ~BUTTON_REPEAT;
-    }
+    if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
+    if (b == BUTTON_MENU) return 1;
     if (b == BUTTON_PLAY)
     {
         const char *cmd = pl_paused ? "mp_play" : "mp_pause";
         bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(cmd, resp, rn, 3); bcm_log_text(cmd, r2, resp);
         pl_paused = !pl_paused;
+        if (!pl_paused) mon_start("PLAY -> mp_play");
         osd_show_for(pl_paused ? 0 : 3000);
     }
-    else if (b == BUTTON_SELECT) osd_show_for(3000);
-    else if (b == BUTTON_LEFT || b == BUTTON_RIGHT)
+    else if (b == BUTTON_SELECT)
     {
-        if (!pl_scrub) { pl_status(); pl_target_ms = pl_el_ms; pl_scrub = true; }
-        if (b == BUTTON_RIGHT) pl_target_ms += 10000; else pl_target_ms = pl_target_ms > 10000 ? pl_target_ms - 10000 : 0;
-        if (pl_dur_ms && pl_target_ms > pl_dur_ms - 1000) pl_target_ms = pl_dur_ms - 1000;
-        seek_at = current_tick + HZ / 2;
-        osd_show_for(0);
+        if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000);
     }
     return 0;
 }
@@ -4089,7 +4426,9 @@ static void bcm_video_run(int secs)
         BLOG("  post: status-screen updates stopped");
     }
     if (cfg_post == 3) { pw1 = current_tick + HZ; pw2 = current_tick + 4 * HZ; }
-    int gf_last = v_getframes;
+    int gf_last = v_getframes, gf_log = v_getframes, nstat = 0;
+    long last_req = current_tick;
+    mon_start("mp_play (start-up pre-buffer)");
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
@@ -4099,8 +4438,9 @@ static void bcm_video_run(int secs)
         bcm_osd_tick();
         if (!TIME_BEFORE(current_tick, next_log))
         {
-            BLOG("  video: get_frame=%d sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d",
-                 v_getframes, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips);
+            BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d  cache misses: tables %u data %u",
+                 v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
+            gf_log = v_getframes;
             backlight_on();                            /* v42: keep the backlight on while a video plays */
             next_log += 2 * HZ;
         }
@@ -4123,9 +4463,16 @@ static void bcm_video_run(int secs)
         if (!TIME_BEFORE(current_tick, next_stat))
         {
             int r;
+            bool full = nstat < 4 || nstat % 6 == 0;  /* v45: full dumps at 5..20 s, then every 30 s; one line otherwise */
+            nstat++;
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_stats video", resp, sizeof resp, 1);
-            bcm_log_text("mp_get_stats video", r, resp);
+            if (full) bcm_log_text("mp_get_stats video", r, resp);
+            else
+            {
+                uint32_t sq = pl_num(resp, "Disp seq_num="), dt = pl_num(resp, "Disp time="), mx = pl_num(resp, "max_time_ahead=");
+                BLOG("  stats: Disp seq_num=%d Disp time=%d max_time_ahead=%d", (int)sq, (int)dt, (int)mx);
+            }
             if (cfg_framedump && !framedumped)
             {
                 /* v40: the decoder reports the picture it handed to the display ("Disp decoded_data=<VC address>",
@@ -4146,7 +4493,9 @@ static void bcm_video_run(int secs)
             }
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 1);
-            bcm_log_text("mp_get_status", r, resp);
+            if (full) bcm_log_text("mp_get_status", r, resp);
+            else BLOG("  status: elapsed=%d buffering=%d paused=%s", (int)pl_num(resp, "elapsed="), (int)pl_num(resp, "buffering="),
+                      strstr(resp, "paused=yes") ? "yes" : "no");
             {   static int props_done;                 /* v38: what mplayer understood of our stream description, once */
                 if (!props_done)
                 {
@@ -4163,9 +4512,13 @@ static void bcm_video_run(int secs)
             }
             next_stat += 5 * HZ;
         }
-        if (v_getframes != gf_last) { gf_last = v_getframes; yield(); }   /* v44: a frame was requested -> poll again at once */
-        else sleep(HZ / 100);
+        /* v45: keep polling without sleeping while the VC is pulling frames (a request within the last 50 ms);
+           sleep a tick only when it has gone quiet (paused, or buffer full) */
+        if (v_getframes != gf_last) { gf_last = v_getframes; last_req = current_tick; yield(); }
+        else if (current_tick - last_req < HZ / 20) yield();
+        else sleep(1);
     }
+    bcm_sync_every = 0;
     bcm_map_probe();
 }
 
@@ -4521,6 +4874,16 @@ static void bcm_playback_probe(void)
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
+            {   /* v45: the overlay shows the file name without folder and extension */
+                const char *bn = strrchr(video, '/'); char *dot;
+                snprintf(pl_title, sizeof pl_title, "%s", bn ? bn + 1 : video);
+                dot = strrchr(pl_title, '.'); if (dot && dot != pl_title) *dot = 0;
+            }
+            if (cfg_quiet && cfg_log_sync > 0)
+            {
+                BLOG("log: from here on flushed every %d s (quiet=1); PDS 0x42 traces after the first 24 are not written", cfg_log_sync);
+                bcm_sync_every = cfg_log_sync * HZ;      /* v45: frames start flowing at mp_selectplay (pre-buffer) */
+            }
             bcm_pds_map_stream(0, cfg_map);                 /* type 1 (video) -> buffer A (cap 0x10000, stock); audio would be B */
             BLOG("REAL VIDEO FEED enabled (video stream only, no audio)");
         }
@@ -4654,7 +5017,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v44, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v45, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
