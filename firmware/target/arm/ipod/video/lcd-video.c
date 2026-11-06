@@ -451,6 +451,7 @@ int bcm_restore_rom_vmcs(void)
 {
     if (rom_vmcs_length == 0)
         return -1;
+    _backlight_hw_enable(false);                       /* v50: like bcm_powerdown(): dark until the first LCD update is done */
     BCM_IO_LOCK();
     tick_remove_task(&lcd_tick);
     lcd_state.display_on = false;
@@ -467,6 +468,7 @@ int bcm_restore_rom_vmcs(void)
     lcd_state.blocked = false;
     lcd_state.state = LCD_INITIAL;
     lcd_awake();                                       /* bcm_init() + first LCD update */
+    _backlight_hw_enable(true);
     if (bcm_init_failed) return -3;
     return lcd_state.display_on ? 0 : -2;
 }
@@ -803,6 +805,8 @@ static void bcm_init(void)
 
 void lcd_awake(void)
 {
+    if (bcm_lcd_frozen)
+        return;     /* v50: a video owns the BCM (stock vmcs.bin); Rockbox's LCD sleep/wake must not touch it */
     if (!lcd_state.display_on && flash_vmcs_length != 0)
     {
         /* Ensure BCM has been off for >= 50 ms */
@@ -834,6 +838,8 @@ void lcd_awake(void)
 
 void lcd_sleep(void)
 {
+    if (bcm_lcd_frozen)
+        return;     /* v50: bcm_powerdown()'s mailbox commands would wait forever on the stock vmcs.bin */
     if (lcd_state.display_on && flash_vmcs_length != 0)
     {
         lcd_state.display_on = false;

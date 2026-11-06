@@ -19,7 +19,7 @@ Output (VUI1): "VUI1", u32 count, count x {u16 key, u16 w, u16 h, u16 format, u3
 import struct, sys, argparse, os
 
 # key -> stock resource id (video overlay views 22056..22065, see the findings)
-KEYS = {0: 21922, 1: 21923, 2: 21931, 3: 21932, 4: 21933, 5: 21934, 20: 21949, 21: 21950}
+KEYS = {0: 21922, 1: 21923, 2: 21931, 3: 21932, 4: 21933, 5: 21934, 20: 21949, 21: 21950, 22: 21927}   # 22 = hold lock (v50)
 KEYS.update({10 + i: 21939 + i for i in range(10)})
 SIG = struct.pack('<I', 3)
 

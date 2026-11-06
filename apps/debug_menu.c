@@ -3557,7 +3557,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v49 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
+    "0: v50 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3849,7 +3849,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v49 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v50 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4032,7 +4032,7 @@ static void bcm_mid_probe(void)
      jump  fallback: a seek to the next key frame every second while playing
    Release always ends with mp_play + mp_seek to the key frame that was on screen (Disp time). */
 #define VUI_PATH "/.rockbox/bcm_video_ui.bin"
-enum { VUI_FILL = 0, VUI_FRAME, VUI_PLAY, VUI_PAUSE, VUI_FF, VUI_REW, VUI_D0 = 10, VUI_MINUS = 20, VUI_COLON, VUI_N };
+enum { VUI_FILL = 0, VUI_FRAME, VUI_PLAY, VUI_PAUSE, VUI_FF, VUI_REW, VUI_D0 = 10, VUI_MINUS = 20, VUI_COLON, VUI_LOCK, VUI_N };
 struct vui_bmp { uint16_t w, h; const uint16_t *px; };
 static struct vui_bmp vui[VUI_N];
 static uint8_t vui_buf[48 * 1024] __attribute__((aligned(4)));
@@ -4136,12 +4136,12 @@ static void cv_text(struct cv *c, int x, int y, const char *s)
 /* ---- windows */
 #define OSD_NS 3
 struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; };
-static uint32_t osd_cv0[48 * 48], osd_cv1[80 * 24], osd_cv2[320 * 52];
+static uint32_t osd_cv0[48 * 48], osd_cv1[112 * 24], osd_cv2[320 * 52];
 static struct osd_strip osd_s[OSD_NS] = {
     /* status icon (stock box 33x33 at 15,15).  v47.1: 48x48 -- with a 40-pixel-wide image the icon came out sheared on the iPod:
        VC images evidently want widths in multiples of 16 pixels (the 80 and 320 wide windows were fine) */
     { 8, 8, 48, 48, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0 },
-    { 232, 12, 80, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1 },      /* battery %, top right */
+    { 200, 12, 112, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1 },     /* hold lock, charging bolt, battery %, top right (v50: 112 wide) */
     { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2 },      /* stock bottom panel (y 192, h 43) */
 };
 static int osd_ok = -1, osd_type = 15;
@@ -4218,7 +4218,7 @@ static int osd_alloc(int type, int w, int h, uint32_t *img, uint32_t *addr)
 /* ---- drawing (into the canvases) */
 static void osd_draw(void)
 {
-    struct cv c0 = { osd_cv0, 48, 48 }, c1 = { osd_cv1, 80, 24 }, c2 = { osd_cv2, 320, 52 };
+    struct cv c0 = { osd_cv0, 48, 48 }, c1 = { osd_cv1, 112, 24 }, c2 = { osd_cv2, 320, 52 };
     uint32_t shown = sc_active ? pl_target_ms : pl_el_ms, rem;
     char a[16], d[20], t[8];
     int fill, k, lvl = battery_level();
@@ -4243,7 +4243,7 @@ static void osd_draw(void)
     /* v47: battery colour: 60-100 % green, 20-59 % orange, 0-19 % red */
     cv_tint = lvl >= 60 ? 0x50E050 : lvl >= 20 ? 0xFF9A1E : 0xF03228;
     {
-        int pw = 12, tw = cv_text_w(t) + pw, x = 305 - 232 - tw, r, q;
+        int pw = 12, tw = cv_text_w(t) + pw, x = 305 - 200 - tw, r, q, lx;
         cv_text(&c1, x, 3, t);
         for (r = 0; r < 7; r++) for (q = 0; q < 5; q++)           /* '%' in the same white-with-shadow style */
             if (lk_font[12][r] & (16 >> q)) cv_shadowed(&c1, x + tw - pw + 1 + 2 * q, 3 + 2 + 2 * r, 2, 2, 0xFFF4F4F4);
@@ -4254,6 +4254,17 @@ static void osd_draw(void)
             int bx = x - 10;
             for (r = 0; r < 13; r++) for (q = 0; q < 8; q++)
                 if (bolt[r] & (0x80 >> q)) cv_shadowed(&c1, bx + q, 3 + r, 1, 1, 0xFFFFD21E);
+            x = bx;
+        }
+        if (button_hold())
+        {   /* v50: hold switch on -> the stock lock icon (21927, 17x20) left of the rest */
+            lx = x - (vui[VUI_LOCK].px ? vui[VUI_LOCK].w : 12) - 4;
+            if (vui_state == 1 && vui[VUI_LOCK].px) cv_blit(&c1, lx, 1, VUI_LOCK, -1);
+            else
+            {   /* look-alike padlock: shackle + body */
+                cv_shadowed(&c1, lx + 3, 3, 6, 2, 0xFFF4F4F4); cv_shadowed(&c1, lx + 2, 4, 2, 5, 0xFFF4F4F4);
+                cv_shadowed(&c1, lx + 8, 4, 2, 5, 0xFFF4F4F4); cv_shadowed(&c1, lx, 9, 12, 9, 0xFFF4F4F4);
+            }
         }
     }
     cv_tint = 0xFFFFFF;
@@ -4734,7 +4745,9 @@ static void bcm_video_run(int secs)
     int gf_last = v_getframes, gf_log = v_getframes, nstat = 0;
     long last_req = current_tick, run_t0 = current_tick, bl_next = current_tick;
     backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* v47.1: video at full brightness (restored when it ends) */
+    backlight_set_on_button_hold(2);                   /* v50: the hold switch does not turn the screen off while a video plays */
     backlight_on();
+    bool hold_was = button_hold();
     bool probed = !cfg_trickprobe;
     mon_start("mp_play (start-up pre-buffer)");
     while (TIME_BEFORE(current_tick, end) && !v_stop)
@@ -4742,6 +4755,12 @@ static void bcm_video_run(int secs)
         bcm_host_service();
         if (bcm_check_dead()) break;
         if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
+        if (button_hold() != hold_was)
+        {   /* v50: show the lock (or its removal) for 3 s */
+            hold_was = !hold_was;
+            BLOG("  hold switch %s", hold_was ? "ON" : "off");
+            osd_show_for(3000);
+        }
         if (!pl_paused && !TIME_BEFORE(current_tick, bl_next))
         {   /* v47.1: backlight always on while the video plays (paused: Rockbox's own timeout and idle power-off apply) */
             bl_next = current_tick + HZ / 2;
@@ -4845,6 +4864,7 @@ static void bcm_video_run(int secs)
         else sleep(1);
     }
     bcm_sync_every = 0;
+    backlight_set_on_button_hold(global_settings.backlight_on_button_hold);
     bcm_map_probe();
 }
 
@@ -5379,7 +5399,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v49, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v50, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
@@ -5570,6 +5590,15 @@ out:
                     sleep(HZ / 50);
                 } while (current_tick - t0 < HZ);
                 BLOG("player: VC[0x1F0] = %08x after %ld ms (stock waits for low half 0)", (unsigned)w1f0, (current_tick - t0) * 1000 / HZ);
+            }
+            if (!bcm_io_dead())
+            {   /* v50: panel off the stock way (display state 0 -> power=0) before the BCM loses power; v49 sometimes left
+                   the panel white when Rockbox's firmware took over (most often when leaving right after the start) */
+                char c[48]; int pr2; long t1 = current_tick;
+                snprintf(c, sizeof c, "display_control 0 model=%d power=0", bcm_hw_model(0));
+                pr2 = bcm_gencmd_start(c);
+                while (pr2 == 0 && (pr2 = bcm_gencmd_poll(resp, sizeof resp)) == -3 && current_tick - t1 < HZ / 2) yield();
+                BLOG("player: %s -> %d", c, pr2);
             }
             bcm_host_detach();
             BLOG("player: GPO32 = %08lx -- powering the BCM down and booting Rockbox's display firmware", *(volatile unsigned long *)0x70000080);
