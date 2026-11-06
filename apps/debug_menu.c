@@ -3284,6 +3284,7 @@ static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, c
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_v40 = 1, cfg_post = 0, cfg_framedump = 1;                            /* v40 */
 static int cfg_gfx_seq = 1, cfg_dc_extra = 0, cfg_fbtest = 1;                       /* v38 */
 static int cfg_dc_model = 0, cfg_dc_final = 99, cfg_dc_noinit = 0, cfg_gfx_quick = 1, cfg_pm27 = 1;   /* v37 */
 static int cfg_gfx_screen = 1;                                                     /* v36 */
@@ -3358,6 +3359,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "gfx_quick")) cfg_gfx_quick = v;
         else if (!strcmp(p, "pm27"))     cfg_pm27 = v;
         else if (!strcmp(p, "gfx_seq"))  cfg_gfx_seq = v;
+        else if (!strcmp(p, "v40"))      cfg_v40 = v;
+        else if (!strcmp(p, "post"))     cfg_post = v;
+        else if (!strcmp(p, "framedump")) cfg_framedump = v;
         else if (!strcmp(p, "dc_extra")) cfg_dc_extra = v;
         else if (!strcmp(p, "fbtest"))   cfg_fbtest = v;
         else if (!strcmp(p, "dump_sdram")) cfg_dump_sdram = v;
@@ -3374,10 +3378,10 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: model=1 power=2 (the v37 run that lit the panel), then SRAM-FB test + 4 present/commit sequences",
-    "1: model=2 power=2, same tests; DECODER: Annex B frames with SPS+PPS in-band, SPS+PPS as extradata, NAL-size word 3",
-    "2: model=1 power=2 + display_control 0 enabled=1; DECODER: Annex B frames with SPS+PPS in-band, no extradata, NAL-size word 0",
-    "3: model=1 power=-2 then power=2, same tests (AVCC like V0)"
+    "0: v40 base (Annex B decode config of v39 V2, power=2 twice -> status screen), status screen keeps updating during playback",
+    "1: same, but status-screen updates STOP at mp_play (our layer stays)",
+    "2: same, but our UI window is REMOVED at mp_play (only the video layer remains)",
+    "3: like 2, plus display_control power=2 re-sent 1 s and 4 s after mp_play"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3406,14 +3410,8 @@ static void bcm_apply_variant(void)
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
     cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0; cfg_vde = 0; cfg_dump = (v == 0); cfg_nolcd = 1;
     cfg_freeze = 2; cfg_lcdtest = 0; cfg_gfx = 1; cfg_dump = 0; cfg_dc_model = 1; cfg_dc_final = 2; cfg_dc_noinit = 1; cfg_dc_extra = 0;
-    cfg_frame_avcc = 1; cfg_si_last = -1;
-    switch (v)
-    {
-    case 1: cfg_dc_model = 2; cfg_frame_avcc = 0; cfg_si_extra = 2; break;
-    case 2: cfg_dc_extra = 1; cfg_frame_avcc = 0; cfg_si_extra = 0; cfg_si_last = 0; break;
-    case 3: cfg_dc_extra = 2; break;
-    default: break;
-    }
+    cfg_frame_avcc = 0; cfg_si_extra = 0; cfg_si_last = 0;       /* v40: the v39 V2 stream config -- the first one the decoder accepted */
+    cfg_v40 = 1; cfg_post = v;
     BLOG("VARIANT %s", bcm_variant_name[v]);
 }
 
@@ -3657,7 +3655,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v39 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v40 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3815,6 +3813,7 @@ static void bcm_mid_probe(void)
     BLOG("---- end of probe");
 }
 
+static int bcm_hw_model(int log);
 static void bcm_video_run(int secs)
 {
     long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
@@ -3822,6 +3821,24 @@ static void bcm_video_run(int secs)
     long dump1 = cfg_dump && cfg_dump_at1 > 0 ? current_tick + cfg_dump_at1 * HZ : 0;
     long dump2 = cfg_dump && cfg_dump_at2 > 0 ? current_tick + cfg_dump_at2 * HZ : 0;
     static char resp[1400];                           /* v29: the v28 logs cut mp_get_stats at 256 bytes (lost_frame_assert_d...) */
+    long pw1 = 0, pw2 = 0;
+    static int framedumped;
+    BLOG("  >>> LOOK: mp_play sent -- VIDEO should appear from here (variant post=%d)", cfg_post);
+    if (cfg_post >= 1 && gfx_front >= 0)
+    {
+        uint32_t o[4], w4[4] = { gfx_win[gfx_front], 0, 0, 0 };
+        if (cfg_post >= 2 && gfx_win[gfx_front])
+        {
+            bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+            bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+            bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+            BLOG("  post: our UI window %08x removed", (unsigned)w4[0]);
+            gfx_win[gfx_front] = 0;
+        }
+        gfx_front = -1;                                /* no more status-screen presents */
+        BLOG("  post: status-screen updates stopped");
+    }
+    if (cfg_post == 3) { pw1 = current_tick + HZ; pw2 = current_tick + 4 * HZ; }
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
@@ -3841,12 +3858,38 @@ static void bcm_video_run(int secs)
             bcm_mid_probe();
         }
         if (gfx_front >= 0 && !TIME_BEFORE(current_tick, gfx_next)) { gfx_next = current_tick + HZ; bcm_gfx_present(); }
+        if ((pw1 && !TIME_BEFORE(current_tick, pw1)) || (pw2 && !TIME_BEFORE(current_tick, pw2)))
+        {
+            char c[64]; int r2;
+            if (pw1 && !TIME_BEFORE(current_tick, pw1)) pw1 = 0; else pw2 = 0;
+            snprintf(c, sizeof c, "display_control 0 model=%d power=2", bcm_hw_model(0));
+            bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(c, resp, sizeof resp, 3); bcm_log_text(c, r2, resp);
+            BLOG("  >>> LOOK: power=2 re-sent during playback");
+        }
         if (!TIME_BEFORE(current_tick, next_stat))
         {
             int r;
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_stats video", resp, sizeof resp, 1);
             bcm_log_text("mp_get_stats video", r, resp);
+            if (cfg_framedump && !framedumped)
+            {
+                /* v40: the decoder reports the picture it handed to the display ("Disp decoded_data=<VC address>",
+                   320x240).  Save 0x30000 bytes from there so the frame can be rendered on a PC. */
+                const char *q = strstr(resp, "Disp decoded_data=");
+                if (q)
+                {
+                    unsigned long fa = 0; const char *h = q + 18;
+                    while ((*h >= '0' && *h <= '9') || (*h >= 'a' && *h <= 'f') || (*h >= 'A' && *h <= 'F'))
+                    { fa = fa * 16 + (unsigned long)(*h <= '9' ? *h - '0' : (*h | 0x20) - 'a' + 10); h++; }
+                    if (fa >= 0xC0000000ul)
+                    {
+                        framedumped = 1;
+                        BLOG("  frame dump: decoded picture at VC %08lx", fa);
+                        bcm_vc_dump("frame", (uint32_t)fa, 0x30000);
+                    }
+                }
+            }
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 1);
             bcm_log_text("mp_get_status", r, resp);
@@ -3955,6 +3998,22 @@ static void bcm_display_final(void)
 {
     char cmd[64], resp[200]; int r;
     if (cfg_dc_final == 99 || bcm_io_dead()) return;
+    if (cfg_v40)
+    {
+        /* decoded power state machine: the first power=2 after a boot turns the panel on and arms a flag, the second
+           power=2 starts the GRAM stream (v39: the status screen appeared). */
+        int k;
+        for (k = 0; k < 2; k++)
+        {
+            snprintf(cmd, sizeof cmd, "display_control 0 model=%d power=2", bcm_hw_model(0));
+            bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(cmd, resp, sizeof resp, 3); bcm_log_text(cmd, r, resp);
+            bcm_hold_ms(1000);
+        }
+        if (gfx_front >= 0) bcm_gfx_present_m(0x101);
+        BLOG("  >>> LOOK: the dark-blue STATUS SCREEN should be on now (it stays until mp_play)");
+        bcm_hold_ms(2000);
+        return;
+    }
     snprintf(cmd, sizeof cmd, "display_control 0 model=%d power=%d", bcm_hw_model(0), cfg_dc_final);
     BLOG("---- v37 final display power command (after the UI layer exists)");
     if (cfg_dc_extra == 2)
@@ -4223,6 +4282,7 @@ static void bcm_playback_probe(void)
     bcm_find_counters();
     bcm_hi_dump("just before mp_selectplay");
     bcm_cmd_t0 = current_tick;
+    if (gfx_front >= 0) { BLOG("  >>> LOOK: sending mp_selectplay -- does the status screen turn WHITE now?"); bcm_gfx_present_m(0x101); }
     r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, cfg_sel_wait);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
@@ -4339,7 +4399,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v39, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v40, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
