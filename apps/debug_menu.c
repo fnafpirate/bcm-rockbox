@@ -34,6 +34,7 @@
 #include "powermgmt.h"
 #include "system.h"
 #include "font.h"
+#include "backlight.h"
 #include "audio.h"
 #include "settings.h"
 #include "list.h"
@@ -3041,7 +3042,8 @@ static struct {
     uint8_t  profile, level, nal_len;
     uint8_t  ps[512]; uint32_t ps_len;                  /* SPS+PPS, Annex B */
     uint8_t  avcc[128]; uint32_t avcc_len;              /* raw avcC record (v22: candidate "extradata" for the 0x60 block) */
-    uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n;
+    uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n, stss, stss_n;   /* v42: stss */
+    bool     need_ps;                                   /* v42: prepend SPS/PPS to the next sample (after a seek) */
     bool     co64;
     uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first;   /* sample cursor */
     uint32_t stts_i, stts_left, stts_delta; uint64_t dts;
@@ -3121,6 +3123,7 @@ static bool m4_trak(uint32_t ps, uint32_t pe)
         else if (t == FOURCC('s','t','t','s')) { m4.stts = s + 8; m4.stts_n = m4_u32(s + 4); have[0] = true; }
         else if (t == FOURCC('s','t','s','c')) { m4.stsc = s + 8; m4.stsc_n = m4_u32(s + 4); have[1] = true; }
         else if (t == FOURCC('s','t','s','z')) { m4.stsz_fixed = m4_u32(s + 4); m4.stsz_n = m4_u32(s + 8); m4.stsz = s + 12; have[2] = true; }
+        else if (t == FOURCC('s','t','s','s')) { m4.stss = s + 8; m4.stss_n = m4_u32(s + 4); }
         else if (t == FOURCC('s','t','c','o')) { m4.stco = s + 8; m4.stco_n = m4_u32(s + 4); m4.co64 = false; have[3] = true; }
         else if (t == FOURCC('c','o','6','4')) { m4.stco = s + 8; m4.stco_n = m4_u32(s + 4); m4.co64 = true;  have[3] = true; }
     }
@@ -3137,6 +3140,75 @@ static void m4_rewind(void)
 }
 
 static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; }
+
+/* v42: random access, the way the stock player does it (ARM positions its demuxer on a key frame, then sends
+   "mp_seek <ms>"; the VC flushes and answers with PDS 0x43 {session, ms}; the stock 0x43 handler (rt 0x20b304)
+   only resets the per-stream timestamps and resumes feeding from the demuxer's new position).
+   m4_key_at(ms): sample index (0-based) of the last sync sample at or before ms, and its time.
+   m4_seek_sample(k): put the cursor on sample k without reading the samples before it. */
+static uint64_t m4_dts_of(uint32_t k)
+{
+    uint64_t t = 0; uint32_t i, base = 0;
+    for (i = 0; i < m4.stts_n; i++)
+    {
+        uint32_t c = m4_u32(m4.stts + 8 * i), dl = m4_u32(m4.stts + 8 * i + 4);
+        if (k < base + c) return t + (uint64_t)(k - base) * dl;
+        t += (uint64_t)c * dl; base += c;
+    }
+    return t;
+}
+static uint32_t m4_sample_at_ms(uint32_t ms)
+{
+    uint64_t want = (uint64_t)ms * m4.timescale / 1000, t = 0; uint32_t i, base = 0;
+    for (i = 0; i < m4.stts_n; i++)
+    {
+        uint32_t c = m4_u32(m4.stts + 8 * i), dl = m4_u32(m4.stts + 8 * i + 4);
+        if (dl && want < t + (uint64_t)c * dl) return base + (uint32_t)((want - t) / dl);
+        t += (uint64_t)c * dl; base += c;
+    }
+    return m4.stsz_n ? m4.stsz_n - 1 : 0;
+}
+static uint32_t m4_key_at(uint32_t ms, uint32_t *key_ms)
+{
+    uint32_t s = m4_sample_at_ms(ms), k = s;
+    if (m4.stss && m4.stss_n)
+    {
+        uint32_t lo = 0, hi = m4.stss_n;              /* largest sync sample number (1-based) <= s+1 */
+        while (hi - lo > 1) { uint32_t mid = (lo + hi) / 2; if (m4_u32(m4.stss + 4 * mid) <= s + 1) lo = mid; else hi = mid; }
+        k = m4_u32(m4.stss + 4 * lo); k = k ? k - 1 : 0;
+    }
+    if (key_ms) *key_ms = (uint32_t)(m4_dts_of(k) * 1000ULL / m4.timescale);
+    return k;
+}
+static void m4_seek_sample(uint32_t k)
+{
+    uint32_t i, chunk = 1, first_sample = 0, spc, nf, j;
+    if (k >= m4.stsz_n) k = m4.stsz_n ? m4.stsz_n - 1 : 0;
+    m4_rewind();
+    for (i = 0; i < m4.stsc_n; i++)                   /* find the stsc run and chunk that hold sample k */
+    {
+        uint32_t fc = m4_u32(m4.stsc + 12 * i);
+        spc = m4_u32(m4.stsc + 12 * i + 4); if (!spc) spc = 1;
+        nf = (i + 1 < m4.stsc_n) ? m4_u32(m4.stsc + 12 * (i + 1)) : 0xffffffffu;
+        if (nf != 0xffffffffu && k >= first_sample + (nf - fc) * spc) { first_sample += (nf - fc) * spc; continue; }
+        chunk = fc + (k - first_sample) / spc;
+        m4.stsc_i = i; m4.spc = spc; m4.next_first = nf;
+        m4.chunk = chunk; m4.s_in_chunk = (k - first_sample) % spc; m4.off_in_chunk = 0;
+        for (j = k - m4.s_in_chunk; j < k; j++)
+            m4.off_in_chunk += m4.stsz_fixed ? m4.stsz_fixed : m4_u32(m4.stsz + 4 * j);
+        break;
+    }
+    m4.idx = k;
+    {   uint64_t t = 0; uint32_t base = 0;            /* stts cursor */
+        for (i = 0; i < m4.stts_n; i++)
+        {
+            uint32_t c = m4_u32(m4.stts + 8 * i), dl = m4_u32(m4.stts + 8 * i + 4);
+            if (k < base + c) { m4.stts_i = i; m4.stts_left = base + c - k; m4.stts_delta = dl; m4.dts = t + (uint64_t)(k - base) * dl; break; }
+            t += (uint64_t)c * dl; base += c;
+        }
+    }
+    m4.need_ps = true;
+}
 static uint32_t m4_dur_ms, m4_br;            /* v20: duration (ms) and average bit rate (bit/s) of the whole file */
 
 /* 0 = ok, <0 = reason */
@@ -3211,7 +3283,8 @@ static int m4_next(uint32_t *ts_ms, bool *key)
         *key = idr;
         return (int)size;
     }
-    if ((first || idr) && m4.ps_len) { memcpy(m4_out, m4.ps, m4.ps_len); o = m4.ps_len; }
+    if ((first || idr || m4.need_ps) && m4.ps_len) { memcpy(m4_out, m4.ps, m4.ps_len); o = m4.ps_len; }
+    m4.need_ps = false;
     for (p = 0; p + m4.nal_len <= size; )                               /* pass 2: length-prefixed -> Annex B */
     {
         n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | m4_raw[p + k];
@@ -3504,9 +3577,13 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
 }
 static void v_seek(int id, uint32_t pos)
 {
+    uint32_t k, kms;
     v_seeks++;
-    BLOG("  PDS seek: stream=%d pos=%u -> %s", id, (unsigned)pos, pos == 0 ? "rewind" : "ignored (units unknown)");
-    if (pos == 0) m4_rewind();
+    if (pos == 0) { m4_rewind(); m4.need_ps = true; BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
+    k = m4_key_at(pos, &kms);                          /* v42: pos = milliseconds (it is the mp_seek argument) */
+    m4_seek_sample(k);
+    BLOG("  PDS seek: stream=%d pos=%u ms -> key frame sample %u at %u ms (chunk %u +%u)", id, (unsigned)pos, (unsigned)k, (unsigned)kms,
+         (unsigned)m4.chunk, (unsigned)m4.off_in_chunk);
 }
 static void v_stopcb(void) { BLOG("  PDS stop (frames sent so far: %d)", v_frames); v_stop = true; }
 static const struct bcm_pds_ops pds_video_ops = { v_start, v_get_frame, v_seek, v_stopcb };
@@ -3654,7 +3731,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v41 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v42 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3863,6 +3940,15 @@ static void bcm_video_run(int secs)
                     q = strstr(resp, "elapsed=");
                     if (q) { q += 8; while (*q >= '0' && *q <= '9') el = el * 10 + (*q++ - '0'); }
                     el += (b == BUTTON_RIGHT) ? 10000 : -10000; if (el < 0) el = 0;
+                    {   uint32_t kms = 0; m4_key_at((uint32_t)el, &kms);   /* v42: like the stock UI, seek to a key frame */
+                        if (b == BUTTON_RIGHT && kms + 2000 < (uint32_t)el)
+                        {   /* the previous key frame would not move forward: take the next one */
+                            uint32_t k2 = m4_key_at((uint32_t)el, NULL), nk = k2;
+                            if (m4.stss && m4.stss_n)
+                            {   uint32_t i2; for (i2 = 0; i2 < m4.stss_n && i2 < 200000; i2++) { uint32_t sn = m4_u32(m4.stss + 4 * i2); if (sn > k2 + 1) { nk = sn - 1; break; } } }
+                            kms = (uint32_t)(m4_dts_of(nk) * 1000ULL / m4.timescale);
+                        }
+                        el = (long)kms; }
                     snprintf(c, sizeof c, "mp_seek %ld", el);
                     bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(c, resp, sizeof resp, 4); bcm_log_text(c, r2, resp);
                 }
@@ -3872,6 +3958,7 @@ static void bcm_video_run(int secs)
         {
             BLOG("  video: get_frame=%d sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d",
                  v_getframes, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips);
+            backlight_on();                            /* v42: keep the backlight on while a video plays */
             next_log += 2 * HZ;
         }
         if (dump1 && !TIME_BEFORE(current_tick, dump1)) { dump1 = 0; if (cfg_dump_sram) bcm_vc_dump("play1", 0, (uint32_t)cfg_dump_len); if (cfg_dump_sdram) bcm_vc_dump("sd1", 0xC0000000u, 0x400000u); }
@@ -4423,7 +4510,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v41, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v42, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
