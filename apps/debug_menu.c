@@ -3557,7 +3557,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v48 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
+    "0: v49 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3841,11 +3841,7 @@ static void bcm_gfx_draw_status(void)
     static int phase;
     long e = current_tick - bcm_t_start;
     if (bcm_player_mode)
-    {   /* v47: the player shows nothing until the first picture (black UI layer under the video) */
-        lcd_set_viewport(NULL); lcd_set_backdrop(NULL); lcd_set_drawmode(DRMODE_SOLID);
-        lcd_set_background(LCD_RGBPACK(0, 0, 0)); lcd_clear_display();
-        return;
-    }
+        return;     /* v48.1: the player never touches Rockbox's frame buffer or LCD settings (v48 cleared them and broke the theme) */
     lcd_set_viewport(NULL);                 /* full screen, absolute coordinates */
     lcd_set_backdrop(NULL);
     lcd_set_drawmode(DRMODE_SOLID);
@@ -3853,7 +3849,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v48 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v49 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3871,6 +3867,7 @@ static void bcm_gfx_present_m(int mode)
     const fb_data *fb;
     if (gfx_front < 0 || bcm_io_dead()) return;
     back = 1 - gfx_front;
+    static const fb_data black[16 * LCD_WIDTH];
     bcm_gfx_draw_status();
     fb = FBADDR(0, 0);
     gfx_presents++;
@@ -3891,10 +3888,12 @@ static void bcm_gfx_present_m(int mode)
         }
         for (y = 0; y < LCD_HEIGHT; y += 16)
         {
-            bcm_io_lock(); bcm_io_write(gfx_addr[back] + (unsigned)y * LCD_WIDTH * 2, fb + y * LCD_WIDTH, 16 * LCD_WIDTH * 2); bcm_io_unlock();
+            bcm_io_lock();
+            bcm_io_write(gfx_addr[back] + (unsigned)y * LCD_WIDTH * 2, bcm_player_mode ? black : fb + y * LCD_WIDTH, 16 * LCD_WIDTH * 2);
+            bcm_io_unlock();
             bcm_host_service();
         }
-        if (gfx_presents <= 2)
+        if (gfx_presents <= 2 && !bcm_player_mode)
         {
             uint16_t rb[8];
             bcm_io_lock(); bcm_io_read(gfx_addr[back] + 640u * 200u, rb, sizeof rb); bcm_io_unlock();
@@ -4682,6 +4681,30 @@ static int bcm_player_input(char *resp, size_t rn)
     return 0;
 }
 
+/* v48.1: going back to the browser.  The panel keeps whatever the VC sent last while the BCM is rebooted into Rockbox's display
+   firmware (~0.5 s): with v48 that was a half-overwritten video frame.  So first put the browser itself on screen: Rockbox's
+   frame buffer (untouched while the video played) goes into a VC image on the top layer. */
+static void bcm_player_cover(void)
+{
+    uint32_t img = 0, addr = 0, o[4], pl[8];
+    int y;
+    long t;
+    if (osd_alloc(1, LCD_WIDTH, LCD_HEIGHT, &img, &addr) != 0) { img = gfx_img[0]; addr = gfx_addr[0]; }
+    if (!img) return;
+    for (y = 0; y < LCD_HEIGHT; y += 16)
+    {
+        bcm_io_lock(); bcm_io_write(addr + (unsigned)y * LCD_WIDTH * 2, FBADDR(0, y), 16 * LCD_WIDTH * 2); bcm_io_unlock();
+    }
+    memset(pl, 0, sizeof pl);
+    pl[1] = (uint32_t)(cfg_osd_layer + 20); pl[3] = img;
+    ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = LCD_HEIGHT;
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300);
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    for (t = current_tick + HZ / 10; TIME_BEFORE(current_tick, t); ) { bcm_host_service(); yield(); }   /* ~3 panel refreshes */
+    BLOG("  player: browser picture put on top (image %08x, window %08x)", (unsigned)img, (unsigned)o[0]);
+}
+
 static int bcm_hw_model(int log);
 static void bcm_video_run(int secs)
 {
@@ -4732,7 +4755,12 @@ static void bcm_video_run(int secs)
             if (pl_dur_ms > 60000) bcm_trick_probe(); else BLOG("trick probe skipped: video shorter than 60 s");
             while (button_get_w_tmo(0) != BUTTON_NONE) ;         /* drop presses made during the probe */
         }
-        else if (bcm_player_input(resp, sizeof resp)) { BLOG("  user: MENU -> stop"); break; }
+        else if (bcm_player_input(resp, sizeof resp))
+        {
+            BLOG("  user: MENU -> stop");
+            if (bcm_player_mode) bcm_player_cover();
+            break;
+        }
         bcm_osd_tick();
         if (!TIME_BEFORE(current_tick, next_log))
         {
@@ -5351,7 +5379,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v48, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v49, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
@@ -5531,9 +5559,10 @@ out:
             if (!bcm_io_dead())
             {
                 uint32_t w1f0 = 0; long t0 = current_tick; int pr;
-                bcm_cmd_t0 = current_tick;
-                pr = bcm_gencmd_watched("power_control videocore 0", resp, sizeof resp, 2);
-                bcm_log_text("power_control videocore 0", pr, resp);
+                /* v48 log: no reply within 2 s and VC[0x1F0] already read a5a50000 -> wait at most 0.3 s for the reply */
+                pr = bcm_gencmd_start("power_control videocore 0");
+                while (pr == 0 && (pr = bcm_gencmd_poll(resp, sizeof resp)) == -3 && current_tick - t0 < HZ * 3 / 10) yield();
+                BLOG("player: power_control videocore 0 -> %d", pr);
                 do {
                     bcm_host_service();
                     bcm_io_lock(); bcm_io_read(0x1F0, &w1f0, 4); bcm_io_unlock();
@@ -5559,8 +5588,7 @@ out:
         bcm_log_fd = -1;
         bcm_sync_every = 0; bcm_player_mode = false; bcm_play_path = NULL;
         backlight_on();
-        lcd_clear_display();
-        lcd_update();
+        lcd_update();                                  /* the frame buffer still holds the browser exactly as it was */
         return false;
     }
     if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
