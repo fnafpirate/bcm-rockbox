@@ -3432,10 +3432,13 @@ static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_reg
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
 static int cfg_osd = 1, cfg_osd_layer = 100;                                         /* v44: playback overlay */
-static int cfg_scrub_mode = 1, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
+static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
+static int cfg_fast = 1, cfg_trickprobe = 1, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
+static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
 static int cfg_m4cache_ref(void) { return cfg_m4cache; }
+static int cfg_fast_ref(void) { return cfg_fast; }
 static int cfg_play_secs = 0;                                                       /* v41: 0 = whole file */
 static int cfg_v40 = 1, cfg_post = 0, cfg_framedump = 0;                            /* v40 (v45: frame dump off by default) */
 static int cfg_gfx_seq = 1, cfg_dc_extra = 0, cfg_fbtest = 1;                       /* v38 */
@@ -3526,6 +3529,11 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "seekmon"))  cfg_seekmon = v;
         else if (!strcmp(p, "quiet"))    cfg_quiet = v;
         else if (!strcmp(p, "m4cache"))  cfg_m4cache = v;
+        else if (!strcmp(p, "fast"))     cfg_fast = v;
+        else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
+        else if (!strcmp(p, "probe_ms")) cfg_probe_ms = v < 500 ? 500 : v;
+        else if (!strcmp(p, "jump_tick")) cfg_jump_tick = v < 300 ? 300 : v;
+        else if (!strcmp(p, "osd_argb")) cfg_osd_argb = v;
         else if (!strcmp(p, "post"))     cfg_post = v;
         else if (!strcmp(p, "framedump")) cfg_framedump = v;
         else if (!strcmp(p, "dc_extra")) cfg_dc_extra = v;
@@ -3544,7 +3552,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v45 PLAYER: Annex B decode, power=2 twice, video on top, stock-style overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
+    "0: v46 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3623,6 +3631,10 @@ static int bcm_send_stream_info(void)
    logged for the first frames so the next run can correct them. Video only -- audio (AAC) is NOT fed;
    any request for a stream other than the video one is answered "nothing" (send_empty). */
 static int v_frames, v_bytes, v_getframes, v_empty, v_eos, v_seeks, v_skips;
+/* v46 trick feed: while tf_dir != 0 each request gets the next KEY frame in that direction (tf_jump ms on), real timestamps */
+static int tf_dir, tf_fed;
+static uint32_t tf_cur, tf_jump = 2000;
+static uint32_t tf_next_key(void);
 static bool v_stop, v_live;
 static long v_eos_tick;
 static void v_start(int id, uint32_t w1)
@@ -3647,6 +3659,12 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
         v_empty++; bcm_pds_send_empty();
         if (v_empty <= 4) BLOG("  -> not video (want=%d): sent empty", want);
         return;
+    }
+    if (tf_dir)
+    {
+        uint32_t km = tf_next_key();
+        tf_cur = km; m4_seek_sample(m4_key_at(km, NULL)); tf_fed++;
+        if (tf_fed <= 3 || tf_fed % 20 == 0) BLOG("  trick feed #%d: key frame at %u ms (%s)", tf_fed, (unsigned)km, tf_dir > 0 ? "fwd" : "back");
     }
     do { n = m4_next(&ts, &key); if (n < 0) v_skips++; } while (n < 0 && ++tries < 8);
     if (n <= 0)
@@ -3792,7 +3810,9 @@ static int bcm_gfx_call(const char *tag, uint32_t op, const void *in, uint32_t i
 }
 static void bcm_hold_ms(int ms)
 {
-    long t = current_tick + (HZ * ms) / 1000;
+    long t;
+    if (cfg_fast_ref() && ms > 150) ms = 150;        /* v46 fast start: no "LOOK" pauses */
+    t = current_tick + (HZ * ms) / 1000;
     while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); sleep(HZ / 100); }
 }
 /* v36: a stock-like double-buffered UI layer (display class rt 0x164f44 present / rt 0x1b02d8 boot-time UI layer):
@@ -3822,7 +3842,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v45 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v46 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3980,56 +4000,158 @@ static void bcm_mid_probe(void)
     BLOG("---- end of probe");
 }
 
-/* ---------------------------------------------------------------- v45: player UI ----
-   Stock-like overlay, two strips on a layer above mplayer's video element (the UI layer -50 is below it):
-     top    (320x20): iPod title-bar look -- play / pause / FF / REW glyph, the video's name (or the scrub speed),
-                      battery % and battery icon at the top right
-     bottom (320x24): elapsed time, progress bar with a position marker, remaining time ("-1:02:03")
-   Each strip is a VC image pair, double-buffered like the stock present path (rt 0x164f44): write the back image,
-   op 1, op 4 (old windows), op 3 (new windows), op 2.  Shown while paused / scrubbing and for 3 s after a control.
+/* ---------------------------------------------------------------- v46: player UI ----
+   STOCK OVERLAY.  The stock firmware's UI resources (block at osos 0x3325a0: BMap/Bits/LDTm/Menu/Str/TCmd/Type/View, see
+   findings 3ap) contain the video-playback overlay: views 22056 (root) -> 22058 status icon box at (15,15) 33x33 and
+   22057 bottom panel at y=192 h=43 -> 22059 progress control (280x20, centred, bitmaps 21922 fill / 21923 frame) with the
+   time labels 22062..22065 (digits 21939..21948, '-' 21949, ':' 21950, 10x17, left- and right-aligned under the bar),
+   plus 30x27 play / pause / FF / REW icons 21931..21934.  They are ARGB4444 with soft shadows and are drawn straight over
+   the video: the stock layer code (rt 0x164450) creates VC image type 15 (32-bit ARGB, the ARM surface format 0x1888 =
+   0xAARRGGBB, packer rt 0x256388) for such surfaces and type 1 for RGB565 ones.
+   We do the same: three ARGB windows (status icon, battery %, bottom panel) on layer osd_layer above the video.  The bitmaps
+   are NOT in this source: they are read at run time from /.rockbox/bcm_video_ui.bin, cut from the iPod's own firmware
+   (tools/bcm/extract_video_ui.py).  Without that file a look-alike drawn in code is used.
+   Battery: the stock overlay has no battery; as asked, the battery % is shown top right in the stock digit style.
 
-   FF/REW (v45, from mplayer.vll + the stock ARM image):
-     * the stock ARM only sends "mp_seek %d" (rt 0x1fa470, vtable slot 0x4c) and "mp_step %d[ no_video]" (rt 0x1fa4c4,
-       slot 0x48) -- there is no "mp_ff"/"mp_rewind" string in the ARM image.
-     * mplayer: gencmd mp_step (0x1025fc) posts message 0x36 -> mp_do_play case 0x36 -> mp_play_step(ms): stores ms in
-       [mp+0xfd0], pauses the display task, mp_clock_stc + mp_clock_start (the clock is started at once, no pre-buffer),
-       state byte [+0x179] = 3; the display task shows frames immediately while [+0xfd0] != 0.
-       gencmd mp_seek (0x1022c8) -> message 0x12 -> mp_play_seek(ms): flush, mp_clock_reset(ms), PDS 0x43 to the ARM.
-     * mp_ff / mp_rewind (0x100fac / 0x1020e0 -> 0x1002e0): "mp_ff [rate] [flag]", rate default 0xa00, rewind negates it,
-       -> mp_play_ff_rew(rate): flush, [+0xfd0] = rate, clock restarted -- mplayer's own trick mode, never used by stock.
-   So the stock scrubber is "seek to a key frame, then step" and that is scrub_mode 1:
-     hold >>| or |<<  ->  mp_pause, then every scrub_tick ms: next key frame in that direction (the jump grows the longer
-     the button is held: 2 s, 5 s, 15 s, 40 s per tick), mp_seek <key ms>, mp_step <step_ms>;  release -> mp_play.
-     A short press jumps tap_secs (default 10 s).  The click wheel does not seek any more. */
-#define OSD_TOP_H 20
-#define OSD_BOT_H 24
-struct osd_strip { int y, h; uint32_t img[2], addr[2], win[2]; int front; };
-static struct osd_strip osd_s[2] = {
-    { 0, OSD_TOP_H, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1 },
-    { LCD_HEIGHT - OSD_BOT_H, OSD_BOT_H, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1 },
+   FF/REW (v46): the v45 log shows "mp_seek + mp_step" leaves mplayer in mode=step with buffering=2450 and Disp seq_num
+   frozen -- nothing is shown.  v46 measures the candidates once per run (trick probe, ~30 s after the start, buttons off)
+   and uses what really moved the picture:
+     ffk   mp_ff/mp_rewind (mplayer trick mode, rate 0xa00) while WE feed only key frames, forwards or backwards
+     ff    mp_ff/mp_rewind with the normal feed
+     step  repeated "mp_step <ms>" while playing (forward only)
+     jump  fallback: a seek to the next key frame every second while playing
+   Release always ends with mp_play + mp_seek to the key frame that was on screen (Disp time). */
+#define VUI_PATH "/.rockbox/bcm_video_ui.bin"
+enum { VUI_FILL = 0, VUI_FRAME, VUI_PLAY, VUI_PAUSE, VUI_FF, VUI_REW, VUI_D0 = 10, VUI_MINUS = 20, VUI_COLON, VUI_N };
+struct vui_bmp { uint16_t w, h; const uint16_t *px; };
+static struct vui_bmp vui[VUI_N];
+static uint8_t vui_buf[48 * 1024] __attribute__((aligned(4)));
+static int vui_state = -1;                      /* -1 not tried, 0 missing, 1 loaded */
+static void vui_load(void)
+{
+    int fd, n; uint32_t cnt, i;
+    if (vui_state >= 0) return;
+    vui_state = 0;
+    fd = open(VUI_PATH, O_RDONLY);
+    if (fd < 0) { BLOG("  overlay: no %s -- using the drawn look-alike (copy the file from the v46 zip for the stock graphics)", VUI_PATH); return; }
+    n = read(fd, vui_buf, sizeof vui_buf);
+    close(fd);
+    if (n < 8 || memcmp(vui_buf, "VUI1", 4)) { BLOG("  overlay: %s is not a VUI1 file", VUI_PATH); return; }
+    memcpy(&cnt, vui_buf + 4, 4);
+    for (i = 0; i < cnt && 8 + 12 * (i + 1) <= (uint32_t)n; i++)
+    {
+        uint16_t key, w, h, fmt; uint32_t off;
+        memcpy(&key, vui_buf + 8 + 12 * i, 2); memcpy(&w, vui_buf + 10 + 12 * i, 2); memcpy(&h, vui_buf + 12 + 12 * i, 2);
+        memcpy(&fmt, vui_buf + 14 + 12 * i, 2); memcpy(&off, vui_buf + 16 + 12 * i, 4);
+        if (key >= VUI_N || fmt != 0x1444 || (off & 1) || off + 2u * w * h > (uint32_t)n) continue;
+        vui[key].w = w; vui[key].h = h; vui[key].px = (const uint16_t *)(vui_buf + off);
+    }
+    vui_state = vui[VUI_FILL].px && vui[VUI_FRAME].px && vui[VUI_D0 + 9].px && vui[VUI_COLON].px ? 1 : 0;
+    BLOG("  overlay: %s -> %s (%u bitmaps)", VUI_PATH, vui_state ? "stock graphics" : "incomplete, using the look-alike", (unsigned)cnt);
+}
+
+/* ---- ARGB canvas (0xAARRGGBB, straight alpha) */
+struct cv { uint32_t *p; int w, h; };
+static void cv_clear(struct cv *c) { memset(c->p, 0, (size_t)c->w * c->h * 4); }
+static void cv_px(struct cv *c, int x, int y, uint32_t s)
+{
+    uint32_t a = s >> 24, d, da, oa, r, g, b;
+    if (!a || x < 0 || y < 0 || x >= c->w || y >= c->h) return;
+    d = c->p[y * c->w + x]; da = d >> 24;
+    if (a == 255 || !da) { c->p[y * c->w + x] = s; return; }
+    oa = a + da * (255 - a) / 255;
+    r = (((s >> 16) & 255) * a + ((d >> 16) & 255) * da * (255 - a) / 255) / oa;
+    g = (((s >> 8) & 255) * a + ((d >> 8) & 255) * da * (255 - a) / 255) / oa;
+    b = ((s & 255) * a + (d & 255) * da * (255 - a) / 255) / oa;
+    c->p[y * c->w + x] = (oa << 24) | (r << 16) | (g << 8) | b;
+}
+static void cv_fill(struct cv *c, int x, int y, int w, int h, uint32_t s)
+{ int i, j; for (j = 0; j < h; j++) for (i = 0; i < w; i++) cv_px(c, x + i, y + j, s); }
+static void cv_blit(struct cv *c, int x, int y, int key, int clipw)
+{
+    const struct vui_bmp *b = &vui[key];
+    int i, j, w;
+    if (!b->px) return;
+    w = clipw >= 0 && clipw < b->w ? clipw : b->w;
+    for (j = 0; j < b->h; j++)
+        for (i = 0; i < w; i++)
+        {
+            uint16_t v = b->px[j * b->w + i];
+            uint32_t a = (v >> 12) & 15;
+            if (a) cv_px(c, x + i, y + j, (a * 17u << 24) | (((v >> 8) & 15) * 17u << 16) | (((v >> 4) & 15) * 17u << 8) | ((v & 15) * 17u));
+        }
+}
+/* look-alike shapes when the stock bitmaps are missing: white with a dark shadow, like the stock art */
+static void cv_shadowed(struct cv *c, int x, int y, int w, int h, uint32_t col)
+{ cv_fill(c, x + 1, y + 1, w, h, 0x90000000); cv_fill(c, x, y, w, h, col); }
+static const uint8_t lk_font[13][7] = {           /* 5x7 digits, '-', ':', '%' for the look-alike / the % sign */
+    {14,17,19,21,25,17,14},{4,12,4,4,4,4,14},{14,17,1,2,4,8,31},{31,2,4,2,1,17,14},{2,6,10,18,31,2,2},{31,16,30,1,1,17,14},
+    {6,8,16,30,17,17,14},{31,1,2,4,8,8,8},{14,17,17,14,17,17,14},{14,17,17,15,1,2,12},{0,0,0,31,0,0,0},{0,12,12,0,12,12,0},
+    {24,25,2,4,8,19,3} };
+static int lk_glyph(char ch) { return ch >= '0' && ch <= '9' ? ch - '0' : ch == '-' ? 10 : ch == ':' ? 11 : ch == '%' ? 12 : -1; }
+static int cv_glyph_w(char ch)
+{
+    if (vui_state == 1)
+    {
+        if (ch >= '0' && ch <= '9') return vui[VUI_D0 + ch - '0'].w;
+        if (ch == '-') return vui[VUI_MINUS].w;
+        if (ch == ':') return vui[VUI_COLON].w;
+    }
+    return ch == ':' ? 6 : 12;
+}
+static int cv_text_w(const char *s) { int w = 0; while (*s) w += cv_glyph_w(*s++); return w; }
+static void cv_text(struct cv *c, int x, int y, const char *s)
+{
+    for (; *s; x += cv_glyph_w(*s), s++)
+    {
+        int k = -1, g, r, q;
+        if (vui_state == 1)
+        {
+            if (*s >= '0' && *s <= '9') k = VUI_D0 + *s - '0'; else if (*s == '-') k = VUI_MINUS; else if (*s == ':') k = VUI_COLON;
+            if (k >= 0 && vui[k].px) { cv_blit(c, x, y, k, -1); continue; }
+        }
+        g = lk_glyph(*s); if (g < 0) continue;
+        for (r = 0; r < 7; r++) for (q = 0; q < 5; q++)          /* 5x7 scaled 2x -> 10x14, shadowed */
+            if (lk_font[g][r] & (16 >> q)) cv_shadowed(c, x + (*s == ':' ? -2 : 1) + 2 * q, y + 2 + 2 * r, 2, 2, 0xFFF4F4F4);
+    }
+}
+
+/* ---- windows */
+#define OSD_NS 3
+struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; };
+static uint32_t osd_cv0[40 * 36], osd_cv1[80 * 24], osd_cv2[320 * 52];
+static struct osd_strip osd_s[OSD_NS] = {
+    { 12, 12, 40, 36, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0 },       /* status icon (stock box 33x33 at 15,15) */
+    { 232, 12, 80, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1 },      /* battery %, top right */
+    { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2 },      /* stock bottom panel (y 192, h 43) */
 };
-static int osd_ok = -1;
+static int osd_ok = -1, osd_type = 15;
 static bool osd_visible, pl_paused;
 static long osd_hide_at, osd_next;
 static uint32_t pl_dur_ms, pl_el_ms, pl_target_ms;
 static char pl_title[40];
 static int pl_buffering = -1;
+static uint16_t osd_row[320 * 2];
 /* scrubber */
-static int sc_btn, sc_dir, sc_ticks;
+enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5 };
+static const char * const sm_name[6] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step" };
+static int sc_btn, sc_dir, sc_ticks, sc_method;
+static int sm_ff = SM_JUMP, sm_rew = SM_JUMP;    /* chosen by the trick probe (or cfg scrub_mode) */
 static long sc_press, sc_t0, sc_next;
 static bool sc_active, sc_was_playing;
 static uint32_t sc_pos, sc_jump;
-/* post-seek monitor: how long until the picture moves again */
+/* post-seek monitor */
 static long mon_t0, mon_until, mon_next;
 static int mon_req0;
 
 static uint32_t pl_num(const char *r, const char *key)
 {
-    const char *q = strstr(r, key); uint32_t v = 0;
+    const char *q = strstr(r, key); uint32_t v = 0; bool neg = false;
     if (!q) return 0xffffffffu;
     q += strlen(key);
+    if (*q == '-') { neg = true; q++; }
     while (*q >= '0' && *q <= '9') v = v * 10 + (uint32_t)(*q++ - '0');
-    return v;
+    return neg ? (uint32_t)-(int32_t)v : v;
 }
 static int pl_cmd(const char *c, bool log_ok)
 {
@@ -4048,135 +4170,131 @@ static void pl_status(void)
     if ((v = pl_num(r, "elapsed="))  != 0xffffffffu) pl_el_ms = v;
     v = pl_num(r, "buffering="); pl_buffering = v == 0xffffffffu ? -1 : (int)v;
 }
+/* the picture on screen: Disp time / seq_num from mp_get_stats video */
+static int pl_disp(uint32_t *dtime, uint32_t *seq)
+{
+    static char r[1400]; int rr;
+    bcm_cmd_t0 = current_tick; rr = bcm_gencmd_watched("mp_get_stats video", r, sizeof r, 2);
+    if (rr < 0) return -1;
+    if (dtime) *dtime = pl_num(r, "Disp time=");
+    if (seq) *seq = pl_num(r, "Disp seq_num=");
+    return 0;
+}
 static void fmt_time(char *b, size_t n, uint32_t ms)
 {
     uint32_t s = ms / 1000;
     if (s >= 3600) snprintf(b, n, "%u:%02u:%02u", (unsigned)(s / 3600), (unsigned)(s / 60 % 60), (unsigned)(s % 60));
     else snprintf(b, n, "%u:%02u", (unsigned)(s / 60), (unsigned)(s % 60));
 }
-static int osd_alloc(int w, int h, uint32_t *img, uint32_t *addr)
+static int osd_alloc(int type, int w, int h, uint32_t *img, uint32_t *addr)
 {
     uint32_t pl[8], o[4];
     memset(pl, 0, sizeof pl);
-    ((uint8_t *)pl)[4] = 1; pl[2] = (uint32_t)w; pl[3] = (uint32_t)h; pl[4] = (uint32_t)w * 2; ((uint8_t *)pl)[0x1c] = 1;
+    ((uint8_t *)pl)[4] = (uint8_t)type; pl[2] = (uint32_t)w; pl[3] = (uint32_t)h; pl[4] = (uint32_t)w * (type == 15 ? 4 : 2);
+    ((uint8_t *)pl)[0x1c] = 1;
     if (bcm_gfx_rpc(8, pl, 0x20, o, NULL, 300) != 0 || !o[0] || o[1] < 0x1000) return -1;
     *img = o[0]; *addr = o[1]; return 0;
 }
-/* FF (dir > 0) or REW glyph: two triangles, 5 wide, 9 high */
-static void osd_glyph_ff(int x, int y, int dir)
+
+/* ---- drawing (into the canvases) */
+static void osd_draw(void)
 {
-    int t, i;
-    for (t = 0; t < 2; t++)
-        for (i = 0; i < 5; i++)
-        {
-            int col = dir > 0 ? x + 5 * t + i : x + 5 * t + 4 - i;
-            lcd_vline(col, y + i, y + 8 - i);
-        }
-}
-static void osd_draw_top(void)
-{
-    const int H = OSD_TOP_H;
-    int y, i, lvl = battery_level(), bx = LCD_WIDTH - 27, by = 5, tw, n;
-    char t[48];
-    for (y = 0; y < H; y++)
-    {   /* light metal gradient like the iPod title bar */
-        int c = 238 - y * 3;
-        lcd_set_foreground(LCD_RGBPACK(c, c, c + 6 > 255 ? 255 : c + 6));
-        lcd_hline(0, LCD_WIDTH - 1, y);
-    }
-    lcd_set_foreground(LCD_RGBPACK(110, 110, 118)); lcd_hline(0, LCD_WIDTH - 1, H - 1);
-    lcd_set_foreground(LCD_RGBPACK(24, 24, 28));
-    if (sc_active) osd_glyph_ff(6, 5, sc_dir);
-    else if (pl_paused) { lcd_fillrect(7, 5, 3, 10); lcd_fillrect(12, 5, 3, 10); }
-    else for (i = 0; i < 5; i++) lcd_vline(7 + i, 5 + i, 14 - i);
-    /* centre: name, or the scrub speed */
-    if (sc_active)
-    {
-        unsigned x = sc_jump * 1000u / (unsigned)(cfg_scrub_tick > 0 ? cfg_scrub_tick : 300) / 1000u;
-        snprintf(t, sizeof t, "%s  x%u", sc_dir > 0 ? "Fast Forward" : "Rewind", x ? x : 1);
-    }
-    else snprintf(t, sizeof t, "%s", pl_title[0] ? pl_title : "Now Playing");
-    n = (int)strlen(t);
-    if (n > 34) { t[33] = '.'; t[34] = 0; n = 34; }
-    tw = 6 * n;
-    lcd_set_drawmode(DRMODE_FG);
-    lcd_putsxyf((LCD_WIDTH - tw) / 2, 6, "%s", t);
-    /* battery: % then the icon, top right */
-    snprintf(t, sizeof t, "%d%%", lvl < 0 ? 0 : lvl);
-    lcd_putsxyf(bx - 4 - 6 * (int)strlen(t), 6, "%s", t);
-    lcd_set_drawmode(DRMODE_SOLID);
-    lcd_drawrect(bx, by, 22, 10);
-    lcd_fillrect(bx + 22, by + 3, 2, 4);
-    lcd_set_foreground(lvl > 20 ? LCD_RGBPACK(60, 190, 60) : LCD_RGBPACK(220, 50, 40));
-    {   int fw = (18 * (lvl > 100 ? 100 : lvl) + 50) / 100;
-        if (lvl > 0) lcd_fillrect(bx + 2, by + 2, fw > 0 ? fw : 1, 6); }
-}
-static void osd_draw_bot(void)
-{
-    const int y0 = LCD_HEIGHT - OSD_BOT_H, bx0 = 56, bx1 = LCD_WIDTH - 56, bw = bx1 - bx0, ym = y0 + 12;
+    struct cv c0 = { osd_cv0, 40, 36 }, c1 = { osd_cv1, 80, 24 }, c2 = { osd_cv2, 320, 52 };
     uint32_t shown = sc_active ? pl_target_ms : pl_el_ms, rem;
-    int y, fill, i;
-    char a[16], d[20];
+    char a[16], d[20], t[8];
+    int fill, k, lvl = battery_level();
+    cv_clear(&c0); cv_clear(&c1); cv_clear(&c2);
+    /* status icon */
+    k = sc_active ? (sc_dir > 0 ? VUI_FF : VUI_REW) : (pl_paused ? VUI_PAUSE : VUI_PLAY);
+    if (vui_state == 1 && vui[k].px) cv_blit(&c0, 4, 6, k, -1);
+    else
+    {
+        int i;
+        cv_fill(&c0, 3, 3, 33, 33, 0x80181818);
+        if (k == VUI_PAUSE) { cv_shadowed(&c0, 12, 10, 5, 17, 0xFFF4F4F4); cv_shadowed(&c0, 21, 10, 5, 17, 0xFFF4F4F4); }
+        else if (k == VUI_PLAY) for (i = 0; i < 9; i++) cv_shadowed(&c0, 13 + i, 10 + i, 1, 17 - 2 * i, 0xFFF4F4F4);
+        else for (i = 0; i < 7; i++)
+        {
+            int x1 = k == VUI_FF ? 9 + i : 23 - i, x2 = k == VUI_FF ? 18 + i : 14 - i;
+            cv_shadowed(&c0, x1, 12 + i, 1, 13 - 2 * i, 0xFFF4F4F4); cv_shadowed(&c0, x2, 12 + i, 1, 13 - 2 * i, 0xFFF4F4F4);
+        }
+    }
+    /* battery %, right-aligned at x 305 (mirrors the stock 15 px inset of the status icon) */
+    snprintf(t, sizeof t, "%d", lvl < 0 ? 0 : lvl > 100 ? 100 : lvl);
+    {
+        int pw = 12, tw = cv_text_w(t) + pw, x = 305 - 232 - tw, r, q;
+        cv_text(&c1, x, 3, t);
+        for (r = 0; r < 7; r++) for (q = 0; q < 5; q++)           /* '%' in the same white-with-shadow style */
+            if (lk_font[12][r] & (16 >> q)) cv_shadowed(&c1, x + tw - pw + 1 + 2 * q, 3 + 2 + 2 * r, 2, 2, 0xFFF4F4F4);
+    }
+    /* bottom panel: progress bar (frame, then the fill cut at the position), elapsed left, remaining right */
     if (pl_dur_ms && shown > pl_dur_ms) shown = pl_dur_ms;
     rem = pl_dur_ms > shown ? pl_dur_ms - shown : 0;
-    for (y = 0; y < OSD_BOT_H; y++)
+    fill = pl_dur_ms ? (int)((uint64_t)shown * 280u / pl_dur_ms) : 0;
+    if (vui_state == 1)
     {
-        int c = 46 - y;
-        lcd_set_foreground(LCD_RGBPACK(c, c, c + 6));
-        lcd_hline(0, LCD_WIDTH - 1, y0 + y);
+        cv_blit(&c2, 20, 6, VUI_FRAME, -1);
+        if (fill > 0) cv_blit(&c2, 20, 6, VUI_FILL, fill);
     }
-    lcd_set_foreground(LCD_RGBPACK(90, 90, 98)); lcd_hline(0, LCD_WIDTH - 1, y0);
+    else
+    {
+        cv_fill(&c2, 21, 7, 280, 20, 0x60000000);
+        cv_fill(&c2, 20, 6, 280, 2, 0xFFE8E8E8); cv_fill(&c2, 20, 24, 280, 2, 0xFFE8E8E8);
+        cv_fill(&c2, 20, 6, 2, 20, 0xFFE8E8E8); cv_fill(&c2, 298, 6, 2, 20, 0xFFE8E8E8);
+        if (fill > 4) cv_fill(&c2, 22, 8, fill - 4, 16, 0xE0F4F4F4);
+    }
     fmt_time(a, sizeof a, shown);
     d[0] = '-'; fmt_time(d + 1, sizeof d - 1, rem);
-    lcd_set_foreground(LCD_RGBPACK(235, 235, 240)); lcd_set_drawmode(DRMODE_FG);
-    lcd_putsxyf(4, y0 + 8, "%s", a);
-    lcd_putsxyf(LCD_WIDTH - 4 - 6 * (int)strlen(d), y0 + 8, "%s", d);
-    lcd_set_drawmode(DRMODE_SOLID);
-    /* bar: outline, filled part, diamond marker */
-    lcd_set_foreground(LCD_RGBPACK(150, 150, 158)); lcd_drawrect(bx0, ym - 3, bw, 7);
-    fill = pl_dur_ms ? (int)((uint64_t)shown * (uint32_t)(bw - 2) / pl_dur_ms) : 0;
-    if (fill > bw - 2) fill = bw - 2;
-    lcd_set_foreground(sc_active ? LCD_RGBPACK(255, 205, 40) : LCD_RGBPACK(225, 225, 232));
-    if (fill > 0) lcd_fillrect(bx0 + 1, ym - 2, fill, 5);
-    lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
-    for (i = -4; i <= 4; i++)
+    cv_text(&c2, 20, 28, a);
+    cv_text(&c2, 300 - cv_text_w(d), 28, d);
+}
+static void osd_upload(struct osd_strip *s, int back)
+{
+    int y, x;
+    for (y = 0; y < s->h; y++)
     {
-        int h = 4 - (i < 0 ? -i : i);
-        lcd_vline(bx0 + 1 + fill + i, ym - h, ym + h);
+        const uint32_t *row = s->cvp + y * s->w;
+        if (osd_type == 15)
+        {
+            bcm_io_lock(); bcm_io_write(s->addr[back] + (unsigned)y * s->w * 4, row, (unsigned)s->w * 4); bcm_io_unlock();
+        }
+        else
+        {   /* RGB565 fallback: composite over a dark panel colour */
+            for (x = 0; x < s->w; x++)
+            {
+                uint32_t p = row[x], a = p >> 24, r = ((p >> 16) & 255) * a / 255 + 20 * (255 - a) / 255,
+                         g = ((p >> 8) & 255) * a / 255 + 20 * (255 - a) / 255, b = (p & 255) * a / 255 + 24 * (255 - a) / 255;
+                osd_row[x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+            bcm_io_lock(); bcm_io_write(s->addr[back] + (unsigned)y * s->w * 2, osd_row, (unsigned)s->w * 2); bcm_io_unlock();
+        }
+        if ((y & 7) == 7) bcm_host_service();
     }
 }
 static void osd_present(void)
 {
     uint32_t o[4], pl[8], w4[4];
-    int k, back[2], y;
+    int k, back[OSD_NS];
     if (osd_ok <= 0) return;
-    lcd_set_viewport(NULL); lcd_set_backdrop(NULL); lcd_set_drawmode(DRMODE_SOLID); lcd_setfont(FONT_SYSFIXED);
-    osd_draw_top(); osd_draw_bot();
-    for (k = 0; k < 2; k++)
+    osd_draw();
+    for (k = 0; k < OSD_NS; k++)
     {
-        struct osd_strip *s = &osd_s[k];
-        const fb_data *fb = FBADDR(0, 0) + s->y * LCD_WIDTH;
-        back[k] = s->front < 0 ? 0 : 1 - s->front;
-        for (y = 0; y < s->h; y += 8)
-        {
-            int n = s->h - y < 8 ? s->h - y : 8;
-            bcm_io_lock(); bcm_io_write(s->addr[back[k]] + (unsigned)y * LCD_WIDTH * 2, fb + y * LCD_WIDTH, (unsigned)n * LCD_WIDTH * 2); bcm_io_unlock();
-        }
-        bcm_host_service();                          /* keep frames flowing while the strips are written */
+        back[k] = osd_s[k].front < 0 ? 0 : 1 - osd_s[k].front;
+        osd_upload(&osd_s[k], back[k]);
     }
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    for (k = 0; k < 2; k++)
+    for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
         if (s->front >= 0 && s->win[s->front])
         { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
     }
-    for (k = 0; k < 2; k++)
+    for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
         memset(pl, 0, sizeof pl);
         pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[back[k]];
-        ((uint16_t *)pl)[8] = 0; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = (uint16_t)s->h;
+        ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
         if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->win[back[k]] = o[0];
         s->front = back[k];
     }
@@ -4189,7 +4307,7 @@ static void osd_hide(void)
     int k;
     if (!osd_visible) return;
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    for (k = 0; k < 2; k++)
+    for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
         if (s->front >= 0 && s->win[s->front])
@@ -4198,26 +4316,37 @@ static void osd_hide(void)
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = false;
 }
+static void osd_init(void)
+{
+    int k, ok = 1;
+    vui_load();
+    osd_type = cfg_osd_argb ? 15 : 1;
+    for (k = 0; k < OSD_NS && ok; k++)
+        ok = osd_alloc(osd_type, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0 &&
+             osd_alloc(osd_type, osd_s[k].w, osd_s[k].h, &osd_s[k].img[1], &osd_s[k].addr[1]) == 0;
+    if (!ok && osd_type == 15)
+    {
+        BLOG("  OSD: 32-bit ARGB images (type 15) refused -- falling back to RGB565 on a dark panel");
+        osd_type = 1; ok = 1;
+        for (k = 0; k < OSD_NS && ok; k++)
+            ok = osd_alloc(1, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0 &&
+                 osd_alloc(1, osd_s[k].w, osd_s[k].h, &osd_s[k].img[1], &osd_s[k].addr[1]) == 0;
+    }
+    osd_ok = ok;
+    BLOG("  OSD: 3 windows, VC image type %d (%s), layer %d -> %s", osd_type, osd_type == 15 ? "ARGB, drawn over the video" : "RGB565",
+         cfg_osd_layer, ok ? "ok" : "FAILED");
+}
 static void osd_show_for(int ms)
 {
     if (!cfg_osd) return;
-    if (osd_ok < 0)
-    {
-        int k, ok = 1;
-        for (k = 0; k < 2 && ok; k++)
-            ok = osd_alloc(LCD_WIDTH, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0 &&
-                 osd_alloc(LCD_WIDTH, osd_s[k].h, &osd_s[k].img[1], &osd_s[k].addr[1]) == 0;
-        osd_ok = ok;
-        BLOG("  OSD: top %08x/%08x bottom %08x/%08x -> %s (layer %d)", (unsigned)osd_s[0].img[0], (unsigned)osd_s[0].img[1],
-             (unsigned)osd_s[1].img[0], (unsigned)osd_s[1].img[1], ok ? "ok" : "FAILED", cfg_osd_layer);
-    }
+    if (osd_ok < 0) osd_init();
     if (!sc_active) pl_status();
     osd_present();
     osd_hide_at = ms ? current_tick + (ms * HZ) / 1000 : 0;
     osd_next = current_tick + HZ;
 }
 
-/* key frames: the last one at or before ms / the first one after the sample at ms */
+/* ---- key frames */
 static uint32_t pl_key_ms(uint32_t k) { return (uint32_t)(m4_dts_of(k) * 1000ULL / m4.timescale); }
 static uint32_t pl_key_after(uint32_t ms)
 {
@@ -4228,7 +4357,6 @@ static uint32_t pl_key_after(uint32_t ms)
     while (lo < hi) { uint32_t mid = (lo + hi) / 2; if (m4_u32(m4.stss + 4 * mid) <= s + 1) lo = mid + 1; else hi = mid; }
     return m4_u32(m4.stss + 4 * lo) - 1;
 }
-/* next scrub position from cur in direction dir, about `jump` ms away, always on a key frame and always moving */
 static uint32_t pl_key_step(uint32_t cur, int dir, uint32_t jump)
 {
     uint32_t kms = cur, k;
@@ -4247,6 +4375,14 @@ static uint32_t pl_key_step(uint32_t cur, int dir, uint32_t jump)
     }
     return kms;
 }
+/* the trick feed (tf_*, used in v_get_frame): next key frame in direction tf_dir, tf_jump ms on */
+static uint32_t tf_next_key(void)
+{
+    uint32_t k = pl_key_step(tf_cur, tf_dir, tf_jump);
+    if (!tf_fed) { uint32_t k0; m4_key_at(tf_cur, &k0); k = k0; }  /* the first frame: the key frame at the start position */
+    return k;
+}
+
 static void mon_start(const char *why)
 {
     mon_t0 = current_tick; mon_until = current_tick + cfg_seekmon * HZ; mon_next = current_tick + HZ / 2; mon_req0 = v_getframes;
@@ -4263,73 +4399,178 @@ static void mon_tick(void)
     if (rr < 0) return;
     el = pl_num(r, "elapsed="); bu = pl_num(r, "buffering=");
     if (el != 0xffffffffu) pl_el_ms = el;
-    BLOG("  mon +%ld.%lds: elapsed=%u buffering=%d paused=%s frames requested since=%d (%ld/s)",
+    BLOG("  mon +%ld.%lds: elapsed=%u buffering=%d paused=%s frames requested since=%d",
          (current_tick - mon_t0) / HZ, (current_tick - mon_t0) % HZ / 10, (unsigned)el, bu == 0xffffffffu ? -1 : (int)bu,
-         strstr(r, "paused=yes") ? "yes" : "no", v_getframes - mon_req0,
-         (current_tick - mon_t0) > 0 ? (long)(v_getframes - mon_req0) * HZ / (current_tick - mon_t0) : 0L);
+         strstr(r, "paused=yes") ? "yes" : "no", v_getframes - mon_req0);
 }
 
+/* ---- trick probe: measure which commands really move the picture (runs once, buttons ignored) */
+struct tp_res { int dseq, dtime; };
+static struct tp_res tp_r[6];
+static void tp_sample(const char *name, long t0, uint32_t *seq, uint32_t *dtime)
+{
+    static char r[1400], s[400];
+    bcm_cmd_t0 = current_tick; bcm_gencmd_watched("mp_get_stats video", r, sizeof r, 2);
+    bcm_cmd_t0 = current_tick; bcm_gencmd_watched("mp_get_status", s, sizeof s, 2);
+    *seq = pl_num(r, "Disp seq_num="); *dtime = pl_num(r, "Disp time=");
+    {   const char *m = strstr(s, "mode="); char mb[10] = "?"; int i = 0;
+        if (m) { m += 5; while (*m && *m != ' ' && i < 9) mb[i++] = *m++; mb[i] = 0; }
+        BLOG("  probe %-11s +%ld.%02lds  seq=%d disp_time=%d elapsed=%d mode=%s buffering=%d fed=%d porder=%d",
+             name, (current_tick - t0) / HZ, (current_tick - t0) % HZ, (int)*seq, (int)*dtime, (int)pl_num(s, "elapsed="), mb,
+             (int)pl_num(s, "buffering="), v_getframes, (int)pl_num(r, "lost_frame_assert_packetorder="));
+    }
+}
+static void tp_wait_ms(long ms)
+{
+    long end = current_tick + (ms * HZ) / 1000;
+    while (TIME_BEFORE(current_tick, end)) { bcm_host_service(); yield(); }
+}
+/* resume normal play at `pos` and wait (<= 4 s) until the picture moves again */
+static void tp_recover(uint32_t pos)
+{
+    char c[40]; uint32_t k, s0 = 0, s1 = 0, t; long end;
+    tf_dir = 0;
+    pl_cmd("mp_play", false);
+    m4_key_at(pos, &k);
+    snprintf(c, sizeof c, "mp_seek %u", (unsigned)k); pl_cmd(c, false);
+    pl_disp(&t, &s0); s1 = s0;
+    for (end = current_tick + 4 * HZ; TIME_BEFORE(current_tick, end); )
+    {
+        tp_wait_ms(250);
+        if (pl_disp(&t, &s1) == 0 && s1 != 0xffffffffu && s1 > s0 + 2 && t >= k) break;
+    }
+    BLOG("  probe: resumed at %u ms (picture moving: %s)", (unsigned)k, s1 > s0 + 2 ? "yes" : "no");
+}
+static void tp_test(int idx, const char *name, const char *start, const char *rep, int rep_ms, int feed, uint32_t pos)
+{
+    uint32_t q0, t0, q1, t1, q, t; long ts = current_tick, next_rep, next_s, end = current_tick + (cfg_probe_ms * HZ) / 1000;
+    BLOG("  probe %s: start=\"%s\" repeat=\"%s\"/%d ms, feed=%s", name, start ? start : "", rep ? rep : "", rep_ms,
+         feed > 0 ? "key frames forward" : feed < 0 ? "key frames backward" : "normal");
+    tp_sample(name, ts, &q0, &t0);
+    if (feed) { tf_cur = t0 != 0xffffffffu && t0 ? t0 : pos; tf_jump = 2000; tf_fed = 0; tf_dir = feed; }
+    if (start) pl_cmd(start, true);
+    next_rep = current_tick; next_s = current_tick + HZ / 4;
+    while (TIME_BEFORE(current_tick, end))
+    {
+        bcm_host_service();
+        if (rep && !TIME_BEFORE(current_tick, next_rep)) { pl_cmd(rep, false); next_rep = current_tick + (rep_ms * HZ) / 1000; }
+        if (!TIME_BEFORE(current_tick, next_s)) { tp_sample(name, ts, &q, &t); next_s = current_tick + HZ / 4; }
+        yield();
+    }
+    tp_sample(name, ts, &q1, &t1);
+    tf_dir = 0;
+    tp_r[idx].dseq = (int)(q1 - q0); tp_r[idx].dtime = (int)(t1 - t0);
+    BLOG("  probe %s RESULT: %d pictures shown, picture time moved %+d ms in %d ms", name, tp_r[idx].dseq, tp_r[idx].dtime, cfg_probe_ms);
+}
+static void bcm_trick_probe(void)
+{
+    char ff[32], rw[32];
+    uint32_t base = pl_dur_ms > 400000 ? 120000 : pl_dur_ms / 3, gap = pl_dur_ms > 400000 ? 60000 : pl_dur_ms / 12;
+    BLOG("---- trick probe (v46): which FF/REW method moves the picture?  (buttons are ignored for ~%d s)", 6 * (cfg_probe_ms / 1000 + 3));
+    snprintf(ff, sizeof ff, "mp_ff %d", cfg_ff_rate); snprintf(rw, sizeof rw, "mp_rewind %d", cfg_ff_rate);
+    tp_recover(base);
+    tp_test(0, "step-play", NULL, "mp_step 1000", 300, 0, base);         tp_recover(base + gap);
+    tp_test(1, "ff", ff, NULL, 0, 0, base + gap);                         tp_recover(base + 2 * gap);
+    tp_test(2, "ff+keys", ff, NULL, 0, +1, base + 2 * gap);               tp_recover(base + 3 * gap);
+    tp_test(3, "rew", rw, NULL, 0, 0, base + 3 * gap);                    tp_recover(base + 4 * gap);
+    tp_test(4, "rew+keys", rw, NULL, 0, -1, base + 4 * gap);              tp_recover(base + 5 * gap);
+    tp_test(5, "step-pause", "mp_pause", "mp_step 1000", 300, 0, base + 5 * gap);
+    pl_paused = false;
+    tp_recover(base);
+    /* choose: a method counts when it showed pictures AND the picture time went the right way */
+    if (tp_r[2].dseq >= 3 && tp_r[2].dtime >= 3000) sm_ff = SM_FFK;
+    else if (tp_r[1].dseq >= 3 && tp_r[1].dtime >= 3000) sm_ff = SM_FF;
+    else if (tp_r[0].dseq >= 4 && tp_r[0].dtime >= 1500) sm_ff = SM_STEP;
+    else sm_ff = SM_JUMP;
+    if (tp_r[4].dseq >= 2 && tp_r[4].dtime <= -2000) sm_rew = SM_FFK;
+    else if (tp_r[3].dseq >= 2 && tp_r[3].dtime <= -2000) sm_rew = SM_FF;
+    else sm_rew = SM_JUMP;
+    BLOG("---- trick probe done: FF uses \"%s\", REW uses \"%s\"", sm_name[sm_ff], sm_name[sm_rew]);
+}
+
+/* ---- scrubbing */
+static uint32_t sc_speed_jump(long held)
+{   /* ms of video per second of holding: 4x, 10x, 30x, 90x */
+    return held < 2 * HZ ? 4000 : held < 5 * HZ ? 10000 : held < 9 * HZ ? 30000 : 90000;
+}
 static void scrub_begin(int dir)
 {
     char c[48];
     pl_status();
     sc_active = true; sc_dir = dir; sc_ticks = 0; sc_t0 = current_tick; sc_next = current_tick;
-    sc_pos = pl_el_ms; pl_target_ms = sc_pos; sc_jump = 2000;
+    sc_pos = pl_el_ms; pl_target_ms = sc_pos; sc_jump = 4000;
     sc_was_playing = !pl_paused;
-    BLOG("  scrub: %s held at %u ms (scrub_mode %d, tick %d ms, step %d ms)", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, cfg_scrub_mode, cfg_scrub_tick, cfg_step_ms);
-    if (cfg_scrub_mode == 3)
-    {   /* mplayer's own trick mode (never used by the stock firmware) */
+    sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : (dir > 0 ? sm_ff : sm_rew);
+    if (sc_method == SM_STEP && dir < 0) sc_method = SM_JUMP;
+    BLOG("  scrub: %s held at %u ms, method %s", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, sm_name[sc_method]);
+    if (sc_method == SM_FF || sc_method == SM_FFK)
+    {
+        if (sc_method == SM_FFK)
+        {   uint32_t dt = 0; pl_disp(&dt, NULL);
+            tf_cur = dt && dt != 0xffffffffu ? dt : sc_pos; tf_jump = 1000; tf_fed = 0; tf_dir = dir; }
         snprintf(c, sizeof c, "%s %d", dir > 0 ? "mp_ff" : "mp_rewind", cfg_ff_rate);
         pl_cmd(c, true);
-        mon_start(c);
     }
-    else if (cfg_scrub_mode != 2 && sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
+    else if (sc_method == SM_SEEKSTEP && sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
+    else if (sc_method == SM_STEP && !sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
     osd_show_for(0);
 }
 static void scrub_tick(void)
 {
     char c[48];
     long held;
-    uint32_t k;
+    uint32_t k, dt;
     if (!sc_active) return;
-    if (sc_btn && !(button_status() & sc_btn)) { /* release event lost: end anyway */ sc_btn = 0; }
+    if (sc_btn && !(button_status() & sc_btn)) sc_btn = 0;
     if (TIME_BEFORE(current_tick, sc_next)) return;
-    sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
-    if (cfg_scrub_mode == 3) { pl_status(); pl_target_ms = pl_el_ms; osd_present(); return; }
     held = current_tick - sc_t0;
-    sc_jump = held < 2 * HZ ? 2000 : held < 5 * HZ ? 5000 : held < 9 * HZ ? 15000 : 40000;
-    k = pl_key_step(sc_pos, sc_dir, sc_jump);
-    if (k == sc_pos && sc_ticks) { pl_target_ms = sc_pos; osd_present(); return; }   /* start / end of the file */
-    sc_pos = k; pl_target_ms = k;
-    snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
-    pl_cmd(c, sc_ticks < 4);
-    if (cfg_scrub_mode == 1 && cfg_step_ms > 0)
+    switch (sc_method)
     {
-        snprintf(c, sizeof c, "mp_step %d", cfg_step_ms);
-        pl_cmd(c, sc_ticks < 4);
+    case SM_FF: case SM_FFK:
+        sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
+        tf_jump = sc_speed_jump(held) / 8;                  /* key frames fed per second of video shown: ~8 */
+        if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
+        break;
+    case SM_STEP:
+        sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
+        snprintf(c, sizeof c, "mp_step %u", (unsigned)(sc_speed_jump(held) * (unsigned)cfg_scrub_tick / 1000));
+        pl_cmd(c, sc_ticks < 3);
+        if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
+        break;
+    case SM_SEEKSTEP: case SM_JUMP: default:
+        sc_next = current_tick + ((sc_method == SM_JUMP ? cfg_jump_tick : cfg_scrub_tick) * HZ) / 1000;
+        sc_jump = sc_speed_jump(held) * (unsigned)(sc_method == SM_JUMP ? cfg_jump_tick : cfg_scrub_tick) / 1000;
+        k = pl_key_step(sc_pos, sc_dir, sc_jump);
+        if (k == sc_pos && sc_ticks) break;
+        sc_pos = k; pl_target_ms = k;
+        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
+        pl_cmd(c, sc_ticks < 3);
+        if (sc_method == SM_SEEKSTEP && cfg_step_ms > 0) { snprintf(c, sizeof c, "mp_step %d", cfg_step_ms); pl_cmd(c, sc_ticks < 3); }
+        break;
     }
-    if (sc_ticks < 6 || sc_ticks % 10 == 0)
-        BLOG("  scrub tick %d: %s to key frame %u ms (jump %u ms, held %ld.%ld s)", sc_ticks, sc_dir > 0 ? "FF" : "REW",
-             (unsigned)k, (unsigned)sc_jump, held / HZ, held % HZ / 10);
+    if (sc_ticks < 5 || sc_ticks % 10 == 0)
+        BLOG("  scrub tick %d (%s): at %u ms, held %ld.%ld s", sc_ticks, sm_name[sc_method], (unsigned)sc_pos, held / HZ, held % HZ / 10);
     sc_ticks++;
     osd_present();
 }
 static void scrub_end(void)
 {
+    char c[40]; uint32_t k, dt = 0;
     sc_active = false;
-    BLOG("  scrub: released at %u ms after %d ticks", (unsigned)sc_pos, sc_ticks);
-    if (cfg_scrub_mode == 3)
+    if (sc_method == SM_FF || sc_method == SM_FFK)
     {
+        tf_dir = 0;
+        if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu && dt) sc_pos = dt;
         pl_cmd("mp_play", true); pl_paused = false;
-        pl_status();
-        mon_start("after mp_ff/mp_rewind -> mp_play");
+        m4_key_at(sc_pos, &k);
+        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k); pl_cmd(c, true);
+        sc_pos = k;
+        if (!sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
     }
-    else
-    {
-        pl_el_ms = sc_pos;
-        if (sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
-        mon_start(sc_was_playing ? "scrub released -> mp_play" : "scrub released (paused)");
-    }
+    else if (sc_method == SM_SEEKSTEP && sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
+    BLOG("  scrub: released at %u ms after %d ticks (%s)", (unsigned)sc_pos, sc_ticks, sm_name[sc_method]);
+    pl_el_ms = sc_pos;
+    mon_start("scrub released");
     osd_show_for(pl_paused ? 0 : 3000);
 }
 static void pl_tap(int dir)
@@ -4347,7 +4588,7 @@ static void pl_tap(int dir)
 static void bcm_osd_tick(void)
 {
     if (sc_btn && !sc_active && current_tick - sc_press >= (HZ * 4) / 10 && (button_status() & sc_btn))
-        scrub_begin(sc_btn == BUTTON_RIGHT ? 1 : -1);     /* held: start scrubbing (does not wait for BUTTON_REPEAT) */
+        scrub_begin(sc_btn == BUTTON_RIGHT ? 1 : -1);
     if (sc_active && !sc_btn) scrub_end();
     scrub_tick();
     mon_tick();
@@ -4374,7 +4615,6 @@ static int bcm_player_input(char *resp, size_t rn)
             {
                 sc_btn = 0;
                 if (!sc_active) pl_tap(base == BUTTON_RIGHT ? 1 : -1);   /* short press */
-                /* a held press ends in bcm_osd_tick (sc_active && !sc_btn) */
             }
             return 0;
         }
@@ -4427,14 +4667,22 @@ static void bcm_video_run(int secs)
     }
     if (cfg_post == 3) { pw1 = current_tick + HZ; pw2 = current_tick + 4 * HZ; }
     int gf_last = v_getframes, gf_log = v_getframes, nstat = 0;
-    long last_req = current_tick;
+    long last_req = current_tick, run_t0 = current_tick;
+    bool probed = !cfg_trickprobe;
     mon_start("mp_play (start-up pre-buffer)");
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
         if (bcm_check_dead()) break;
         if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
-        if (bcm_player_input(resp, sizeof resp)) { BLOG("  user: MENU -> stop"); break; }
+        if (!probed && current_tick - run_t0 > 5 * HZ)
+        {   /* v46: once per run, ~5 s in: measure the FF/REW candidates (buttons are not read meanwhile) */
+            probed = true; mon_until = 0;
+            pl_status();
+            if (pl_dur_ms > 60000) bcm_trick_probe(); else BLOG("trick probe skipped: video shorter than 60 s");
+            while (button_get_w_tmo(0) != BUTTON_NONE) ;         /* drop presses made during the probe */
+        }
+        else if (bcm_player_input(resp, sizeof resp)) { BLOG("  user: MENU -> stop"); break; }
         bcm_osd_tick();
         if (!TIME_BEFORE(current_tick, next_log))
         {
@@ -4897,17 +5145,16 @@ static void bcm_playback_probe(void)
     bcm_setvol();                                      /* v28: stock order: mp_setvol 0, audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_audio_enable();                                /* v27: stock order: audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay (cfg pm, default off since v20) */
-    bcm_find_counters();
-    bcm_hi_dump("just before mp_selectplay");
+    if (!cfg_fast) { bcm_find_counters(); bcm_hi_dump("just before mp_selectplay"); }
     bcm_cmd_t0 = current_tick;
     if (gfx_front >= 0) { BLOG("  >>> LOOK: sending mp_selectplay -- does the status screen turn WHITE now?"); bcm_gfx_present_m(0x101); }
     r = bcm_gencmd_watched("mp_selectplay passthru:test 0", resp, sizeof resp, cfg_sel_wait);
     bcm_log_text("mp_selectplay passthru:test 0", r, resp);
     bcm_cmd_t0 = current_tick;
     bcm_step("mp_selectplay");
-    bcm_hi_dump("right after mp_selectplay");
+    if (!cfg_fast) bcm_hi_dump("right after mp_selectplay");
     {
-        int adv = bcm_check_counters("after mp_selectplay");
+        int adv = cfg_fast ? 1 : bcm_check_counters("after mp_selectplay");
         if (adv == 0)
         {
             int k;
@@ -4925,11 +5172,14 @@ static void bcm_playback_probe(void)
             }
         }
     }
-    bcm_diag_cmd("version", 2);
-    bcm_diag_cmd("tasks", 2);
-    bcm_diag_cmd("pm_get_status", 2);
-    bcm_diag_cmd("mp_get_status", 2);
-    bcm_hi_dump("after the four diagnostic commands");
+    if (!cfg_fast)
+    {
+        bcm_diag_cmd("version", 2);
+        bcm_diag_cmd("tasks", 2);
+        bcm_diag_cmd("pm_get_status", 2);
+        bcm_diag_cmd("mp_get_status", 2);
+        bcm_hi_dump("after the four diagnostic commands");
+    }
     if (cfg_region_when & 2) bcm_region("after mp_selectplay");
     if (cfg_pm_play) bcm_pm_set();                     /* v18: a second pm_set_policy min after selectplay never got a reply and blocked mp_play behind it */
     bcm_cmd_t0 = current_tick;
@@ -5017,11 +5267,13 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v45, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v46, built %s %s", __DATE__, __TIME__);
+    bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
     bcm_load_cfg();
+    if (!cfg_fast) bcm_sync_every = 0;
     bcm_apply_variant();
 
     fd = open(BCM_VMCS_PATH, O_RDONLY);
@@ -5126,16 +5378,21 @@ static bool dbg_bcm_host(void)
     bcm_host_set_pds_flags_legacy(cfg_flags_legacy);       /* v29: stock chunk flags unless flags_legacy=1 */       /* v28: 0 = stock zero-length reply to VCHR op 0x47 */
     for (i = 0; i < (int)(sizeof cmds / sizeof cmds[0]); i++)
     {
+        if (cfg_fast && (!strcmp(cmds[i], "commands") || (i > 0 && !strcmp(cmds[i], "tasks")))) continue;   /* v46: diagnostics only */
         bcm_cmd_t0 = current_tick;
         r = bcm_gencmd(cmds[i], resp, sizeof resp, 1000);
         bcm_log_text(cmds[i], r, resp);
     }
 
     {   /* listen for unsolicited traffic (VCFS/VCHR/VCPD requests) for 5 seconds */
-        long end = current_tick + 5*HZ;
+        long end = current_tick + 5*HZ, t0 = current_tick, quiet = current_tick;
+        uint32_t last_rx = bcm_host_get_stats()->rx_msgs;
         while (TIME_BEFORE(current_tick, end))
         {
             bcm_host_service();
+            if (bcm_host_get_stats()->rx_msgs != last_rx) { last_rx = bcm_host_get_stats()->rx_msgs; quiet = current_tick; }
+            /* v46 fast start: stop listening once the VC has been quiet for 0.3 s (mplayer.vll is loaded by then) */
+            if (cfg_fast && current_tick - t0 > HZ / 3 && current_tick - quiet > HZ * 3 / 10) break;
             sleep(HZ/100);
         }
         const struct bcm_host_stats *st = bcm_host_get_stats();
