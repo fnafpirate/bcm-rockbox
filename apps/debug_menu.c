@@ -2868,6 +2868,7 @@ extern void bcm_io_unlock(void);
 extern void bcm_io_read(unsigned vc_addr, void *dst, unsigned len);
 extern void bcm_io_write(unsigned vc_addr, const void *src, unsigned len);
 extern int  bcm_use_vmcs_image(const void *img, unsigned len);
+extern int bcm_restore_rom_vmcs(void);           /* v47, lcd-video.c */
 extern int  bcm_io_dead(void);        /* v16: host bus wait timed out -> the VC stopped answering */
 extern void bcm_io_doorbell(void);    /* v23: BCM_CONTROL = 0x31, the wake/notify write */
 extern void bcm_io_status(unsigned v[4]);   /* v24: bus status registers */
@@ -2881,6 +2882,8 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
 static int bcm_log_fd = -1;
+static const char *bcm_play_path;   /* v47: set when started from the file browser ("player mode") */
+static bool bcm_player_mode;
 
 static long bcm_t_start;
 static char bcm_last_line[72];
@@ -3434,7 +3437,8 @@ static int cfg_dc_seq = 0, cfg_probe_at = 0;
 static int cfg_osd = 1, cfg_osd_layer = 100;                                         /* v44: playback overlay */
 static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
-static int cfg_fast = 1, cfg_trickprobe = 1, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
+static int cfg_ff_accel = 1;                                                        /* v47 */
+static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
 static int cfg_m4cache_ref(void) { return cfg_m4cache; }
@@ -3530,6 +3534,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "quiet"))    cfg_quiet = v;
         else if (!strcmp(p, "m4cache"))  cfg_m4cache = v;
         else if (!strcmp(p, "fast"))     cfg_fast = v;
+        else if (!strcmp(p, "ff_accel")) cfg_ff_accel = v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
         else if (!strcmp(p, "probe_ms")) cfg_probe_ms = v < 500 ? 500 : v;
         else if (!strcmp(p, "jump_tick")) cfg_jump_tick = v < 300 ? 300 : v;
@@ -3552,7 +3557,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v46 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
+    "0: v47 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3835,6 +3840,12 @@ static void bcm_gfx_draw_status(void)
 {
     static int phase;
     long e = current_tick - bcm_t_start;
+    if (bcm_player_mode)
+    {   /* v47: the player shows nothing until the first picture (black UI layer under the video) */
+        lcd_set_viewport(NULL); lcd_set_backdrop(NULL); lcd_set_drawmode(DRMODE_SOLID);
+        lcd_set_background(LCD_RGBPACK(0, 0, 0)); lcd_clear_display();
+        return;
+    }
     lcd_set_viewport(NULL);                 /* full screen, absolute coordinates */
     lcd_set_backdrop(NULL);
     lcd_set_drawmode(DRMODE_SOLID);
@@ -3842,7 +3853,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v46 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v47 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3922,7 +3933,7 @@ static void bcm_gfx_probe(void)
     {
         static const uint16_t col[8] = { 0xF800, 0x07E0, 0x001F, 0xFFE0, 0xF81F, 0x07FF, 0xFFFF, 0x0000 };
         for (x = 0; x < 320; x++)
-            row[x] = (y < 24) ? (uint16_t)(((x * 31 / 319) << 11) | ((x * 63 / 319) << 5) | (x * 31 / 319)) : col[x / 40];
+            row[x] = bcm_player_mode ? 0 : (y < 24) ? (uint16_t)(((x * 31 / 319) << 11) | ((x * 63 / 319) << 5) | (x * 31 / 319)) : col[x / 40];
         bcm_io_lock(); bcm_io_write(vcaddr + 640u * (unsigned)y, row, sizeof row); bcm_io_unlock();
         if ((y & 31) == 31) bcm_host_service();
     }
@@ -4067,6 +4078,13 @@ static void cv_px(struct cv *c, int x, int y, uint32_t s)
 }
 static void cv_fill(struct cv *c, int x, int y, int w, int h, uint32_t s)
 { int i, j; for (j = 0; j < h; j++) for (i = 0; i < w; i++) cv_px(c, x + i, y + j, s); }
+static uint32_t cv_tint = 0xFFFFFF;              /* v47: multiplies the bitmap colours (white digits -> battery colour) */
+static uint32_t cv_tinted(uint32_t s)
+{
+    if (cv_tint == 0xFFFFFF) return s;
+    return (s & 0xFF000000u) | ((((s >> 16) & 255) * ((cv_tint >> 16) & 255) / 255) << 16)
+         | ((((s >> 8) & 255) * ((cv_tint >> 8) & 255) / 255) << 8) | ((s & 255) * (cv_tint & 255) / 255);
+}
 static void cv_blit(struct cv *c, int x, int y, int key, int clipw)
 {
     const struct vui_bmp *b = &vui[key];
@@ -4078,12 +4096,12 @@ static void cv_blit(struct cv *c, int x, int y, int key, int clipw)
         {
             uint16_t v = b->px[j * b->w + i];
             uint32_t a = (v >> 12) & 15;
-            if (a) cv_px(c, x + i, y + j, (a * 17u << 24) | (((v >> 8) & 15) * 17u << 16) | (((v >> 4) & 15) * 17u << 8) | ((v & 15) * 17u));
+            if (a) cv_px(c, x + i, y + j, cv_tinted((a * 17u << 24) | (((v >> 8) & 15) * 17u << 16) | (((v >> 4) & 15) * 17u << 8) | ((v & 15) * 17u)));
         }
 }
 /* look-alike shapes when the stock bitmaps are missing: white with a dark shadow, like the stock art */
 static void cv_shadowed(struct cv *c, int x, int y, int w, int h, uint32_t col)
-{ cv_fill(c, x + 1, y + 1, w, h, 0x90000000); cv_fill(c, x, y, w, h, col); }
+{ cv_fill(c, x + 1, y + 1, w, h, 0x90000000); cv_fill(c, x, y, w, h, cv_tinted(col)); }
 static const uint8_t lk_font[13][7] = {           /* 5x7 digits, '-', ':', '%' for the look-alike / the % sign */
     {14,17,19,21,25,17,14},{4,12,4,4,4,4,14},{14,17,1,2,4,8,31},{31,2,4,2,1,17,14},{2,6,10,18,31,2,2},{31,16,30,1,1,17,14},
     {6,8,16,30,17,17,14},{31,1,2,4,8,8,8},{14,17,17,14,17,17,14},{14,17,17,15,1,2,12},{0,0,0,31,0,0,0},{0,12,12,0,12,12,0},
@@ -4135,8 +4153,8 @@ static uint16_t osd_row[320 * 2];
 /* scrubber */
 enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5 };
 static const char * const sm_name[6] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step" };
-static int sc_btn, sc_dir, sc_ticks, sc_method;
-static int sm_ff = SM_JUMP, sm_rew = SM_JUMP;    /* chosen by the trick probe (or cfg scrub_mode) */
+static int sc_btn, sc_dir, sc_ticks, sc_method, sc_rate;
+static int sm_ff = SM_FFK, sm_rew = SM_FFK;      /* v47: the v46 probe: ff+keys 454 pictures / +21.5 s, rew+keys 452 / -22.2 s in 2.4 s */
 static long sc_press, sc_t0, sc_next;
 static bool sc_active, sc_was_playing;
 static uint32_t sc_pos, sc_jump;
@@ -4221,12 +4239,15 @@ static void osd_draw(void)
     }
     /* battery %, right-aligned at x 305 (mirrors the stock 15 px inset of the status icon) */
     snprintf(t, sizeof t, "%d", lvl < 0 ? 0 : lvl > 100 ? 100 : lvl);
+    /* v47: battery colour: 60-100 % green, 20-59 % orange, 0-19 % red */
+    cv_tint = lvl >= 60 ? 0x50E050 : lvl >= 20 ? 0xFF9A1E : 0xF03228;
     {
         int pw = 12, tw = cv_text_w(t) + pw, x = 305 - 232 - tw, r, q;
         cv_text(&c1, x, 3, t);
         for (r = 0; r < 7; r++) for (q = 0; q < 5; q++)           /* '%' in the same white-with-shadow style */
             if (lk_font[12][r] & (16 >> q)) cv_shadowed(&c1, x + tw - pw + 1 + 2 * q, 3 + 2 + 2 * r, 2, 2, 0xFFF4F4F4);
     }
+    cv_tint = 0xFFFFFF;
     /* bottom panel: progress bar (frame, then the fill cut at the position), elapsed left, remaining right */
     if (pl_dur_ms && shown > pl_dur_ms) shown = pl_dur_ms;
     rem = pl_dur_ms > shown ? pl_dur_ms - shown : 0;
@@ -4508,7 +4529,8 @@ static void scrub_begin(int dir)
         if (sc_method == SM_FFK)
         {   uint32_t dt = 0; pl_disp(&dt, NULL);
             tf_cur = dt && dt != 0xffffffffu ? dt : sc_pos; tf_jump = 1000; tf_fed = 0; tf_dir = dir; }
-        snprintf(c, sizeof c, "%s %d", dir > 0 ? "mp_ff" : "mp_rewind", cfg_ff_rate);
+        sc_rate = cfg_ff_rate;
+        snprintf(c, sizeof c, "%s %d", dir > 0 ? "mp_ff" : "mp_rewind", sc_rate);
         pl_cmd(c, true);
     }
     else if (sc_method == SM_SEEKSTEP && sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
@@ -4529,6 +4551,16 @@ static void scrub_tick(void)
     case SM_FF: case SM_FFK:
         sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
         tf_jump = sc_speed_jump(held) / 8;                  /* key frames fed per second of video shown: ~8 */
+        if (cfg_ff_accel)
+        {   /* v47: faster the longer the button is held: rate x1 (~9x, v46 probe), x2 after 3 s, x4 after 7 s */
+            int want = cfg_ff_rate * (held < 3 * HZ ? 1 : held < 7 * HZ ? 2 : 4);
+            if (want != sc_rate)
+            {
+                sc_rate = want;
+                snprintf(c, sizeof c, "%s %d", sc_dir > 0 ? "mp_ff" : "mp_rewind", sc_rate);
+                pl_cmd(c, true);
+            }
+        }
         if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
         break;
     case SM_STEP:
@@ -4690,6 +4722,7 @@ static void bcm_video_run(int secs)
                  v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
             gf_log = v_getframes;
             backlight_on();                            /* v42: keep the backlight on while a video plays */
+            reset_poweroff_timer();                    /* v47: and do not let Rockbox's idle power-off stop it */
             next_log += 2 * HZ;
         }
         if (dump1 && !TIME_BEFORE(current_tick, dump1)) { dump1 = 0; if (cfg_dump_sram) bcm_vc_dump("play1", 0, (uint32_t)cfg_dump_len); if (cfg_dump_sdram) bcm_vc_dump("sd1", 0xC0000000u, 0x400000u); }
@@ -5085,16 +5118,24 @@ static void bcm_scan_vc_ram(uint32_t w0, uint32_t w1)
 
 static void bcm_playback_probe(void)
 {
-    char resp[256], video[192];
+    char resp[256], video[MAX_PATH];
     int fd, r, i;
 
-    fd = open(BCM_TESTFILE_PATH, O_RDONLY);
-    if (fd < 0) {
-        BLOG("no %s -- skipping playback probe (create it with one line: the video's path)", BCM_TESTFILE_PATH);
-        return;
+    if (bcm_play_path)                                 /* v47: player mode: the file chosen in the file browser */
+    {
+        snprintf(video, sizeof video, "%s", bcm_play_path);
+        r = (int)strlen(video);
     }
-    r = read(fd, video, sizeof video - 1);
-    close(fd);
+    else
+    {
+        fd = open(BCM_TESTFILE_PATH, O_RDONLY);
+        if (fd < 0) {
+            BLOG("no %s -- skipping playback probe (create it with one line: the video's path)", BCM_TESTFILE_PATH);
+            return;
+        }
+        r = read(fd, video, sizeof video - 1);
+        close(fd);
+    }
     if (r <= 0) { BLOG("testfile.txt is empty"); return; }
     video[r] = 0;
     for (i = 0; i < r; i++) if (video[i] == '\r' || video[i] == '\n') { video[i] = 0; break; }
@@ -5248,7 +5289,31 @@ static void bcm_verify_upload(unsigned len)
     BLOG("upload verify: %u of %u KiB blocks differ from vmcs.bin", bad, total);
 }
 
-static bool dbg_bcm_host(void)
+/* v47: the player can now run many times per boot (file browser), so the per-run state is reset here */
+static void bcm_reset_run_state(void)
+{
+    int k;
+    bcm_dead_seen = false; bcm_vc_stopped = false; bcm_trace_42 = 0;
+    v_frames = v_bytes = v_getframes = v_empty = v_eos = v_seeks = v_skips = 0;
+    v_stop = v_live = false; v_eos_tick = 0;
+    tf_dir = 0; tf_fed = 0;
+    gfx_front = -1; gfx_presents = 0; memset(gfx_win, 0, sizeof gfx_win);
+    osd_ok = -1; osd_visible = false;
+    for (k = 0; k < OSD_NS; k++) { osd_s[k].front = -1; memset(osd_s[k].win, 0, sizeof osd_s[k].win); }
+    pl_paused = false; pl_el_ms = 0; pl_dur_ms = 0; pl_target_ms = 0;
+    sc_active = false; sc_btn = 0; mon_until = 0;
+    m4c_miss = m4d_miss = 0;
+}
+static bool bcm_run(const char *play_path);
+static bool dbg_bcm_host(void) { return bcm_run(NULL); }
+/* v47: play a video from the file browser and come back to it (the display goes back to Rockbox's own firmware) */
+bool bcm_video_play(const char *path) { return bcm_run(path); }
+bool bcm_video_is_video(const char *path)
+{
+    const char *e = strrchr(path, '.');
+    return e && (!strcasecmp(e, ".mp4") || !strcasecmp(e, ".m4v") || !strcasecmp(e, ".mov"));
+}
+static bool bcm_run(const char *play_path)
 {
     static char resp[1536];
     unsigned snap[4], boots;
@@ -5265,11 +5330,13 @@ static bool dbg_bcm_host(void)
                                              very end (cfg cmds_end) once the signal-after-partial-read fix can be judged. */
     };
 
+    bcm_play_path = play_path; bcm_player_mode = play_path != NULL;
+    bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v46, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v47, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
-    BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
+    BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
     bcm_load_cfg();
@@ -5281,6 +5348,7 @@ static bool dbg_bcm_host(void)
     {
         BLOG("cannot open %s", BCM_VMCS_PATH);
         splash(HZ*3, "vmcs.bin not found");
+        bcm_play_path = NULL;                          /* nothing was changed: no display restore needed */
         goto out;
     }
     r = read(fd, bcm_vmcs_buf, sizeof bcm_vmcs_buf);
@@ -5293,7 +5361,7 @@ static bool dbg_bcm_host(void)
     BLOG("vmcs.bin %d bytes", r);
 
     BLOG("booting the VC from vmcs.bin now (about 1 s; if the log stops here the boot hung: the watchdog reboots after %d s)", BCM_WD_SECS);
-    splash(0, "Booting VideoCore from file...");
+    if (!bcm_player_mode) splash(0, "Booting VideoCore from file...");   /* v47: the player starts without a message */
     BLOG("boot splash shown; calling bcm_use_vmcs_image");
     vmcs_len = (unsigned)r;
     r = bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);
@@ -5380,7 +5448,8 @@ static bool dbg_bcm_host(void)
     {
         if (cfg_fast && (!strcmp(cmds[i], "commands") || (i > 0 && !strcmp(cmds[i], "tasks")))) continue;   /* v46: diagnostics only */
         bcm_cmd_t0 = current_tick;
-        r = bcm_gencmd(cmds[i], resp, sizeof resp, 1000);
+        /* v46 log: one VCFS read of mplayer.vll every 20 ms (two 10 ms poll sleeps each); the watched wait polls without sleeping */
+        r = cfg_fast ? bcm_gencmd_watched(cmds[i], resp, sizeof resp, 10) : bcm_gencmd(cmds[i], resp, sizeof resp, 1000);
         bcm_log_text(cmds[i], r, resp);
     }
 
@@ -5420,7 +5489,7 @@ static bool dbg_bcm_host(void)
         splash(HZ*2, "v26 marker B: after display_control");
     bcm_playback_probe();
 
-    if (cfg_cmds_end && !bcm_check_dead() && !bcm_vc_stopped)
+    if (cfg_cmds_end && !bcm_player_mode && !bcm_check_dead() && !bcm_vc_stopped)
     {
         char big[1024]; int cr;
         bcm_cmd_t0 = current_tick;
@@ -5432,6 +5501,22 @@ static bool dbg_bcm_host(void)
     if (v_live && !cfg_nolcd && !bcm_check_dead())
         splashf(HZ*3, "v26: sent %d video frames", v_frames);
 out:
+    if (bcm_player_mode)
+    {   /* v47: back to the file browser: Rockbox's own display firmware is booted again, nothing is rebooted */
+        int rr;
+        bcm_host_detach();
+        bcm_wd_on = 0;
+        tick_remove_task(bcm_wd_tick);
+        rr = bcm_play_path ? bcm_restore_rom_vmcs() : 0;
+        BLOG("player: display back to Rockbox (%d)", rr);
+        if (bcm_log_fd >= 0) close(bcm_log_fd);
+        bcm_log_fd = -1;
+        bcm_sync_every = 0; bcm_player_mode = false; bcm_play_path = NULL;
+        backlight_on();
+        lcd_clear_display();
+        lcd_update();
+        return false;
+    }
     if (bcm_dead_seen || (cfg_reboot_end && bcm_log_fd >= 0))
     {
         /* The LCD code spins forever on a dead BCM, so do NOT touch it: save the log and reboot cleanly. */

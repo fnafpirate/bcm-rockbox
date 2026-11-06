@@ -166,6 +166,13 @@ static struct hi_chan *chan_by_type(uint16_t type)
 static int chan_index(const struct hi_chan *c) { return (int)(c - hi.ch); }
 
 /* ------------------------------------------------------------------- attach --- */
+void bcm_host_detach(void)
+{
+    hi.attached = false;
+    hi.gc_wait = false;
+    hi.gfx_wait = false;
+}
+
 int bcm_host_attach(void)
 {
     uint32_t w[4];

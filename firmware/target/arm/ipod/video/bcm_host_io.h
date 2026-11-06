@@ -36,5 +36,6 @@ void bcm_io_idle(void);     /* called while waiting; sleep(1) on target, so poll
 #include <stdbool.h>
 int  bcm_use_vmcs_image(const void *img, unsigned len);   /* 0 ok, -1 no NOR vmcs, -2 BCM not rebooted */
 unsigned bcm_get_boot_info(unsigned snap[4]);             /* VC[0x1F0..0x1FC] right after boot; returns boot count */
+int  bcm_restore_rom_vmcs(void);                          /* v47: power-cycle back to Rockbox's NOR display firmware; 0 ok */
 
 #endif

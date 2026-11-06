@@ -563,6 +563,11 @@ int ft_assemble_path(char *buf, size_t bufsz, const char* currdir, const char* f
     return (int)len;
 }
 
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+extern bool bcm_video_play(const char *path);      /* apps/debug_menu.c */
+extern bool bcm_video_is_video(const char *path);
+#endif
+
 int ft_enter(struct tree_context* c)
 {
     int rc = GO_TO_PREVIOUS;
@@ -588,6 +593,16 @@ int ft_enter(struct tree_context* c)
         int seed = current_tick;
         bool play = false;
         int start_index=0;
+
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+        /* bcm host v47: H.264 videos play on the BCM2722 (apps/debug_menu.c); MENU comes back here, same folder,
+           same file selected */
+        if (bcm_video_is_video(buf))
+        {
+            bcm_video_play(buf);
+            return GO_TO_PREVIOUS;
+        }
+#endif
 
         switch ( file_attr & FILE_ATTR_MASK ) {
             case FILE_ATTR_M3U:

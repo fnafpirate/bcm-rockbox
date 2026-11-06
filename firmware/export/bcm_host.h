@@ -21,6 +21,7 @@
  * Returns 0 on success, <0 on failure (-2: bad info pointer, -3: no gencmd channel,
  * -4: no plausible channel directory). */
 int  bcm_host_attach(void);
+void bcm_host_detach(void);              /* v47: forget the VC (it is being rebooted into another image) */
 
 /* What attach saw, for logging. Valid after any call to bcm_host_attach(). */
 struct bcm_host_diag {

@@ -128,6 +128,8 @@ static struct mutex bcm_io_mtx;
 #ifdef HAVE_LCD_SLEEP
 const fb_data *flash_vmcs_offset;
 unsigned flash_vmcs_length;
+static const fb_data *rom_vmcs_offset;      /* v47: the NOR image Rockbox normally runs, to go back to after a video */
+static unsigned rom_vmcs_length;
 
 #define ROM_BASE        0x20000000
 #define ROM_ID(a,b,c,d) (unsigned int)(  ((unsigned int)(d))        | \
@@ -441,6 +443,31 @@ int bcm_use_vmcs_image(const void *img, unsigned len)
     return (bcm_boot_count != before) ? 0 : -2;
 }
 
+/* v47: back to Rockbox's own display firmware after a video.  The VC runs the stock vmcs.bin, which does not answer
+   the legacy BCMA_COMMAND mailbox, so lcd_sleep()'s bcm_powerdown() would wait forever: cut the BCM power directly,
+   point bcm_init() at the NOR image again and wake the LCD (bootstrap, upload, first LCD update). */
+int bcm_restore_rom_vmcs(void)
+{
+    if (rom_vmcs_length == 0)
+        return -1;
+    BCM_IO_LOCK();
+    tick_remove_task(&lcd_tick);
+    lcd_state.display_on = false;
+    lcd_state.waking = false;
+    GPO32_VAL &= ~0x4000;                              /* BCM power off */
+    BCM_IO_UNLOCK();
+    lcd_state.update_timeout = current_tick;
+    sleep(HZ / 10);                                    /* >= 50 ms off */
+    bcm_io_bad = 0;
+    bcm_lcd_frozen = false;
+    flash_vmcs_offset = rom_vmcs_offset;
+    flash_vmcs_length = rom_vmcs_length;
+    lcd_state.blocked = false;
+    lcd_state.state = LCD_INITIAL;
+    lcd_awake();                                       /* bcm_init() + first LCD update */
+    return lcd_state.display_on ? 0 : -2;
+}
+
 /* VC[0x1F0..0x1FC] as read at the end of the last bcm_init(); returns the number of boots so far. */
 unsigned bcm_get_boot_info(unsigned snap[4])
 {
@@ -502,6 +529,8 @@ void lcd_init_device(void)
     {
         /* lcd_write_data needs an even number of 16 bit values */
         flash_vmcs_length = ((flash_vmcs_length + 3) >> 1) & ~1;
+        rom_vmcs_offset = flash_vmcs_offset;
+        rom_vmcs_length = flash_vmcs_length;
     }
     semaphore_init(&(lcd_state.initwakeup), 1, 0);
     lcd_state.waking = false;
