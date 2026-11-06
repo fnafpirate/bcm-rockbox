@@ -3284,6 +3284,7 @@ static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, c
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_play_secs = 0;                                                       /* v41: 0 = whole file */
 static int cfg_v40 = 1, cfg_post = 0, cfg_framedump = 1;                            /* v40 */
 static int cfg_gfx_seq = 1, cfg_dc_extra = 0, cfg_fbtest = 1;                       /* v38 */
 static int cfg_dc_model = 0, cfg_dc_final = 99, cfg_dc_noinit = 0, cfg_gfx_quick = 1, cfg_pm27 = 1;   /* v37 */
@@ -3360,6 +3361,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "pm27"))     cfg_pm27 = v;
         else if (!strcmp(p, "gfx_seq"))  cfg_gfx_seq = v;
         else if (!strcmp(p, "v40"))      cfg_v40 = v;
+        else if (!strcmp(p, "play_secs")) cfg_play_secs = v;
         else if (!strcmp(p, "post"))     cfg_post = v;
         else if (!strcmp(p, "framedump")) cfg_framedump = v;
         else if (!strcmp(p, "dc_extra")) cfg_dc_extra = v;
@@ -3376,12 +3378,9 @@ static void bcm_load_cfg(void)
 /* v22: the v21 log shows the VC core stops right after it consumes our 0x60 reply (selectplay is answered within 1 ms, then
    nothing: no further gencmd is read, its ack bits for ch0/ch2/ch3 never toggle, none of 6 RAM tick counters moves).
    Which part of the payload kills it is unknown, so each run can try one preset. */
-#define BCM_NVARIANTS 4
+#define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v40 base (Annex B decode config of v39 V2, power=2 twice -> status screen), status screen keeps updating during playback",
-    "1: same, but status-screen updates STOP at mp_play (our layer stays)",
-    "2: same, but our UI window is REMOVED at mp_play (only the video layer remains)",
-    "3: like 2, plus display_control power=2 re-sent 1 s and 4 s after mp_play"
+    "0: v41 PLAYER: Annex B decode, power=2 twice, UI layer + status screen, video on top.  MENU = stop, PLAY = pause/resume, LEFT/RIGHT = seek -/+10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3518,7 +3517,7 @@ static void bcm_vc_dump(const char *tag, uint32_t start, uint32_t len)
 {
     static uint32_t dbuf[1024];
     char path[48]; int fd; uint32_t a; long t0 = current_tick; unsigned n = 0;
-    if (!cfg_dump || bcm_io_dead()) return;
+    if ((!cfg_dump && strcmp(tag, "frame")) || bcm_io_dead()) return;   /* v41: the decoded-frame dump is always allowed */
     snprintf(path, sizeof path, "/.rockbox/vcdump_%s.bin", tag);
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { BLOG("dump: cannot create %s", path); return; }
@@ -3655,7 +3654,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v40 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v41 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3844,6 +3843,31 @@ static void bcm_video_run(int secs)
         bcm_host_service();
         if (bcm_check_dead()) break;
         if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
+        {   /* v41: player controls */
+            static bool paused;
+            int b = button_get_w_tmo(0);
+            if (b != BUTTON_NONE && !(b & (BUTTON_REL | BUTTON_REPEAT)))
+            {
+                char c[48]; int r2;
+                if (b == BUTTON_MENU) { BLOG("  user: MENU -> stop"); break; }
+                if (b == BUTTON_PLAY)
+                {
+                    const char *cmd = paused ? "mp_play" : "mp_pause";
+                    bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(cmd, resp, sizeof resp, 3); bcm_log_text(cmd, r2, resp);
+                    paused = !paused;
+                }
+                if (b == BUTTON_LEFT || b == BUTTON_RIGHT)
+                {
+                    long el = 0; const char *q;
+                    bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 2);
+                    q = strstr(resp, "elapsed=");
+                    if (q) { q += 8; while (*q >= '0' && *q <= '9') el = el * 10 + (*q++ - '0'); }
+                    el += (b == BUTTON_RIGHT) ? 10000 : -10000; if (el < 0) el = 0;
+                    snprintf(c, sizeof c, "mp_seek %ld", el);
+                    bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(c, resp, sizeof resp, 4); bcm_log_text(c, r2, resp);
+                }
+            }
+        }
         if (!TIME_BEFORE(current_tick, next_log))
         {
             BLOG("  video: get_frame=%d sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d",
@@ -4321,7 +4345,7 @@ static void bcm_playback_probe(void)
 
     if (v_live)
     {
-        bcm_video_run(45);                 /* v13: really play for up to 45 s (stops early on PDS stop / end of stream) */
+        bcm_video_run(cfg_play_secs > 0 ? cfg_play_secs : 6 * 3600);   /* v41: whole file by default (MENU stops) */
         BLOG("VIDEO RESULT: get_frame=%d frames_sent=%d bytes=%d empty=%d eos=%d stop=%d", v_getframes, v_frames, v_bytes, v_empty, v_eos, v_stop);
         m4_close();
     }
@@ -4399,7 +4423,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v40, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v41, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
