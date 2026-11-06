@@ -3284,6 +3284,7 @@ static int cfg_si_extra = 1, cfg_si_b20 = 1, cfg_noreply = 0, cfg_minimal = 0, c
 static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_region_h = 240, cfg_pm_play = 0, cfg_disp_all = 0;
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
+static int cfg_gfx_seq = 1, cfg_dc_extra = 0, cfg_fbtest = 1;                       /* v38 */
 static int cfg_dc_model = 0, cfg_dc_final = 99, cfg_dc_noinit = 0, cfg_gfx_quick = 1, cfg_pm27 = 1;   /* v37 */
 static int cfg_gfx_screen = 1;                                                     /* v36 */
 static int cfg_gfx = 0;                                                            /* v34 */
@@ -3356,6 +3357,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "dc_noinit")) cfg_dc_noinit = v;
         else if (!strcmp(p, "gfx_quick")) cfg_gfx_quick = v;
         else if (!strcmp(p, "pm27"))     cfg_pm27 = v;
+        else if (!strcmp(p, "gfx_seq"))  cfg_gfx_seq = v;
+        else if (!strcmp(p, "dc_extra")) cfg_dc_extra = v;
+        else if (!strcmp(p, "fbtest"))   cfg_fbtest = v;
         else if (!strcmp(p, "dump_sdram")) cfg_dump_sdram = v;
         else if (!strcmp(p, "dump_sram")) cfg_dump_sram = v;
         else BLOG("cfg: unknown key '%s'", p);
@@ -3370,10 +3374,10 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 4
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: STOCK ORDER: freeze=0, UI layer, THEN display_control 0 model=<from HW rev> power=-2 (no power=1 before)",
-    "1: power=1 at bring-up as before, then UI layer, then power=-2 (stock first-time 'on')",
-    "2: stock order with power=2 instead of -2",
-    "3: stock order with the OTHER model value (1<->2) and power=-2"
+    "0: model=1 power=2 (the v37 run that lit the panel), then SRAM-FB test + 4 present/commit sequences",
+    "1: model=2 power=2, same tests; DECODER: Annex B frames with SPS+PPS in-band, SPS+PPS as extradata, NAL-size word 3",
+    "2: model=1 power=2 + display_control 0 enabled=1; DECODER: Annex B frames with SPS+PPS in-band, no extradata, NAL-size word 0",
+    "3: model=1 power=-2 then power=2, same tests (AVCC like V0)"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3401,12 +3405,13 @@ static void bcm_apply_variant(void)
     if (v >= BCM_NVARIANTS) v = 0;
     cfg_si_extra = 1; cfg_si_b20 = 1; cfg_noreply = 0; cfg_minimal = 0; cfg_vchr47 = 0; cfg_flags_legacy = 0;
     cfg_region_when = 1; cfg_region_mode = 0; cfg_dc_seq = 0; cfg_vde = 0; cfg_dump = (v == 0); cfg_nolcd = 1;
-    cfg_freeze = 2; cfg_lcdtest = 0; cfg_gfx = 1; cfg_dump = 0; cfg_dc_model = 0; cfg_dc_final = -2; cfg_dc_noinit = 1;
+    cfg_freeze = 2; cfg_lcdtest = 0; cfg_gfx = 1; cfg_dump = 0; cfg_dc_model = 1; cfg_dc_final = 2; cfg_dc_noinit = 1; cfg_dc_extra = 0;
+    cfg_frame_avcc = 1; cfg_si_last = -1;
     switch (v)
     {
-    case 1: cfg_dc_noinit = 0; break;
-    case 2: cfg_dc_final = 2; break;
-    case 3: cfg_dc_model = -1; break;           /* -1 = the other model */
+    case 1: cfg_dc_model = 2; cfg_frame_avcc = 0; cfg_si_extra = 2; break;
+    case 2: cfg_dc_extra = 1; cfg_frame_avcc = 0; cfg_si_extra = 0; cfg_si_last = 0; break;
+    case 3: cfg_dc_extra = 2; break;
     default: break;
     }
     BLOG("VARIANT %s", bcm_variant_name[v]);
@@ -3652,7 +3657,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v37 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v39 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -3663,7 +3668,7 @@ static void bcm_gfx_draw_status(void)
     lcd_fillrect((phase * 8) % (LCD_WIDTH - 40), 200, 40, 20);      /* moves every present: proves updates arrive */
     phase++;
 }
-static void bcm_gfx_present(void)
+static void bcm_gfx_present_m(int mode)
 {
     uint32_t o[4], pl[8], w4[4];
     int back, y;
@@ -3676,11 +3681,17 @@ static void bcm_gfx_present(void)
     {   int verbose = gfx_presents <= 3 || (gfx_presents % 20) == 0;
         if (verbose) BLOG("  gfx present #%d: back image %d (%08x @ VC %08x)", gfx_presents, back, (unsigned)gfx_img[back], (unsigned)gfx_addr[back]);
         bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+        if (verbose || mode >= 0x100) BLOG("    op1 status %08x %08x", (unsigned)o[0], (unsigned)o[1]);
         if (gfx_win[gfx_front])
         {
             memset(w4, 0, sizeof w4); w4[0] = gfx_win[gfx_front];
             bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
             gfx_win[gfx_front] = 0;
+        }
+        if (mode & 2)
+        {
+            uint32_t t[4] = { gfx_img[back], 1, 0, 0 };
+            bcm_gfx_rpc(0x10, t, 8, o, NULL, 300);
         }
         for (y = 0; y < LCD_HEIGHT; y += 16)
         {
@@ -3695,13 +3706,15 @@ static void bcm_gfx_present(void)
                  rb[0], rb[1], rb[2], rb[3], fb[200 * LCD_WIDTH], fb[200 * LCD_WIDTH + 1], fb[200 * LCD_WIDTH + 2], fb[200 * LCD_WIDTH + 3]);
         }
         memset(pl, 0, sizeof pl);
-        pl[1] = 0xffffffceu; pl[3] = gfx_img[back];
+        pl[0] = (mode & 4) ? 2 : 0; pl[1] = (mode & 8) ? 0 : 0xffffffceu; pl[3] = gfx_img[back];
         ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = LCD_HEIGHT;
         if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) gfx_win[back] = o[0];
-        if (verbose) BLOG("    -> window %08x", (unsigned)gfx_win[back]);
+        if (mode & 1) bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+        if (verbose || mode >= 0x100) BLOG("    -> window %08x (mode %x)", (unsigned)gfx_win[back], (unsigned)mode);
     }
     gfx_front = back;
 }
+static void bcm_gfx_present(void) { bcm_gfx_present_m(cfg_gfx_seq); }
 
 static void bcm_gfx_probe(void)
 {
@@ -3837,6 +3850,20 @@ static void bcm_video_run(int secs)
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 1);
             bcm_log_text("mp_get_status", r, resp);
+            {   static int props_done;                 /* v38: what mplayer understood of our stream description, once */
+                if (!props_done)
+                {
+                    static const char * const pc[] = { "mp_get_file_props", "mp_get_file_props video", "mp_get_stats audio" };
+                    int k;
+                    props_done = 1;
+                    for (k = 0; k < 3; k++)
+                    {
+                        bcm_cmd_t0 = current_tick;
+                        r = bcm_gencmd_watched(pc[k], resp, sizeof resp, 2);
+                        bcm_log_text(pc[k], r, resp);
+                    }
+                }
+            }
             next_stat += 5 * HZ;
         }
         sleep(HZ / 100);
@@ -3930,9 +3957,70 @@ static void bcm_display_final(void)
     if (cfg_dc_final == 99 || bcm_io_dead()) return;
     snprintf(cmd, sizeof cmd, "display_control 0 model=%d power=%d", bcm_hw_model(0), cfg_dc_final);
     BLOG("---- v37 final display power command (after the UI layer exists)");
+    if (cfg_dc_extra == 2)
+    {
+        char c2[64]; snprintf(c2, sizeof c2, "display_control 0 model=%d power=-2", bcm_hw_model(0));
+        bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(c2, resp, sizeof resp, 3); bcm_log_text(c2, r, resp);
+        bcm_hold_ms(1500);
+    }
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched(cmd, resp, sizeof resp, 3);
     bcm_log_text(cmd, r, resp);
+    if (cfg_dc_extra == 1)
+    {
+        bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched("display_control 0 enabled=1", resp, sizeof resp, 3);
+        bcm_log_text("display_control 0 enabled=1", r, resp);
+    }
+    BLOG("  >>> LOOK (A, 3 s): panel on? (v37 showed the OLD debug menu + 'booting' splash here)");
+    bcm_hold_ms(3000);
+    if (cfg_fbtest)
+    {
+        /* where does that old picture come from?  The legacy Rockbox FB at SRAM 0xE0000 still holds it after the VC reboot. */
+        static uint16_t row[320];
+        int x, y;
+        for (y = 0; y < 240; y++)
+        {
+            for (x = 0; x < 320; x++) row[x] = (uint16_t)(((x / 20) & 1) ^ ((y / 20) & 1) ? 0x07E0 : 0xF81F);   /* green/magenta checkerboard */
+            bcm_io_lock(); bcm_io_write(0xE0000 + 640 * (unsigned)y, row, sizeof row); bcm_io_unlock();
+            if ((y & 31) == 31) bcm_host_service();
+        }
+        BLOG("  >>> LOOK (B, 3 s): green/magenta CHECKERBOARD written to SRAM 0xE0000 (no kick).  If you see it, the panel is fed from 0xE0000");
+        bcm_hold_ms(3000);
+        bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(cmd, resp, sizeof resp, 3); bcm_log_text(cmd, r, resp);
+        BLOG("  >>> LOOK (C, 3 s): same power command re-sent after the checkerboard write");
+        bcm_hold_ms(3000);
+    }
+    if (gfx_front >= 0)
+    {
+        static const int modes[4] = { 0x100, 0x101, 0x103, 0x109 };
+        static const char * const mname[4] = { "stock (op1, op4, write, op3)", "+ op2 after op3", "+ op 0x10(img,1) before the write + op2",
+                                                "B=0 instead of -50, + op2" };
+        int k;
+        for (k = 0; k < 4; k++)
+        {
+            BLOG("  >>> LOOK (D%d, 3 s): status screen presented with %s", k, mname[k]);
+            bcm_gfx_present_m(modes[k]);
+            bcm_hold_ms(3000);
+        }
+    }
+    {
+        /* v39: decoded lcd_power (vmcs.bin 0xf672): r0 = power + 2 indexes a byte jump table at 0xf744.
+           power=-2: only sets state 2 (no panel access);  power=0: R002=0x400 + GPIO 0x30;  power=1: R100=0x0704 (standby);
+           power=2: display-on ramp (R007 0x31 -> 0x72 -> 0x173); the FIRST time it only sets state 3 and flag [0xeb78+0x1c],
+                    the second time it runs the +0x30 sequence and 0x10c9c (full 320x240 window + GRAM write start);
+           power=4: +0x30 sequence + 0x10c9c directly.  So: power=2 twice, then power=4, each followed by a present. */
+        static const int pw[3] = { 2, 4, 2 };
+        int k;
+        for (k = 0; k < 3; k++)
+        {
+            char c3[64];
+            snprintf(c3, sizeof c3, "display_control 0 model=%d power=%d", bcm_hw_model(0), pw[k]);
+            bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(c3, resp, sizeof resp, 3); bcm_log_text(c3, r, resp);
+            if (gfx_front >= 0) bcm_gfx_present_m(0x101);
+            BLOG("  >>> LOOK (E%d, 3 s): after power=%d + one status-screen present", k, pw[k]);
+            bcm_hold_ms(3000);
+        }
+    }
 }
 static void bcm_display_probe(void)
 {
@@ -4251,7 +4339,7 @@ static bool dbg_bcm_host(void)
 
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v37, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v39, built %s %s", __DATE__, __TIME__);
     BLOG("battery: %d mV, %d%%", battery_voltage(), battery_level());
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
