@@ -17401,3 +17401,20 @@
     ipodvideo: "Widescreen TV"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_SSD_POWEROFF
+  desc: disk menu: how long an SSD (iFlash) stays powered in standby; Off = always
+  user: core
+  <source>
+    *: none
+    ipodvideo: "SSD Power-Off Delay"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "SSD Power-Off Delay"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "SSD Power-Off Delay"
+  </voice>
+</phrase>

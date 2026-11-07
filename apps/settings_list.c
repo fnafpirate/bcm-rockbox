@@ -1648,6 +1648,11 @@ const struct settings_list settings[] = {
 #ifdef HAVE_DISK_STORAGE
     INT_SETTING(F_TIME_SETTING, disk_spindown, LANG_SPINDOWN, 5, "disk spindown",
                     UNIT_SEC, 3, 254, 1, NULL, NULL, STORAGE_FUNCTION(spindown)),
+#if (CONFIG_STORAGE & STORAGE_ATA) && defined(HAVE_ATA_POWER_OFF)
+    INT_SETTING(F_TIME_SETTING, ssd_poweroff, LANG_SSD_POWEROFF, 60, "ssd power off",
+                    UNIT_SEC, 0, 300, 5, formatter_time_unit_0_is_off, getlang_time_unit_0_is_off,
+                    ata_set_ssd_poweroff),
+#endif
 #endif /* HAVE_DISK_STORAGE */
     /* browser */
     TEXT_SETTING(0, start_directory, "start directory", "/", NULL, NULL),

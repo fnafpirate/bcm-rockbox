@@ -536,6 +536,9 @@ struct user_settings
 
 #ifdef HAVE_DISK_STORAGE
     int disk_spindown; /* time until disk spindown, in seconds (0=off) */
+#if (CONFIG_STORAGE & STORAGE_ATA) && defined(HAVE_ATA_POWER_OFF)
+    int ssd_poweroff;  /* SSD power-off delay after standby, seconds (0 = never) */
+#endif
     int buffer_margin; /* audio buffer watermark margin, in seconds */
 #endif
 

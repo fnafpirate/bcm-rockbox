@@ -283,14 +283,18 @@ static int hi_tx(struct hi_chan *c, uint32_t op, uint32_t seq, const void *paylo
 
     uint32_t total = HI_HDR + padded, done = 0;
     int spins = 0;
+    uint32_t t_full = bcm_io_us();
     bcm_io_lock();
     while (done < total) {
         uint32_t n = ring_write(c, buf + done, total - done);
         done += n;
-        if (n) { chan_kick(c); spins = 0; }
+        if (n) { chan_kick(c); spins = 0; t_full = bcm_io_us(); }
         if (done < total) {                               /* ring full: wait for the VC to consume */
             bcm_io_unlock();
-            bcm_io_idle();
+            /* v57: the VC drains the ring within a millisecond or two; a whole tick per wait made every 4 KB VCFS read
+               reply (and so every .vll load) cost ~10 ms per read.  Spin for 20 ms, then sleep. */
+            if (bcm_io_us() - t_full < 20000) { bcm_io_yield(); spins--; }
+            else bcm_io_idle();
             bcm_io_lock();
             c->tx_rd = rd16(hi.base + c->desc + D_TX_RD); /* rt 0x288928 refresh */
             if (++spins > 1000) { bcm_io_unlock(); return -1; }   /* ~10 s at sleep(1) per idle */

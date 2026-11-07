@@ -101,6 +101,13 @@ static long sleep_timeout = 5*HZ;
 static long last_disk_activity = -1;
 #ifdef HAVE_ATA_POWER_OFF
 static long power_off_tick = 0;
+/* v57 (bcm overlay): an SSD (iFlash) wakes from STANDBY in milliseconds, but from power-off it needs ~0.8 s (power up, reset,
+   identify, configure).  Its power-off delay after the standby is settable: 0 = never power it off. */
+static long ssd_power_off_delay = 60 * HZ;
+void ata_set_ssd_poweroff(int seconds)
+{
+    ssd_power_off_delay = seconds > 0 ? seconds * HZ : -1;
+}
 #endif
 
 static uint8_t  multisectors; /* number of supported multisectors */
@@ -680,7 +687,12 @@ void ata_sleepnow(void)
                 ata_state = ATA_SLEEPING;
 #ifdef HAVE_ATA_POWER_OFF
                 if (ata_disk_can_sleep() || canflush) {
-                    power_off_tick = current_tick + ATA_POWER_OFF_TIMEOUT;
+                    if (!ata_disk_isssd())
+                        power_off_tick = current_tick + ATA_POWER_OFF_TIMEOUT;
+                    else if (ssd_power_off_delay > 0)
+                        power_off_tick = current_tick + ssd_power_off_delay;
+                    else
+                        power_off_tick = 0;            /* SSD stays in standby: instant wake */
                 }
 #endif
             }

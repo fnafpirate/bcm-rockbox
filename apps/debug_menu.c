@@ -3622,7 +3622,11 @@ static int cfg_sound = 2, cfg_av_tol = 150, cfg_av_lead = 0, cfg_vol_start = 50,
 static int cfg_asc_n = 2, cfg_av_offset = 0, cfg_av_stall = 7;  /* v53 */
 static int cfg_av_hz = 48000, cfg_av_mix = 1, cfg_vcvol = -1;
 static int cfg_vol_direct = 1;
-static int cfg_tv = -1, cfg_tv_enc = -1, cfg_tv_extra = 0, cfg_tv_osd = 1;   /* v55: force TV on/off, encoding number, 1 = add svideo=1 */
+static int cfg_tv = -1, cfg_tv_enc = -1, cfg_tv_extra = 0, cfg_tv_osd = 1;
+static int cfg_boost = 2;              /* v57: CPU boost 0 never, 1 always, 2 auto */
+static bool av_boosted;
+static long av_boost_until;
+static void av_boost(bool on);   /* v55: force TV on/off, encoding number, 1 = add svideo=1 */
 static int bcm_tv;                     /* v55: this video goes to the TV (display 2) */       /* v54: volume bar written straight into the visible window's image */  /* v53 stock route: codec rate, AUX into the output mixer, mp_setvol after mp_play */
 static int v_sound;                  /* v53: route in use this run (cfg_sound, or 1 after a stall fallback) */
 static bool v_fallback;              /* v53: the stock route stalled -> restart the video with Rockbox's sound */
@@ -3739,6 +3743,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "tv_enc"))   cfg_tv_enc = v;
         else if (!strcmp(p, "tv_extra")) cfg_tv_extra = v;
         else if (!strcmp(p, "tv_osd"))   cfg_tv_osd = v;
+        else if (!strcmp(p, "boost"))    cfg_boost = v;
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
@@ -4109,7 +4114,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v56 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v57 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5283,6 +5288,8 @@ static int bcm_player_input(char *resp, size_t rn)
 {
     int b = button_get_w_tmo(0), base, r2;
     if (b == BUTTON_NONE) return 0;
+    av_boost_until = current_tick + 3 * HZ;            /* v57 */
+    if (!av_boosted && cfg_boost) av_boost(true);
     base = b & ~(BUTTON_REPEAT | BUTTON_REL);
     if (base == BUTTON_RIGHT || base == BUTTON_LEFT)
     {
@@ -5355,6 +5362,24 @@ static void bcm_player_cover(void)
     BLOG("  player: browser picture put on top (image %08x, window %08x)", (unsigned)img, (unsigned)o[0]);
 }
 
+/* v57: CPU boost only while the ARM has real work: the first 10 s (start-up, pre-buffer), while scrubbing and for 3 s after any
+   button.  With the stock sound route the VideoCore decodes picture AND sound; the ARM only reads ~60 KB/s from the disk and
+   copies it over the bus, which the unboosted clock does easily (cfg boost: 0 never, 1 always, 2 auto). */
+static void av_boost(bool on)
+{
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    if (on == av_boosted || (on && cfg_boost == 0)) return;
+    cpu_boost(on); av_boosted = on;
+#else
+    (void)on;
+#endif
+}
+static void av_boost_tick(long run_t0)
+{
+    if (cfg_boost != 2) return;
+    if (sc_active || current_tick - run_t0 < 10 * HZ || v_sound != 2 || TIME_BEFORE(current_tick, av_boost_until)) av_boost(true);
+    else av_boost(false);
+}
 static int bcm_hw_model(int log);
 static void bcm_video_run(int secs)
 {
@@ -5383,11 +5408,12 @@ static void bcm_video_run(int secs)
     if (cfg_post == 3) { pw1 = current_tick + HZ; pw2 = current_tick + 4 * HZ; }
     int gf_last = v_getframes, gf_log = v_getframes, nstat = 0;
     long last_req = current_tick, run_t0 = current_tick, bl_next = current_tick;
-    backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* v47.1: video at full brightness (restored when it ends) */
-    backlight_set_on_button_hold(2);                   /* v50: the hold switch does not turn the screen off while a video plays */
-#ifdef HAVE_ADJUSTABLE_CPU_FREQ
-    cpu_boost(true);                                   /* v51: video feed + AAC decode on the same ARM */
-#endif
+    if (!bcm_tv)
+    {   /* v57: on the TV the iPod's own backlight follows Rockbox's normal timeout (the panel itself stays on) */
+        backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* v47.1: video at full brightness (restored when it ends) */
+        backlight_set_on_button_hold(2);                   /* v50: the hold switch does not turn the screen off while a video plays */
+    }
+    av_boost(true);                                    /* v51: boosted; v57: only while it is needed (av_boost_tick) */
     av_open(bcm_play_path ? bcm_play_path : v_path);   /* v51: sound (starts when the picture moves) */
     backlight_on();
     bool hold_was = button_hold();
@@ -5413,11 +5439,13 @@ static void bcm_video_run(int secs)
             osd_show_for(3000);
         }
         if (!pl_paused && !TIME_BEFORE(current_tick, bl_next))
-        {   /* v47.1: backlight always on while the video plays (paused: Rockbox's own timeout and idle power-off apply) */
+        {   /* v47.1: backlight always on while the video plays (paused: Rockbox's own timeout and idle power-off apply).
+               v57: TV out: only the power-off timer is held off -- the backlight may time out */
             bl_next = current_tick + HZ / 2;
-            backlight_on();
+            if (!bcm_tv) backlight_on();
             reset_poweroff_timer();
         }
+        av_boost_tick(run_t0);
         if (!probed && current_tick - run_t0 > 5 * HZ)
         {   /* v46: once per run, ~5 s in: measure the FF/REW candidates (buttons are not read meanwhile) */
             probed = true; mon_until = 0;
@@ -5494,7 +5522,7 @@ static void bcm_video_run(int secs)
         if (!TIME_BEFORE(current_tick, next_stat))
         {
             int r;
-            bool full = nstat < 4 || nstat % 6 == 0;  /* v45: full dumps at 5..20 s, then every 30 s; one line otherwise */
+            bool full = nstat < 2 || nstat % 12 == 0;  /* v45/v57: full dumps at 5 and 15 s, then every 2 min; one line otherwise */
             nstat++;
             bcm_cmd_t0 = current_tick;
             r = bcm_gencmd_watched("mp_get_stats video", resp, sizeof resp, 1);
@@ -5527,7 +5555,7 @@ static void bcm_video_run(int secs)
             if (full) bcm_log_text("mp_get_status", r, resp);
             else BLOG("  status: elapsed=%d buffering=%d paused=%s", (int)pl_num(resp, "elapsed="), (int)pl_num(resp, "buffering="),
                       strstr(resp, "paused=yes") ? "yes" : "no");
-            if (v_sound == 2 && (full || nstat % 2 == 0))
+            if (v_sound == 2 && full)
             {   /* v53: the VC's own view of the sound */
                 bcm_cmd_t0 = current_tick;
                 r = bcm_gencmd_watched("mp_get_stats audio", resp, sizeof resp, 1);
@@ -5547,7 +5575,7 @@ static void bcm_video_run(int secs)
                     }
                 }
             }
-            next_stat += 5 * HZ;
+            next_stat += nstat < 2 ? 5 * HZ : 10 * HZ;    /* v57: every 10 s after the first two */
         }
         /* v45: keep polling without sleeping while the VC is pulling frames (a request within the last 50 ms);
            sleep a tick only when it has gone quiet (paused, or buffer full) */
@@ -5557,9 +5585,7 @@ static void bcm_video_run(int secs)
     }
     bcm_sync_every = 0;
     av_close();
-#ifdef HAVE_ADJUSTABLE_CPU_FREQ
-    cpu_boost(false);
-#endif
+    av_boost(false);
     backlight_set_on_button_hold(global_settings.backlight_on_button_hold);
     bcm_map_probe();
 }
@@ -6174,7 +6200,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v56, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v57, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
@@ -6316,7 +6342,7 @@ static bool bcm_run(const char *play_path)
             bcm_host_service();
             if (bcm_host_get_stats()->rx_msgs != last_rx) { last_rx = bcm_host_get_stats()->rx_msgs; quiet = current_tick; }
             /* v46 fast start: stop listening once the VC has been quiet for 0.3 s (mplayer.vll is loaded by then) */
-            if (cfg_fast && current_tick - t0 > HZ / 10 && current_tick - quiet > HZ / 10) break;   /* v56: 0.1 s (was 0.3) */
+            if (cfg_fast && (bcm_player_mode || (current_tick - t0 > HZ / 10 && current_tick - quiet > HZ / 10))) break;   /* v56: 0.1 s; v57: player: none (load_application has returned) */
             if (cfg_fast) yield(); else sleep(HZ/100);
         }
         const struct bcm_host_stats *st = bcm_host_get_stats();

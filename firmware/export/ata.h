@@ -131,6 +131,9 @@ struct storage_info;
 
 void ata_enable(bool on);
 void ata_spindown(int seconds);
+#ifdef HAVE_ATA_POWER_OFF
+void ata_set_ssd_poweroff(int seconds);   /* power-off delay after standby for SSDs; 0 = never */
+#endif
 void ata_sleepnow(void);
 /* NOTE: DO NOT use this to poll for disk activity.
          If you are waiting for the disk to become active before
