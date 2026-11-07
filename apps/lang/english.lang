@@ -17231,3 +17231,156 @@
     touchscreen: "Touchscreen Flick Shortcuts"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_VIDEO_OUT
+  desc: in settings menu: video player output to a TV
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Video Out"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Video Out"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Video Out"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_SIGNAL
+  desc: video out: TV standard
+  user: core
+  <source>
+    *: none
+    ipodvideo: "TV Signal"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "TV Signal"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "TV Signal"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_NTSC
+  desc: video out: TV standard
+  user: core
+  <source>
+    *: none
+    ipodvideo: "NTSC"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "NTSC"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "NTSC"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_PAL
+  desc: video out: TV standard
+  user: core
+  <source>
+    *: none
+    ipodvideo: "PAL"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "PAL"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "PAL"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_PICTURE
+  desc: video out: how the video fills the TV
+  user: core
+  <source>
+    *: none
+    ipodvideo: "TV Picture"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "TV Picture"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "TV Picture"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_LETTERBOX
+  desc: video out: keep the aspect ratio
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Letterbox"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Letterbox"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Letterbox"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_FILL
+  desc: video out: stretch to the whole TV
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Fill Screen"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Fill Screen"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Fill Screen"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_ON
+  desc: video out ask menu
+  user: core
+  <source>
+    *: none
+    ipodvideo: "TV On"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "TV On"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "TV On"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_OFF
+  desc: video out ask menu
+  user: core
+  <source>
+    *: none
+    ipodvideo: "TV Off"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "TV Off"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "TV Off"
+  </voice>
+</phrase>

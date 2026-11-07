@@ -1313,6 +1313,15 @@ const struct settings_list settings[] = {
                    settings_apply_videoout, 3,
                    ID2P(LANG_OFF), ID2P(LANG_AUTO), ID2P(LANG_ON)),
 #endif
+#ifdef IPOD_VIDEO
+    /* the video player's TV output (BCM2722 composite / S-video: dock connector and the headphone jack's 4th contact) */
+    CHOICE_SETTING(0, bcm_video_out, LANG_VIDEO_OUT, 2, "video out", "on,ask,off", NULL, 3,
+                   ID2P(LANG_ON), ID2P(LANG_ASK), ID2P(LANG_OFF)),
+    CHOICE_SETTING(0, bcm_tv_signal, LANG_TV_SIGNAL, 0, "tv signal", "ntsc,pal", NULL, 2,
+                   ID2P(LANG_TV_NTSC), ID2P(LANG_TV_PAL)),
+    CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
+                   ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
+#endif
     /* display */
      CHOICE_SETTING(F_TEMPVAR|F_THEMESETTING, cursor_style, LANG_INVERT_CURSOR,
  #ifdef HAVE_LCD_COLOR

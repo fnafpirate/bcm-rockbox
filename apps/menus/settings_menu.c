@@ -837,6 +837,15 @@ static struct browse_folder_info langs = { LANG_DIR, SHOW_LNG };
 MENUITEM_FUNCTION_W_PARAM(browse_langs, 0, ID2P(LANG_LANGUAGE),
                           browse_folder, (void*)&langs, NULL, Icon_Language);
 
+#ifdef IPOD_VIDEO
+/* video player: TV output */
+MENUITEM_SETTING(bcm_video_out_item, &global_settings.bcm_video_out, NULL);
+MENUITEM_SETTING(bcm_tv_signal_item, &global_settings.bcm_tv_signal, NULL);
+MENUITEM_SETTING(bcm_tv_picture_item, &global_settings.bcm_tv_picture, NULL);
+MAKE_MENU(video_out_menu, ID2P(LANG_VIDEO_OUT), 0, Icon_Display_menu,
+          &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_picture_item);
+#endif
+
 MAKE_MENU(settings_menu_item, ID2P(LANG_GENERAL_SETTINGS), 0,
           Icon_General_settings_menu,
           &wps_settings,
@@ -844,7 +853,11 @@ MAKE_MENU(settings_menu_item, ID2P(LANG_GENERAL_SETTINGS), 0,
 #ifdef HAVE_TAGCACHE
           &tagcache_menu,
 #endif
-          &display_menu, &system_menu,
+          &display_menu,
+#ifdef IPOD_VIDEO
+          &video_out_menu,
+#endif
+          &system_menu,
           &startup_shutdown_menu,
           &bookmark_settings_menu,
 #ifdef HAVE_TAGCACHE

@@ -754,6 +754,11 @@ struct user_settings
 #ifdef HAVE_COMPOSITE_VIDEO_OUT
     int composite_video_output;
 #endif
+#ifdef IPOD_VIDEO
+    int bcm_video_out;   /* video player TV output: 0 on, 1 ask, 2 off */
+    int bcm_tv_signal;   /* 0 NTSC, 1 PAL */
+    int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
+#endif
 
 #ifdef HAVE_REMOTE_LCD
     /* remote lcd */
