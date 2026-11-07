@@ -2881,6 +2881,9 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 #include "playlist.h"     /* v51: the video's sound is played by Rockbox's playback engine */
 #include "sound.h"
 #include "pcmbuf.h"
+#include "pcm_mixer.h"    /* v53: the codec's sample rate for the VideoCore's sound */
+#include "wmcodec.h"
+#include "wm8758.h"
 #define BCM_TESTFILE_PATH BCM_VC_ROOT "/../../testfile.txt"   /* -> /.rockbox/testfile.txt: first line = video path */
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
@@ -3064,6 +3067,14 @@ static struct {
     uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first;   /* sample cursor */
     uint32_t stts_i, stts_left, stts_delta; uint64_t dts;
 } m4 = { .fd = -1 };
+/* v53: the AAC track (stock route, see ma_trak) */
+static struct {
+    bool ok;
+    uint32_t timescale, channels, rate, bitrate;
+    uint8_t asc[16]; uint32_t asc_len;
+    uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n; bool co64;
+    uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first, stts_i, stts_left, stts_delta; uint64_t dts;
+} ma;
 
 static uint32_t m4_be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static bool m4_rd(uint32_t off, void *buf, uint32_t n)
@@ -3291,6 +3302,8 @@ static void m4_seek_sample(uint32_t k)
 }
 static uint32_t m4_dur_ms, m4_br;            /* v20: duration (ms) and average bit rate (bit/s) of the whole file */
 
+static bool ma_trak(uint32_t ps, uint32_t pe);   /* v53: audio track (below) */
+static void ma_rewind(void);
 /* 0 = ok, <0 = reason */
 static int mp4_open(const char *path)
 {
@@ -3304,6 +3317,11 @@ static int mp4_open(const char *path)
     fsz = (uint32_t)sz;
     while (m4_box(&pos, fsz, &t, &ps, &pe)) if (t == FOURCC('m','o','o','v')) { moov_s = ps; moov_e = pe; break; }
     if (!moov_e) { m4_close(); return -3; }
+    memset(&ma, 0, sizeof ma);                   /* v53: the AAC track too, if there is one */
+    pos = moov_s;
+    while (m4_box(&pos, moov_e, &t, &ps, &pe))
+        if (t == FOURCC('t','r','a','k') && !ma.ok && ma_trak(ps, pe)) { ma.ok = true; ma_rewind(); break; }
+    if (!ma.ok) memset(&ma, 0, sizeof ma);
     pos = moov_s;
     while (m4_box(&pos, moov_e, &t, &ps, &pe))
         if (t == FOURCC('t','r','a','k') && m4_trak(ps, pe))
@@ -3377,6 +3395,144 @@ static int m4_next(uint32_t *ts_ms, bool *key)
     return o ? (int)o : -1;
 }
 
+
+/* ---- v53: the AAC audio track, for the stock route (sound=2): the stock media layer gives the VC both streams --
+   0x60 stream table with an audio block (type 0, 'AAC\0', bit rate, AudioSpecificConfig bytes, channels, sample rate:
+   RAM snapshot of the stock media object, findings 1.2/3ar) and the get-frame handler (rt 0x20b39c) serves a request
+   for stream -1 with whichever stream is behind.  Samples go out raw (no ADTS header), timestamps in ms. */
+static uint8_t ma_buf[8192];
+static uint32_t ma_desc_len(uint32_t *p)
+{   /* MPEG-4 descriptor length: up to 4 bytes, 7 bits each */
+    uint32_t n = 0; int i;
+    for (i = 0; i < 4; i++) { uint32_t b = m4_u8((*p)++); n = (n << 7) | (b & 0x7f); if (!(b & 0x80)) break; }
+    return n;
+}
+static bool ma_trak(uint32_t ps, uint32_t pe)
+{
+    uint32_t ms, me, a, b, minf_s, minf_e, stbl_s, stbl_e, pos, t, s, e;
+    bool have_esds = false;
+    if (!m4_find(ps, pe, FOURCC('m','d','i','a'), &ms, &me)) return false;
+    if (!m4_find(ms, me, FOURCC('h','d','l','r'), &a, &b) || m4_u32(a + 8) != FOURCC('s','o','u','n')) return false;
+    if (!m4_find(ms, me, FOURCC('m','d','h','d'), &a, &b)) return false;
+    ma.timescale = m4_u8(a) == 1 ? m4_u32(a + 20) : m4_u32(a + 12);
+    if (!ma.timescale) return false;
+    if (!m4_find(ms, me, FOURCC('m','i','n','f'), &minf_s, &minf_e)) return false;
+    if (!m4_find(minf_s, minf_e, FOURCC('s','t','b','l'), &stbl_s, &stbl_e)) return false;
+    pos = stbl_s;
+    while (m4_box(&pos, stbl_e, &t, &s, &e))
+    {
+        if (t == FOURCC('s','t','s','d'))
+        {
+            uint32_t ent = s + 8, esz = m4_u32(ent), cs, ce;
+            if (m4_u32(ent + 4) != FOURCC('m','p','4','a') || esz < 36) return false;
+            ma.channels = m4_u16(ent + 24);
+            ma.rate = m4_u32(ent + 32) >> 16;
+            if (m4_find(ent + 36, ent + esz, FOURCC('e','s','d','s'), &cs, &ce))
+            {
+                uint32_t p = cs + 4, l, end;                         /* skip version/flags */
+                if (m4_u8(p++) == 0x03)                              /* ES_Descriptor */
+                {
+                    l = ma_desc_len(&p); end = p + l; (void)end;
+                    {   uint32_t fl; p += 2; fl = m4_u8(p++);
+                        if (fl & 0x80) p += 2;
+                        if (fl & 0x40) p += 1 + m4_u8(p);
+                        if (fl & 0x20) p += 2;
+                    }
+                    if (m4_u8(p++) == 0x04)                          /* DecoderConfigDescriptor */
+                    {
+                        l = ma_desc_len(&p);
+                        ma.bitrate = m4_u32(p + 9);                  /* avgBitrate */
+                        if (!ma.bitrate) ma.bitrate = m4_u32(p + 5);
+                        p += 13;
+                        if (m4_u8(p++) == 0x05)                      /* DecoderSpecificInfo = AudioSpecificConfig */
+                        {
+                            uint32_t k;
+                            l = ma_desc_len(&p);
+                            ma.asc_len = l < sizeof ma.asc ? l : sizeof ma.asc;
+                            for (k = 0; k < ma.asc_len; k++) ma.asc[k] = (uint8_t)m4_u8(p + k);
+                            have_esds = ma.asc_len >= 2;
+                        }
+                    }
+                }
+            }
+        }
+        else if (t == FOURCC('s','t','t','s')) { ma.stts = s + 8; ma.stts_n = m4_u32(s + 4); }
+        else if (t == FOURCC('s','t','s','c')) { ma.stsc = s + 8; ma.stsc_n = m4_u32(s + 4); }
+        else if (t == FOURCC('s','t','s','z')) { ma.stsz_fixed = m4_u32(s + 4); ma.stsz_n = m4_u32(s + 8); ma.stsz = s + 12; }
+        else if (t == FOURCC('s','t','c','o')) { ma.stco = s + 8; ma.stco_n = m4_u32(s + 4); ma.co64 = false; }
+        else if (t == FOURCC('c','o','6','4')) { ma.stco = s + 8; ma.stco_n = m4_u32(s + 4); ma.co64 = true; }
+    }
+    return have_esds && ma.stts_n && ma.stsc_n && ma.stsz_n && ma.stco_n;
+}
+static void ma_rewind(void)
+{
+    ma.idx = 0; ma.chunk = 1; ma.s_in_chunk = 0; ma.off_in_chunk = 0; ma.stsc_i = 0;
+    ma.spc = m4_u32(ma.stsc + 4); if (!ma.spc) ma.spc = 1;
+    ma.next_first = ma.stsc_n > 1 ? m4_u32(ma.stsc + 12) : 0xffffffffu;
+    ma.stts_i = 0; ma.stts_left = m4_u32(ma.stts); ma.stts_delta = m4_u32(ma.stts + 4); ma.dts = 0;
+}
+/* put the cursor on the first sample at or after ms */
+static void ma_seek_ms(uint32_t ms)
+{
+    uint64_t want = (uint64_t)ms * ma.timescale / 1000, tt = 0; uint32_t i, base = 0, k = 0, chunk, first_sample = 0, spc, nf, j;
+    for (i = 0; i < ma.stts_n; i++)
+    {
+        uint32_t c = m4_u32(ma.stts + 8 * i), dl = m4_u32(ma.stts + 8 * i + 4);
+        if (dl && want < tt + (uint64_t)c * dl) { k = base + (uint32_t)((want - tt + dl - 1) / dl); break; }
+        tt += (uint64_t)c * dl; base += c; k = base;
+    }
+    if (k >= ma.stsz_n) k = ma.stsz_n ? ma.stsz_n - 1 : 0;
+    ma_rewind();
+    for (i = 0; i < ma.stsc_n; i++)
+    {
+        uint32_t fc = m4_u32(ma.stsc + 12 * i);
+        spc = m4_u32(ma.stsc + 12 * i + 4); if (!spc) spc = 1;
+        nf = (i + 1 < ma.stsc_n) ? m4_u32(ma.stsc + 12 * (i + 1)) : 0xffffffffu;
+        if (nf != 0xffffffffu && k >= first_sample + (nf - fc) * spc) { first_sample += (nf - fc) * spc; continue; }
+        chunk = fc + (k - first_sample) / spc;
+        ma.stsc_i = i; ma.spc = spc; ma.next_first = nf;
+        ma.chunk = chunk; ma.s_in_chunk = (k - first_sample) % spc; ma.off_in_chunk = 0;
+        for (j = k - ma.s_in_chunk; j < k; j++) ma.off_in_chunk += ma.stsz_fixed ? ma.stsz_fixed : m4_u32(ma.stsz + 4 * j);
+        break;
+    }
+    ma.idx = k;
+    {   uint64_t t2 = 0; uint32_t b2 = 0;
+        for (i = 0; i < ma.stts_n; i++)
+        {
+            uint32_t c = m4_u32(ma.stts + 8 * i), dl = m4_u32(ma.stts + 8 * i + 4);
+            if (k < b2 + c) { ma.stts_i = i; ma.stts_left = b2 + c - k; ma.stts_delta = dl; ma.dts = t2 + (uint64_t)(k - b2) * dl; break; }
+            t2 += (uint64_t)c * dl; b2 += c;
+        }
+    }
+}
+static uint32_t ma_next_ts(void) { return ma.ok && ma.idx < ma.stsz_n ? (uint32_t)(ma.dts * 1000ULL / ma.timescale) : 0xffffffffu; }
+static uint32_t m4_next_ts(void) { return m4.idx < m4.stsz_n ? (uint32_t)(m4.dts * 1000ULL / m4.timescale) : 0xffffffffu; }
+/* next audio sample into ma_buf: length, 0 at the end, -1 skipped */
+static int ma_next(uint32_t *ts_ms)
+{
+    uint32_t size, coff, off;
+    if (!ma.ok || ma.idx >= ma.stsz_n || ma.chunk > ma.stco_n) return 0;
+    size = ma.stsz_fixed ? ma.stsz_fixed : m4_u32(ma.stsz + 4 * ma.idx);
+    coff = ma.co64 ? m4_u32(ma.stco + 8 * (ma.chunk - 1) + 4) : m4_u32(ma.stco + 4 * (ma.chunk - 1));
+    off = coff + ma.off_in_chunk;
+    *ts_ms = (uint32_t)(ma.dts * 1000ULL / ma.timescale);
+    ma.idx++; ma.off_in_chunk += size;
+    if (++ma.s_in_chunk >= ma.spc)
+    {
+        ma.chunk++; ma.s_in_chunk = 0; ma.off_in_chunk = 0;
+        if (ma.chunk >= ma.next_first && ma.stsc_i + 1 < ma.stsc_n)
+        {
+            ma.stsc_i++; ma.spc = m4_u32(ma.stsc + 12 * ma.stsc_i + 4); if (!ma.spc) ma.spc = 1;
+            ma.next_first = ma.stsc_i + 1 < ma.stsc_n ? m4_u32(ma.stsc + 12 * (ma.stsc_i + 1)) : 0xffffffffu;
+        }
+    }
+    ma.dts += ma.stts_delta;
+    if (ma.stts_left && --ma.stts_left == 0 && ma.stts_i + 1 < ma.stts_n)
+    { ma.stts_i++; ma.stts_left = m4_u32(ma.stts + 8 * ma.stts_i); ma.stts_delta = m4_u32(ma.stts + 8 * ma.stts_i + 4); }
+    if (size == 0 || size > sizeof ma_buf || !m4_rdd(off, ma_buf, size)) return -1;
+    return (int)size;
+}
+
 /* v14: the opcode-0x60 stream description the stock firmware sends before playback (rt 0x288f40, serialiser
    rt 0xc8770). 0x520 bytes = 328 words:
      w0  stream count            w1  [r4+0xc] (unknown; 0 here)     w2..w6  constants 1,0,1,1,0     w7 unused
@@ -3441,7 +3597,11 @@ static int cfg_osd = 1, cfg_osd_layer = 100;                                    
 static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
 static int cfg_ff_accel = 1;                                                        /* v47 */
-static int cfg_sound = 1, cfg_av_tol = 150, cfg_av_lead = 0, cfg_vol_start = 50, cfg_vol_step = 2;  /* v51 */
+static int cfg_sound = 2, cfg_av_tol = 150, cfg_av_lead = 0, cfg_vol_start = 50, cfg_vol_step = 3;  /* v51 (v53: sound 2 = stock route) */
+static int cfg_asc_n = 2, cfg_av_offset = 0, cfg_av_stall = 7;  /* v53 */
+static int cfg_av_hz = 48000, cfg_av_mix = 1, cfg_vcvol = -1;  /* v53 stock route: codec rate, AUX into the output mixer, mp_setvol after mp_play */
+static int v_sound;                  /* v53: route in use this run (cfg_sound, or 1 after a stall fallback) */
+static bool v_fallback;              /* v53: the stock route stalled -> restart the video with Rockbox's sound */
 static int cfg_av_ready = 8;                       /* v52: PCM chunks buffered before the sound counts as ready */
 static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
@@ -3544,6 +3704,12 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "av_tol"))   cfg_av_tol = v < 40 ? 40 : v;
         else if (!strcmp(p, "av_lead"))  cfg_av_lead = v;
         else if (!strcmp(p, "av_ready")) cfg_av_ready = v;
+        else if (!strcmp(p, "asc_n"))    cfg_asc_n = v;
+        else if (!strcmp(p, "av_offset")) cfg_av_offset = v;
+        else if (!strcmp(p, "av_stall")) cfg_av_stall = v;
+        else if (!strcmp(p, "av_hz"))    cfg_av_hz = v;
+        else if (!strcmp(p, "av_mix"))   cfg_av_mix = v;
+        else if (!strcmp(p, "vcvol"))    cfg_vcvol = v;
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
@@ -3635,6 +3801,30 @@ static int bcm_send_stream_info(void)
     si_words[i++] = 0;                                 /* key bits (0 = none) */
     i += 32 + 16;                                      /* key + IV, zero */
     si_words[i++] = cfg_si_last >= 0 ? (uint32_t)cfg_si_last : (uint32_t)(m4.nal_len - 1);   /* stock: avcC lengthSizeMinusOne (3) */
+    if (v_sound == 2 && ma.ok)
+    {   /* v53: the stock route -- the AAC track as a second block (stream id 1), laid out like the stock RAM snapshot:
+           type 0, 'AAC\0', bit rate, 0, N, N AudioSpecificConfig bytes (one per word), channels, sample rate,
+           b20 = 1, b21 = 0, key bits 0, 48 words key + IV, last word 0 */
+        uint32_t k, n = ma.asc_len;
+        if (cfg_asc_n > 0 && n > (uint32_t)cfg_asc_n) n = (uint32_t)cfg_asc_n;
+        si_words[0] = 2;
+        si_words[i++] = 0;
+        si_words[i++] = 0x00414143;                    /* 'AAC\0' */
+        si_words[i++] = ma.bitrate ? ma.bitrate : 128000;
+        si_words[i++] = 0;
+        si_words[i++] = n;
+        for (k = 0; k < n; k++) si_words[i++] = ma.asc[k];
+        si_words[i++] = ma.channels;
+        si_words[i++] = ma.rate;
+        si_words[i++] = 1;
+        si_words[i++] = 0;
+        si_words[i++] = 0;
+        i += 32 + 16;
+        si_words[i++] = 0;
+        BLOG("stream info (0x60): + AAC block (stream 1): %u Hz, %u ch, %u bit/s, ASC %u of %u bytes %02x %02x %02x %02x %02x",
+             (unsigned)ma.rate, (unsigned)ma.channels, (unsigned)ma.bitrate, (unsigned)n, (unsigned)ma.asc_len,
+             ma.asc[0], ma.asc[1], ma.asc[2], ma.asc[3], ma.asc[4]);
+    }
     BLOG("stream info (0x60): extradata=%u bytes (si_extra=%d) b20=%d; duration_ms=%u bit_rate=%u; %u words used, w8..: %08x %08x %08x %08x %08x %08x %08x",
          (unsigned)m4.avcc_len * (cfg_si_extra == 1) + (unsigned)m4.ps_len * (cfg_si_extra == 2), cfg_si_extra, cfg_si_b20,
          (unsigned)si_words[1], (unsigned)si_words[10], (unsigned)i, (unsigned)si_words[8], (unsigned)si_words[9], (unsigned)si_words[10], (unsigned)si_words[11],
@@ -3647,6 +3837,8 @@ static int bcm_send_stream_info(void)
    logged for the first frames so the next run can correct them. Video only -- audio (AAC) is NOT fed;
    any request for a stream other than the video one is answered "nothing" (send_empty). */
 static int v_frames, v_bytes, v_getframes, v_empty, v_eos, v_seeks, v_skips;
+static int a_frames, a_bytes, a_eos, a_req;   /* v53: AAC fed to the VC (stock route) */
+static uint32_t a_last_ts;
 static char v_path[MAX_PATH];        /* v51: the video being played (for the sound) */
 /* v46 trick feed: while tf_dir != 0 each request gets the next KEY frame in that direction (tf_jump ms on), real timestamps */
 static int tf_dir, tf_fed;
@@ -3658,6 +3850,8 @@ static void v_start(int id, uint32_t w1)
 {
     BLOG("  PDS start: object=%d w1=%08x", id, (unsigned)w1);
     m4_rewind();
+    if (ma.ok) ma_rewind();
+    a_frames = a_bytes = 0;
     if (cfg_reply_ms > 0) sleep(cfg_reply_ms * HZ / 1000 ? cfg_reply_ms * HZ / 1000 : 1);
     /* v15: the 0x60 stream description is the REPLY to this 0x41 (seq echoed) -- the VC waits for it. */
     bcm_variant_commit();
@@ -3671,6 +3865,29 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     v_getframes++;
     if (v_getframes <= 12)
         BLOG("  PDS get_frame #%d: cur_stream=%d w1=%08x w2=%08x", v_getframes, id, (unsigned)w1, (unsigned)w2);
+    if (v_sound == 2 && ma.ok && !tf_dir && (want == 1 || want == -1))
+    {   /* v53: stock rt 0x20b39c -- "any stream" gets the one that is behind (lower next timestamp) */
+        uint32_t ta = ma_next_ts(), tv = m4_next_ts();
+        if (want == 1 || (ta != 0xffffffffu && ta <= tv))
+        {
+            a_req++;
+            do n = ma_next(&ts); while (n < 0 && ++tries < 8);
+            if (n <= 0)
+            {
+                if (!a_eos) BLOG("  audio: end of the AAC track after %d frames", a_frames);
+                a_eos++; bcm_pds_send_empty();
+                return;
+            }
+            memset(&f, 0, sizeof f);
+            f.stream_id = 1; f.f2 = 1; f.f4 = ts;      /* stock: audio f2 = 1, f4 = time */
+            f.length = (uint32_t)n; f.data = ma_buf;
+            r = bcm_pds_send_frame(&f);
+            a_frames++; a_bytes += n; a_last_ts = ts;
+            if (a_frames <= 6 || a_frames % 2000 == 0 || r < 0)
+                BLOG("  aac #%d len=%d ts=%ums send=%d (want=%d)", a_frames, n, (unsigned)ts, r, want);
+            return;
+        }
+    }
     if (want != -1 && want != 0)                        /* not the video stream (assumed 0 or "any") */
     {
         v_empty++; bcm_pds_send_empty();
@@ -3705,9 +3922,10 @@ static void v_seek(int id, uint32_t pos)
 {
     uint32_t k, kms;
     v_seeks++;
-    if (pos == 0) { m4_rewind(); m4.need_ps = true; BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
+    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
     k = m4_key_at(pos, &kms);                          /* v42: pos = milliseconds (it is the mp_seek argument) */
     m4_seek_sample(k);
+    if (ma.ok) { ma_seek_ms(kms); a_eos = 0; }         /* v53: the sound restarts at the key frame too */
     BLOG("  PDS seek: stream=%d pos=%u ms -> key frame sample %u at %u ms (chunk %u +%u)", id, (unsigned)pos, (unsigned)k, (unsigned)kms,
          (unsigned)m4.chunk, (unsigned)m4.off_in_chunk);
 }
@@ -3861,7 +4079,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v52 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v53 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4165,7 +4383,8 @@ static char pl_title[40];
 static int pl_buffering = -1;
 static uint16_t osd_row[320 * 2];
 static int av_vol_pct;                 /* v51: volume 0..100 % (audio section below) */
-static long av_vol_until;
+static long av_vol_until, av_vol_drawn;
+static bool av_vol_dirty;
 /* scrubber */
 enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5 };
 static const char * const sm_name[6] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step" };
@@ -4346,7 +4565,8 @@ static void osd_upload(struct osd_strip *s, int back)
         if ((y & 7) == 7) bcm_host_service();
     }
 }
-static void osd_present(void)
+/* v53: mask = which strips to redraw (1 icon, 2 battery, 4 bottom); the volume bar redraws only the bottom strip */
+static void osd_present_mask(int mask)
 {
     uint32_t o[4], pl[8], w4[4];
     int k, back[OSD_NS];
@@ -4355,18 +4575,20 @@ static void osd_present(void)
     for (k = 0; k < OSD_NS; k++)
     {
         back[k] = osd_s[k].front < 0 ? 0 : 1 - osd_s[k].front;
-        osd_upload(&osd_s[k], back[k]);
+        if (mask & (1 << k)) osd_upload(&osd_s[k], back[k]);
     }
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
     for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
+        if (!(mask & (1 << k))) continue;
         if (s->front >= 0 && s->win[s->front])
         { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
     }
     for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
+        if (!(mask & (1 << k))) continue;
         memset(pl, 0, sizeof pl);
         pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[back[k]];
         ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
@@ -4376,6 +4598,8 @@ static void osd_present(void)
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = true;
 }
+static bool osd_vol_only;              /* v53: only the volume bar is up (the wheel was turned while the overlay was hidden) */
+static void osd_present(void) { osd_vol_only = false; osd_present_mask(7); }
 static void osd_hide(void)
 {
     uint32_t o[4], w4[4];
@@ -4389,7 +4613,7 @@ static void osd_hide(void)
         { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
     }
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
-    osd_visible = false;
+    osd_visible = false; osd_vol_only = false;
 }
 static void osd_init(void)
 {
@@ -4614,9 +4838,9 @@ static uint32_t av_vc_elapsed(void)
     return pl_num(r, "elapsed=");
 }
 static uint32_t av_rb_elapsed(void)
-{
+{   /* v53: + av_offset ms (positive = treat the sound as later, i.e. it is played earlier) */
     struct mp3entry *id3 = audio_current_track();
-    return id3 ? (uint32_t)id3->elapsed : 0xffffffffu;
+    return id3 ? (uint32_t)((int32_t)id3->elapsed + cfg_av_offset) : 0xffffffffu;
 }
 static void av_wait_ms(long ms)
 {
@@ -4642,6 +4866,32 @@ static void av_prep(uint32_t t, bool video_paused_by_us)
     av_state = AV_PREP; av_prep_t0 = current_tick; av_v_last = 0xffffffffu; av_next = current_tick;
     BLOG("  audio: sound paused at %u ms, waiting for the picture%s", (unsigned)t, video_paused_by_us ? " (picture held)" : "");
 }
+/* v53: route 2 (stock): the VideoCore decodes and plays the AAC itself; Rockbox's playback is stopped and only the codec is
+   set up -- volume (same 0..100 % scale and limit), sample rate (mplayer opens its output at 48 kHz) and, as an experiment for
+   the unknown wiring, the WM8758's AUX inputs mixed into the output (cfg av_mix). */
+static bool av_vc_route;
+static unsigned int av_hz_saved;
+static void av_codec_vc(bool on)
+{
+    if (on)
+    {
+        av_hz_saved = mixer_get_frequency();
+        if (cfg_av_hz > 0) mixer_set_frequency((unsigned)cfg_av_hz);
+        if (cfg_av_mix & 1)
+        {   /* R50/R51: DAC + AUX (AUXxMIXVOL 5 = 0 dB) */
+            wmcodec_write(LOUTMIX, LOUTMIX_DACL2LMIX | (1 << 5) | (5 << 6));
+            wmcodec_write(ROUTMIX, ROUTMIX_DACR2RMIX | (1 << 5) | (5 << 6));
+        }
+        BLOG("  audio: VideoCore route -- codec at %u Hz (was %u), AUX mix %s", mixer_get_frequency(), av_hz_saved,
+             (cfg_av_mix & 1) ? "on" : "off");
+    }
+    else
+    {
+        if (cfg_av_mix & 1) { wmcodec_write(LOUTMIX, LOUTMIX_DACL2LMIX); wmcodec_write(ROUTMIX, ROUTMIX_DACR2RMIX); }
+        if (av_hz_saved) mixer_set_frequency(av_hz_saved);
+        av_hz_saved = 0;
+    }
+}
 static void av_open(const char *path)
 {
     char dir[MAX_PATH], *sl;
@@ -4649,18 +4899,32 @@ static void av_open(const char *path)
     if (!cfg_sound || !path) return;
     av_vol_saved = global_status.volume;
     av_set_vol(cfg_vol_start);
+    if (v_sound == 2)
+    {
+        audio_stop();
+        av_vc_route = true;
+        av_codec_vc(true);
+        BLOG("  audio: the VideoCore plays the AAC track (stock route); volume %d %% = %d dB (limit %d dB)", av_vol_pct,
+             global_status.volume, global_settings.volume_limit);
+        return;
+    }
     snprintf(dir, sizeof dir, "%s", path);
     sl = strrchr(dir, '/'); if (sl) *sl = 0;
     audio_stop();
     if (playlist_create(dir, NULL) < 0 || playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST, false, true) < 0)
     { BLOG("  audio: playlist for %s failed -- no sound", path); return; }
     av_have = true;
-    BLOG("  audio: Rockbox decodes the AAC track; volume %d %% = %d dB (limit %d dB)", av_vol_pct, global_status.volume,
-         global_settings.volume_limit);
+    BLOG("  audio: Rockbox decodes the AAC track; volume %d %% = %d dB (limit %d dB); mixer %u Hz", av_vol_pct, global_status.volume,
+         global_settings.volume_limit, mixer_get_frequency());
     av_prep(0, false);
 }
 static void av_close(void)
 {
+    if (av_vc_route)
+    {
+        av_codec_vc(false); av_vc_route = false;
+        if (!av_have) { global_status.volume = av_vol_saved; setvol(); BLOG("  audio: volume back to %d dB", av_vol_saved); }
+    }
     if (!av_have) return;
     audio_stop();
     global_status.volume = av_vol_saved; setvol();
@@ -4709,6 +4973,16 @@ static void av_tick(void)
         else       { pl_cmd("mp_play", false); av_wait_ms(-d); audio_resume(); }
         BLOG("  audio: released together at picture %u / sound %u ms (gap %+d ms, pcm descs %d, %ld ms after prep)",
              (unsigned)v, (unsigned)a, d, pcmbuf_used_descs(), (current_tick - av_prep_t0) * 1000 / HZ);
+        {   static bool id3_done;                      /* v53: what Rockbox thinks it is playing (the "too fast" report) */
+            struct mp3entry *id3 = audio_current_track();
+            if (id3 && !id3_done)
+            {
+                id3_done = true;
+                BLOG("  audio: Rockbox track: codec %d, %lu Hz, %lu kbit/s, length %lu ms, upsampling corr %d; mixer %u Hz",
+                     (int)id3->codectype, (unsigned long)id3->frequency, (unsigned long)id3->bitrate, (unsigned long)id3->length,
+                     (int)id3->needs_upsampling_correction, mixer_get_frequency());
+            }
+        }
         av_vpaused = false;
         av_state = AV_RUN; av_next = current_tick + 2 * HZ; av_a_last = 0xffffffffu;
         return;
@@ -4859,13 +5133,22 @@ static void bcm_osd_tick(void)
     scrub_tick();
     mon_tick();
     av_tick();
+    if (av_vol_dirty && current_tick - av_vol_drawn >= HZ / 10 && cfg_osd)
+    {   /* v53: volume bar */
+        av_vol_dirty = false; av_vol_drawn = current_tick;
+        if (osd_ok < 0) osd_init();
+        if (!osd_visible) osd_vol_only = true;
+        osd_present_mask(4);
+        if (!pl_paused && !sc_active && (!osd_hide_at || TIME_BEFORE(osd_hide_at, av_vol_until))) osd_hide_at = av_vol_until;
+        osd_next = current_tick + HZ;
+    }
     if (!osd_visible || sc_active) return;
     if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused) { osd_hide(); return; }
     if (!TIME_BEFORE(current_tick, osd_next))
     {
         osd_next = current_tick + HZ;
         pl_status();
-        osd_present();
+        if (osd_vol_only) osd_present_mask(4); else osd_present();
     }
 }
 /* returns 1 when the user wants to stop.  The wheel is the volume (v51), never seeking. */
@@ -4891,11 +5174,16 @@ static int bcm_player_input(char *resp, size_t rn)
         return 0;
     }
     if (base == BUTTON_SCROLL_FWD || base == BUTTON_SCROLL_BACK)
-    {   /* v51: the wheel is the volume, like stock; the stock volume bar shows for 3 s */
+    {   /* v51: the wheel is the volume, like stock.  v53: applied at once (the codec volume is one register write);
+           fast turning takes bigger steps; the stock volume bar is redrawn at most 10x/s from bcm_osd_tick, only the
+           bottom strip (v51 redrew all three strips + read the status on every click: ~0.2 s per click) */
+        static long last_scroll;
+        int step = current_tick - last_scroll < HZ / 12 ? cfg_vol_step * 2 : cfg_vol_step;
         if (b & BUTTON_REL) return 0;
-        av_set_vol(av_vol_pct + (base == BUTTON_SCROLL_FWD ? cfg_vol_step : -cfg_vol_step));
-        av_vol_until = current_tick + 3 * HZ;
-        osd_show_for(3000);
+        last_scroll = current_tick;
+        av_set_vol(av_vol_pct + (base == BUTTON_SCROLL_FWD ? step : -step));
+        av_vol_until = current_tick + 2 * HZ;
+        av_vol_dirty = true;
         return 0;
     }
     if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
@@ -4977,6 +5265,12 @@ static void bcm_video_run(int secs)
     backlight_on();
     bool hold_was = button_hold();
     bool probed = !cfg_trickprobe;
+    bool av_checked = false;
+    if (v_sound == 2 && cfg_vcvol >= 0)
+    {   char c[24]; int r2;
+        snprintf(c, sizeof c, "mp_setvol %d", cfg_vcvol);
+        bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(c, resp, sizeof resp, 2); bcm_log_text(c, r2, resp);
+    }
     mon_start("mp_play (start-up pre-buffer)");
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
@@ -5009,11 +5303,31 @@ static void bcm_video_run(int secs)
             break;
         }
         bcm_osd_tick();
+        if (v_sound == 2 && !av_checked && current_tick - run_t0 > cfg_av_stall * HZ && !pl_paused && !sc_active)
+        {   /* v53: does the stock route run?  The VC's clock follows its sound output: no sound output = no clock = no picture */
+            uint32_t e = av_vc_elapsed();
+            av_checked = true;
+            BLOG("  audio check (stock route) %d s in: VC elapsed %u ms, AAC frames sent %d (asked %d, %d B, last ts %u ms)", cfg_av_stall,
+                 (unsigned)e, a_frames, a_req, a_bytes, (unsigned)a_last_ts);
+            if (e != 0xffffffffu && e < 1000)
+            {
+                BLOG("  audio: the picture does not move with the VC's sound -> restarting with Rockbox's sound (sound=1)");
+                v_fallback = true;
+                break;
+            }
+            if (a_frames == 0)
+            {   int pct = av_vol_pct;
+                BLOG("  audio: the VC plays the picture but never asked for sound -> Rockbox plays it (sound=1)");
+                av_close(); v_sound = 1; av_open(bcm_play_path ? bcm_play_path : v_path); av_set_vol(pct);
+            }
+        }
         if (!TIME_BEFORE(current_tick, next_log))
         {
             BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d  cache misses: tables %u data %u",
                  v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
             gf_log = v_getframes;
+            if (v_sound == 2 && ma.ok)
+                BLOG("  sound (VC): aac frames=%d (%d B) last ts=%u ms asked=%d eos=%d", a_frames, a_bytes, (unsigned)a_last_ts, a_req, a_eos);
             /* v47.1: backlight + power-off timer are now kept alive below, only while the video is not paused */
             next_log += 2 * HZ;
         }
@@ -5069,6 +5383,12 @@ static void bcm_video_run(int secs)
             if (full) bcm_log_text("mp_get_status", r, resp);
             else BLOG("  status: elapsed=%d buffering=%d paused=%s", (int)pl_num(resp, "elapsed="), (int)pl_num(resp, "buffering="),
                       strstr(resp, "paused=yes") ? "yes" : "no");
+            if (v_sound == 2 && (full || nstat % 2 == 0))
+            {   /* v53: the VC's own view of the sound */
+                bcm_cmd_t0 = current_tick;
+                r = bcm_gencmd_watched("mp_get_stats audio", resp, sizeof resp, 1);
+                bcm_log_text("mp_get_stats audio", r, resp);
+            }
             {   static int props_done;                 /* v38: what mplayer understood of our stream description, once */
                 if (!props_done)
                 {
@@ -5472,7 +5792,15 @@ static void bcm_playback_probe(void)
                 bcm_sync_every = cfg_log_sync * HZ;      /* v45: frames start flowing at mp_selectplay (pre-buffer) */
             }
             bcm_pds_map_stream(0, cfg_map);                 /* type 1 (video) -> buffer A (cap 0x10000, stock); audio would be B */
-            BLOG("REAL VIDEO FEED enabled (video stream only, no audio)");
+            v_sound = cfg_sound; v_fallback = false;
+            if (v_sound == 2 && !ma.ok) { BLOG("no AAC track found -- no VC sound"); v_sound = cfg_sound ? 1 : 0; }
+            if (v_sound == 2)
+            {
+                bcm_pds_map_stream(1, 1);                   /* v53: stream 1 (AAC) -> buffer B (cap 0x4000), like stock */
+                BLOG("REAL VIDEO FEED enabled: H.264 stream 0 + AAC stream 1 (%u Hz, %u ch) -- the VideoCore plays the sound (stock route)",
+                     (unsigned)ma.rate, (unsigned)ma.channels);
+            }
+            else BLOG("REAL VIDEO FEED enabled (video stream only; sound=%d)", v_sound);
         }
         else
         {
@@ -5481,6 +5809,7 @@ static void bcm_playback_probe(void)
         }
     }
     bcm_step("mp_region");
+again:
     bcm_setvol();                                      /* v28: stock order: mp_setvol 0, audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_audio_enable();                                /* v27: stock order: audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay (cfg pm, default off since v20) */
@@ -5530,6 +5859,18 @@ static void bcm_playback_probe(void)
     {
         bcm_video_run(cfg_play_secs > 0 ? cfg_play_secs : 6 * 3600);   /* v41: whole file by default (MENU stops) */
         BLOG("VIDEO RESULT: get_frame=%d frames_sent=%d bytes=%d empty=%d eos=%d stop=%d", v_getframes, v_frames, v_bytes, v_empty, v_eos, v_stop);
+        if (v_fallback)
+        {   /* v53: stop, then the same start-up again with one stream (Rockbox plays the sound) */
+            long t;
+            v_fallback = false; v_sound = 1;
+            bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched("mp_stop", resp, sizeof resp, 3); bcm_log_text("mp_stop", r, resp);
+            for (t = current_tick + HZ / 2; TIME_BEFORE(current_tick, t); ) { bcm_host_service(); yield(); }
+            m4_rewind(); m4.need_ps = true;
+            v_stop = false; v_eos = 0; v_eos_tick = 0; v_frames = v_bytes = v_getframes = v_empty = v_seeks = v_skips = 0;
+            pl_paused = false; tf_dir = 0;
+            BLOG("restart: mp_selectplay again with the video stream only");
+            goto again;
+        }
         m4_close();
     }
     else
@@ -5633,7 +5974,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v52, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v53, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
