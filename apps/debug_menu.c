@@ -2878,6 +2878,8 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 #define BCM_VC_ROOT    "/.rockbox/vc"
 #define BCM_VMCS_PATH  BCM_VC_ROOT "/Resources/VideoCore/Boot/vmcs.bin"
 #define BCM_LOG_PATH   "/bcm_host_log.txt"
+#include "playlist.h"     /* v51: the video's sound is played by Rockbox's playback engine */
+#include "sound.h"
 #define BCM_TESTFILE_PATH BCM_VC_ROOT "/../../testfile.txt"   /* -> /.rockbox/testfile.txt: first line = video path */
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
@@ -3438,6 +3440,7 @@ static int cfg_osd = 1, cfg_osd_layer = 100;                                    
 static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
 static int cfg_ff_accel = 1;                                                        /* v47 */
+static int cfg_sound = 1, cfg_av_tol = 120, cfg_av_lead = 0, cfg_vol_start = 50, cfg_vol_step = 2;  /* v51 */
 static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
@@ -3535,6 +3538,11 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "m4cache"))  cfg_m4cache = v;
         else if (!strcmp(p, "fast"))     cfg_fast = v;
         else if (!strcmp(p, "ff_accel")) cfg_ff_accel = v;
+        else if (!strcmp(p, "sound"))    cfg_sound = v;
+        else if (!strcmp(p, "av_tol"))   cfg_av_tol = v < 40 ? 40 : v;
+        else if (!strcmp(p, "av_lead"))  cfg_av_lead = v;
+        else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
+        else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
         else if (!strcmp(p, "probe_ms")) cfg_probe_ms = v < 500 ? 500 : v;
         else if (!strcmp(p, "jump_tick")) cfg_jump_tick = v < 300 ? 300 : v;
@@ -3557,7 +3565,7 @@ static void bcm_load_cfg(void)
    Which part of the payload kills it is unknown, so each run can try one preset. */
 #define BCM_NVARIANTS 1
 static const char * const bcm_variant_name[BCM_NVARIANTS] = {
-    "0: v50 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
+    "0: v51 PLAYER: Annex B decode, power=2 twice, video on top, stock overlay.  MENU = stop, PLAY = pause, SELECT = overlay, hold >>| / |<< = FF / REW, tap = +/-10 s"
 };
 static int bcm_variant_next = -1;               /* v25: counter value to store once the variant has really been exercised */
 static void bcm_variant_commit(void)
@@ -3636,6 +3644,7 @@ static int bcm_send_stream_info(void)
    logged for the first frames so the next run can correct them. Video only -- audio (AAC) is NOT fed;
    any request for a stream other than the video one is answered "nothing" (send_empty). */
 static int v_frames, v_bytes, v_getframes, v_empty, v_eos, v_seeks, v_skips;
+static char v_path[MAX_PATH];        /* v51: the video being played (for the sound) */
 /* v46 trick feed: while tf_dir != 0 each request gets the next KEY frame in that direction (tf_jump ms on), real timestamps */
 static int tf_dir, tf_fed;
 static uint32_t tf_cur, tf_jump = 2000;
@@ -3849,7 +3858,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v50 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v51 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4032,10 +4041,11 @@ static void bcm_mid_probe(void)
      jump  fallback: a seek to the next key frame every second while playing
    Release always ends with mp_play + mp_seek to the key frame that was on screen (Disp time). */
 #define VUI_PATH "/.rockbox/bcm_video_ui.bin"
-enum { VUI_FILL = 0, VUI_FRAME, VUI_PLAY, VUI_PAUSE, VUI_FF, VUI_REW, VUI_D0 = 10, VUI_MINUS = 20, VUI_COLON, VUI_LOCK, VUI_N };
+enum { VUI_FILL = 0, VUI_FRAME, VUI_PLAY, VUI_PAUSE, VUI_FF, VUI_REW, VUI_D0 = 10, VUI_MINUS = 20, VUI_COLON, VUI_LOCK,
+       VUI_SPK_LO, VUI_SPK_HI, VUI_VOL_FRAME, VUI_VOL_FILL, VUI_N };   /* v51: 23..26 = stock volume view 22060 */
 struct vui_bmp { uint16_t w, h; const uint16_t *px; };
 static struct vui_bmp vui[VUI_N];
-static uint8_t vui_buf[48 * 1024] __attribute__((aligned(4)));
+static uint8_t vui_buf[80 * 1024] __attribute__((aligned(4)));
 static int vui_state = -1;                      /* -1 not tried, 0 missing, 1 loaded */
 static void vui_load(void)
 {
@@ -4151,6 +4161,8 @@ static uint32_t pl_dur_ms, pl_el_ms, pl_target_ms;
 static char pl_title[40];
 static int pl_buffering = -1;
 static uint16_t osd_row[320 * 2];
+static int av_vol_pct;                 /* v51: volume 0..100 % (audio section below) */
+static long av_vol_until;
 /* scrubber */
 enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5 };
 static const char * const sm_name[6] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step" };
@@ -4268,6 +4280,25 @@ static void osd_draw(void)
         }
     }
     cv_tint = 0xFFFFFF;
+    if (av_vol_until && TIME_BEFORE(current_tick, av_vol_until))
+    {   /* v51: stock volume view 22060 instead of the progress bar: speaker, 246x24 bar, loud speaker */
+        int vf = 246 * av_vol_pct / 100;
+        if (vui_state == 1 && vui[VUI_VOL_FRAME].px && vui[VUI_VOL_FILL].px)
+        {
+            cv_blit(&c2, 13, 6, VUI_SPK_LO, -1);
+            cv_blit(&c2, 37, 6, VUI_VOL_FRAME, -1);
+            if (vf > 0) cv_blit(&c2, 37, 6, VUI_VOL_FILL, vf);
+            cv_blit(&c2, 287, 6, VUI_SPK_HI, -1);
+        }
+        else
+        {
+            cv_fill(&c2, 37, 10, 246, 16, 0x60000000);
+            cv_fill(&c2, 37, 10, 246, 2, 0xFFE8E8E8); cv_fill(&c2, 37, 24, 246, 2, 0xFFE8E8E8);
+            cv_fill(&c2, 37, 10, 2, 16, 0xFFE8E8E8); cv_fill(&c2, 281, 10, 2, 16, 0xFFE8E8E8);
+            if (vf > 4) cv_fill(&c2, 39, 12, vf - 4, 12, 0xE0F4F4F4);
+        }
+        return;
+    }
     /* bottom panel: progress bar (frame, then the fill cut at the position), elapsed left, remaining right */
     if (pl_dur_ms && shown > pl_dur_ms) shown = pl_dur_ms;
     rem = pl_dur_ms > shown ? pl_dur_ms - shown : 0;
@@ -4529,6 +4560,144 @@ static void bcm_trick_probe(void)
     BLOG("---- trick probe done: FF uses \"%s\", REW uses \"%s\"", sm_name[sm_ff], sm_name[sm_rew]);
 }
 
+
+/* ---------------------------------------------------------------- v51: audio + A/V sync ----
+   Sound: the file's AAC track is played by Rockbox's own playback engine on the ARM (the same decoder as for .m4a music),
+   started when the VC's clock starts and kept on the VC clock: every second the VC's elapsed (mp_get_status) and Rockbox's
+   elapsed (audio_current_track()->elapsed) are compared; when they differ by more than av_tol ms the side that is ahead
+   is paused for the difference (audio_pause/resume, or mp_pause/mp_play).  Pause, FF/REW and taps pause the sound; when
+   the picture moves again the sound is moved to the picture time (audio_ff_rewind) and resumed.
+   Why not the stock route: the stock firmware sends the AAC stream to the VC too (media_open_streams rt 0x20af74 puts the
+   AudioSpecificConfig into the 0x60 stream table, get-frame rt 0x20b39c serves "whichever stream is behind") and mplayer
+   plays it with vmcs.bin's audio_play* (48 kHz) -- but how the BCM's audio reaches the WM8758 (which is the I2S clock
+   master to the PP5022 in Rockbox) is not known yet, so that route is left for a later experiment (findings 3ar).
+   Volume: starts at vol_start % (default 50) of the range up to Rockbox's own volume limit; the click wheel changes it,
+   with the stock volume bar (bitmaps 21924/21925/21928/21929, view 22060).  Your previous volume comes back afterwards. */
+enum { AV_OFF = 0, AV_WAIT, AV_RUN };
+static int av_state, av_fixes, av_vol_saved;
+static long av_next;
+static uint32_t av_v_last, av_a_last;
+static int av_checks;
+static bool av_have;
+static int av_pct_to_vol(int p)
+{
+    int mn = sound_min(SOUND_VOLUME), lim = global_settings.volume_limit, lo;
+    if (lim > sound_max(SOUND_VOLUME) || lim < mn) lim = sound_max(SOUND_VOLUME);
+    lo = mn > -60 ? mn : -60;
+    if (p <= 0) return mn;
+    if (p > 100) p = 100;
+    return lo + (lim - lo) * p / 100;
+}
+static void av_set_vol(int p)
+{
+    av_vol_pct = p < 0 ? 0 : p > 100 ? 100 : p;
+    global_status.volume = av_pct_to_vol(av_vol_pct);
+    setvol();
+}
+static uint32_t av_vc_elapsed(void)
+{
+    static char r[400];
+    bcm_cmd_t0 = current_tick;
+    if (bcm_gencmd_watched("mp_get_status", r, sizeof r, 2) < 0) return 0xffffffffu;
+    return pl_num(r, "elapsed=");
+}
+static uint32_t av_rb_elapsed(void)
+{
+    struct mp3entry *id3 = audio_current_track();
+    return id3 ? (uint32_t)id3->elapsed : 0xffffffffu;
+}
+/* start: build a one-file playlist (the Rockbox playlist is replaced, like playing a song from the browser) */
+static void av_open(const char *path)
+{
+    char dir[MAX_PATH], *sl;
+    av_state = AV_OFF; av_have = false; av_fixes = 0;
+    if (!cfg_sound || !path) return;
+    av_vol_saved = global_status.volume;
+    av_set_vol(cfg_vol_start);
+    snprintf(dir, sizeof dir, "%s", path);
+    sl = strrchr(dir, '/'); if (sl) *sl = 0;
+    audio_stop();
+    if (playlist_create(dir, NULL) < 0 || playlist_insert_track(NULL, path, PLAYLIST_INSERT_LAST, false, true) < 0)
+    { BLOG("  audio: playlist for %s failed -- no sound", path); return; }
+    av_have = true; av_state = AV_WAIT; av_next = current_tick;
+    BLOG("  audio: Rockbox will decode the AAC track; volume %d %% = %d dB (limit %d dB)", av_vol_pct, global_status.volume,
+         global_settings.volume_limit);
+}
+static void av_close(void)
+{
+    if (!av_have) return;
+    audio_stop();
+    global_status.volume = av_vol_saved; setvol();
+    BLOG("  audio: stopped after %d sync corrections; volume back to %d dB", av_fixes, av_vol_saved);
+    av_have = false; av_state = AV_OFF;
+}
+/* the picture is about to stop or jump: hold the sound, resync once the VC clock runs again */
+static void av_hold(void)
+{
+    if (!av_have) return;
+    if (audio_status() & AUDIO_STATUS_PLAY) audio_pause();
+    av_state = AV_WAIT; av_v_last = 0xffffffffu; av_next = current_tick + HZ / 5;
+}
+static void av_tick(void)
+{
+    uint32_t v, a; int d;
+    if (!av_have || pl_paused || sc_active || TIME_BEFORE(current_tick, av_next)) return;
+    if (av_state == AV_WAIT)
+    {   /* start / resume the sound when the VC's clock moves (two readings, rising) */
+        av_next = current_tick + HZ / 10;
+        v = av_vc_elapsed();
+        if (v == 0xffffffffu) return;
+        if (av_v_last != 0xffffffffu && v > av_v_last)
+        {
+            uint32_t at = v + (uint32_t)cfg_av_lead;
+            if (!(audio_status() & AUDIO_STATUS_PLAY))
+                playlist_start(0, at, 0);                /* first start: decode from the picture's time */
+            else
+            {
+                audio_ff_rewind((long)at);
+                audio_resume();
+            }
+            BLOG("  audio: picture moving at %u ms -> sound started at %u ms", (unsigned)v, (unsigned)at);
+            av_state = AV_RUN; av_next = current_tick + HZ; av_a_last = 0xffffffffu;
+        }
+        av_v_last = v;
+        return;
+    }
+    /* AV_RUN: compare once a second */
+    av_next = current_tick + HZ;
+    if (!(audio_status() & AUDIO_STATUS_PLAY) || (audio_status() & AUDIO_STATUS_PAUSE)) return;
+    v = av_vc_elapsed(); a = av_rb_elapsed();
+    if (v == 0xffffffffu || a == 0xffffffffu || a == 0) return;
+    if (a == av_a_last) return;                        /* Rockbox still buffering / loading the codec: not playing yet */
+    av_a_last = a;
+    d = (int)(a - v);
+    if (++av_checks <= 5 || av_checks % 30 == 0)
+        BLOG("  audio check: picture %u ms, sound %u ms (%+d ms)", (unsigned)v, (unsigned)a, d);
+    if (d > cfg_av_tol || d < -cfg_av_tol)
+    {
+        long t;
+        if (d > 2000 || d < -2000)
+        {   /* far off (e.g. the audio engine jumped): move the sound to the picture */
+            audio_ff_rewind((long)v + cfg_av_lead);
+        }
+        else if (d > 0)
+        {   /* sound ahead: hold it */
+            audio_pause();
+            for (t = current_tick + (d * HZ) / 1000; TIME_BEFORE(current_tick, t); ) { bcm_host_service(); yield(); }
+            audio_resume();
+        }
+        else
+        {   /* picture ahead: hold it */
+            pl_cmd("mp_pause", false);
+            for (t = current_tick + (-d * HZ) / 1000; TIME_BEFORE(current_tick, t); ) { bcm_host_service(); yield(); }
+            pl_cmd("mp_play", false);
+        }
+        av_fixes++;
+        if (av_fixes <= 20 || av_fixes % 20 == 0)
+            BLOG("  audio sync #%d: picture %u ms, sound %u ms (%+d ms) -> corrected", av_fixes, (unsigned)v, (unsigned)a, d);
+    }
+}
+
 /* ---- scrubbing */
 static uint32_t sc_speed_jump(long held)
 {   /* ms of video per second of holding: 4x, 10x, 30x, 90x */
@@ -4544,6 +4713,7 @@ static void scrub_begin(int dir)
     sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : (dir > 0 ? sm_ff : sm_rew);
     if (sc_method == SM_STEP && dir < 0) sc_method = SM_JUMP;
     BLOG("  scrub: %s held at %u ms, method %s", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, sm_name[sc_method]);
+    av_hold();
     if (sc_method == SM_FF || sc_method == SM_FFK)
     {
         if (sc_method == SM_FFK)
@@ -4622,6 +4792,7 @@ static void scrub_end(void)
     else if (sc_method == SM_SEEKSTEP && sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
     BLOG("  scrub: released at %u ms after %d ticks (%s)", (unsigned)sc_pos, sc_ticks, sm_name[sc_method]);
     pl_el_ms = sc_pos;
+    av_hold();                                         /* sound follows when the picture moves again */
     mon_start("scrub released");
     osd_show_for(pl_paused ? 0 : 3000);
 }
@@ -4631,6 +4802,7 @@ static void pl_tap(int dir)
     if (cfg_tap_secs <= 0) return;
     pl_status();
     k = pl_key_step(pl_el_ms, dir, (uint32_t)cfg_tap_secs * 1000u);
+    av_hold();
     snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
     pl_cmd(c, true);
     pl_el_ms = k; pl_target_ms = k;
@@ -4644,6 +4816,7 @@ static void bcm_osd_tick(void)
     if (sc_active && !sc_btn) scrub_end();
     scrub_tick();
     mon_tick();
+    av_tick();
     if (!osd_visible || sc_active) return;
     if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused) { osd_hide(); return; }
     if (!TIME_BEFORE(current_tick, osd_next))
@@ -4653,7 +4826,7 @@ static void bcm_osd_tick(void)
         osd_present();
     }
 }
-/* returns 1 when the user wants to stop.  The wheel is ignored (no seeking with the wheel). */
+/* returns 1 when the user wants to stop.  The wheel is the volume (v51), never seeking. */
 static int bcm_player_input(char *resp, size_t rn)
 {
     int b = button_get_w_tmo(0), base, r2;
@@ -4675,14 +4848,23 @@ static int bcm_player_input(char *resp, size_t rn)
             scrub_begin(base == BUTTON_RIGHT ? 1 : -1);
         return 0;
     }
+    if (base == BUTTON_SCROLL_FWD || base == BUTTON_SCROLL_BACK)
+    {   /* v51: the wheel is the volume, like stock; the stock volume bar shows for 3 s */
+        if (b & BUTTON_REL) return 0;
+        av_set_vol(av_vol_pct + (base == BUTTON_SCROLL_FWD ? cfg_vol_step : -cfg_vol_step));
+        av_vol_until = current_tick + 3 * HZ;
+        osd_show_for(3000);
+        return 0;
+    }
     if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
     if (b == BUTTON_MENU) return 1;
     if (b == BUTTON_PLAY)
     {
         const char *cmd = pl_paused ? "mp_play" : "mp_pause";
+        if (!pl_paused) av_hold();                     /* pausing: hold the sound now */
         bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(cmd, resp, rn, 3); bcm_log_text(cmd, r2, resp);
         pl_paused = !pl_paused;
-        if (!pl_paused) mon_start("PLAY -> mp_play");
+        if (!pl_paused) mon_start("PLAY -> mp_play");  /* resuming: av_tick restarts the sound when the picture moves */
         osd_show_for(pl_paused ? 0 : 3000);
     }
     else if (b == BUTTON_SELECT)
@@ -4746,6 +4928,10 @@ static void bcm_video_run(int secs)
     long last_req = current_tick, run_t0 = current_tick, bl_next = current_tick;
     backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* v47.1: video at full brightness (restored when it ends) */
     backlight_set_on_button_hold(2);                   /* v50: the hold switch does not turn the screen off while a video plays */
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    cpu_boost(true);                                   /* v51: video feed + AAC decode on the same ARM */
+#endif
+    av_open(bcm_play_path ? bcm_play_path : v_path);   /* v51: sound (starts when the picture moves) */
     backlight_on();
     bool hold_was = button_hold();
     bool probed = !cfg_trickprobe;
@@ -4864,6 +5050,10 @@ static void bcm_video_run(int secs)
         else sleep(1);
     }
     bcm_sync_every = 0;
+    av_close();
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    cpu_boost(false);
+#endif
     backlight_set_on_button_hold(global_settings.backlight_on_button_hold);
     bcm_map_probe();
 }
@@ -5204,6 +5394,7 @@ static void bcm_playback_probe(void)
     if (r <= 0) { BLOG("testfile.txt is empty"); return; }
     video[r] = 0;
     for (i = 0; i < r; i++) if (video[i] == '\r' || video[i] == '\n') { video[i] = 0; break; }
+    snprintf(v_path, sizeof v_path, "%s", video);
     BLOG("playback probe: test video = %s", video);
 
     BLOG("opening test video from Rockbox...");    /* progress marker: if the log stops right
@@ -5367,6 +5558,7 @@ static void bcm_reset_run_state(void)
     for (k = 0; k < OSD_NS; k++) { osd_s[k].front = -1; memset(osd_s[k].win, 0, sizeof osd_s[k].win); }
     pl_paused = false; pl_el_ms = 0; pl_dur_ms = 0; pl_target_ms = 0;
     sc_active = false; sc_btn = 0; mon_until = 0;
+    av_have = false; av_state = 0; av_vol_until = 0;
     m4c_miss = m4d_miss = 0;
 }
 static bool bcm_run(const char *play_path);
@@ -5399,7 +5591,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v50, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v51, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
