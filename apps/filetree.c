@@ -565,7 +565,30 @@ int ft_assemble_path(char *buf, size_t bufsz, const char* currdir, const char* f
 
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
 extern bool bcm_video_play(const char *path);      /* apps/debug_menu.c */
+extern bool bcm_video_play_again(const char *path);
 extern bool bcm_video_is_video(const char *path);
+extern int bcm_video_next_request;
+/* v63: a dock / remote asked for the next (+1) or previous (-1) video: the neighbouring video file of this folder
+   (wrapping round), selected in the browser and played; 0 = none */
+static bool ft_video_neighbour(struct tree_context *c, int dir, char *buf, size_t n)
+{
+    int count = c->filesindir, i, k;
+    for (k = 1; k < count; k++)
+    {
+        struct entry *e;
+        i = ((c->selected_item + dir * k) % count + count) % count;
+        e = tree_get_entry_at(c, i);
+        if (!e || (e->attr & ATTR_DIRECTORY))
+            continue;
+        ft_assemble_path(buf, n, c->currdir, e->name);
+        if (bcm_video_is_video(buf))
+        {
+            c->selected_item = i;
+            return true;
+        }
+    }
+    return false;
+}
 #endif
 
 int ft_enter(struct tree_context* c)
@@ -599,7 +622,12 @@ int ft_enter(struct tree_context* c)
            same file selected */
         if (bcm_video_is_video(buf))
         {
+            int guard = 0;
             bcm_video_play(buf);
+            while (bcm_video_next_request && guard++ < 1000
+                   && ft_video_neighbour(c, bcm_video_next_request, buf, sizeof buf))
+                bcm_video_play_again(buf);              /* v63 */
+            bcm_video_next_request = 0;
             return GO_TO_PREVIOUS;
         }
 #endif

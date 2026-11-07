@@ -89,6 +89,8 @@ void adc_init(void)
 #if defined(IPOD_VIDEO) || defined(IPOD_NANO)
     adcdata[ADC_4066_ISTAT].channelnum = 7;
     adcdata[ADC_4066_ISTAT].timeout = 0;
+    adcdata[ADC_BATTERY_SUBTR].channelnum = 3;   /* ADCIN1, subtractor (as Apple's firmware) */
+    adcdata[ADC_BATTERY_SUBTR].timeout = 0;
 #endif
     _adc_read(adc_battery);
 }

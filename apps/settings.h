@@ -762,6 +762,7 @@ struct user_settings
     int bcm_tv_signal;   /* 0 NTSC, 1 PAL */
     int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
     bool bcm_tv_wide;    /* the TV is 16:9 (stock "Widescreen") */
+    int battery_reading; /* 0 smooth (stock-like), 1 exact (Rockbox) */
 #endif
 
 #ifdef HAVE_REMOTE_LCD
@@ -802,6 +803,9 @@ struct user_settings
 #endif
 #ifdef HAVE_ACCESSORY_SUPPLY
     bool accessory_supply; /* 0=off 1=on, accessory power supply for iPod */
+#endif
+#if defined(IPOD_ACCESSORY_PROTOCOL) && defined(IPOD_VIDEO)
+    int accessory_id;      /* bcm overlay v62: what iAP reports: 0 iPod video 5.5G (like Apple), 1 iPod classic (Rockbox) */
 #endif
 #ifdef HAVE_LINEOUT_POWEROFF
     bool lineout_active;

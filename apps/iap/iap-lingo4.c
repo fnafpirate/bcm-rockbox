@@ -1552,6 +1552,18 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
             unsigned long time_total = id3->length;
             unsigned long time_elapsed = id3->elapsed;
             int status = audio_status();
+#ifdef IPOD_VIDEO
+            {   /* v63: a video is playing: its length, position and state (3 = FF, 4 = REW) */
+                uint32_t vl, vp; int vs;
+                if (bcm_video_status(&vl, &vp, &vs)) {
+                    put_u32(&data[3], vl);
+                    put_u32(&data[7], vp);
+                    data[11] = vs;
+                    iap_send_pkt(data, sizeof(data));
+                    break;
+                }
+            }
+#endif
             put_u32(&data[3], time_total);
             put_u32(&data[7], time_elapsed);
             if (status == AUDIO_STATUS_PLAY)
@@ -2066,6 +2078,22 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
              * Reserved             0x0A - 0xFF
              *
              */
+#ifdef IPOD_VIDEO
+            /* v63: a video is playing: the codes control it (car video kits, AV docks) */
+            CHECKLEN(4);
+            if (IAP_VIDEO_ACTIVE())
+            {
+                static const unsigned char map[12] = { 0, IAPV_TOGGLE, IAPV_STOP, IAPV_NEXT, IAPV_PREV, IAPV_FF,
+                    IAPV_REW, IAPV_FFREW_END, IAPV_CH_NEXT, IAPV_CH_PREV, IAPV_PLAY, IAPV_PAUSE };
+                if (buf[3] == 0 || buf[3] >= sizeof(map)) {
+                    cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                    break;
+                }
+                bcm_video_remote(map[buf[3]], 0);
+                cmd_ok(cmd);
+                break;
+            }
+#endif
             switch(buf[3])
             {
                 case 0x01: /* play/pause */

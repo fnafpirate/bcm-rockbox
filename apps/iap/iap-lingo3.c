@@ -261,7 +261,7 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
             device.trackpos_ms = iap_get_trackpos();
             device.track_index = iap_get_trackindex();
             device.chapter_index = 0;
-            device.play_status = audio_status();
+            device.play_status = iap_play_status();
             /* TODO: Fix this */
             device.mute = false;
             device.volume = global_status.volume;
@@ -375,8 +375,8 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
                  */
                 case 0x00:
                 {
-                    id3 = audio_current_track();
-                    IAP_TX_PUT_U32(id3->elapsed);
+                    (void)id3;
+                    IAP_TX_PUT_U32(iap_get_trackpos());   /* v63: the video's position while one plays */
 
                     iap_send_tx();
                     break;
@@ -416,7 +416,7 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
                 {
                     /* TODO: Handle FF/REW
                      */
-                    play_status = audio_status();
+                    play_status = iap_play_status();
                     if (play_status & AUDIO_STATUS_PLAY) {
                         if (play_status & AUDIO_STATUS_PAUSE) {
                             IAP_TX_PUT(0x02);
@@ -728,6 +728,15 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
                 case 0x03:
                 {
                     CHECKLEN(4);
+#ifdef IPOD_VIDEO
+                    /* v63: stop / play / pause the video while one plays */
+                    if (IAP_VIDEO_ACTIVE() && buf[0x03] <= 2) {
+                        static const unsigned char m[3] = { IAPV_STOP, IAPV_PLAY, IAPV_PAUSE };
+                        bcm_video_remote(m[buf[0x03]], 0);
+                        cmd_ok(cmd);
+                        break;
+                    }
+#endif
                     switch(buf[0x03])
                     {
                         case 0x00:
@@ -763,6 +772,22 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
                 case 0x04:
                 {
                     CHECKLEN(5);
+#ifdef IPOD_VIDEO
+                    /* v63: while a video plays the dock's volume / mute go to the video player */
+                    if (IAP_VIDEO_ACTIVE()) {
+                        if (buf[0x03] == 0x00) {
+                            if (device.mute)
+                                bcm_video_remote(IAPV_MUTE, 0);
+                            bcm_video_remote(IAPV_VOL_SET, (buf[0x04] * 100 + 127) / 255);
+                            device.mute = false;
+                        } else if (!device.mute) {
+                            bcm_video_remote(IAPV_MUTE, 0);
+                            device.mute = true;
+                        }
+                        cmd_ok(cmd);
+                        break;
+                    }
+#endif
                     if (buf[0x03]==0x00){
                         /* Not Muted */
                         global_status.volume = (int) (buf[0x04]/2.65625)-90;
@@ -991,7 +1016,7 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
 
             IAP_TX_INIT(0x03, 0x10);
 
-            play_status = audio_status();
+            play_status = iap_play_status();
 
             if (play_status & AUDIO_STATUS_PLAY) {
                 /* Playing or paused */

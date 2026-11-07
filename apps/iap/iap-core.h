@@ -28,6 +28,36 @@
 //#define LOGF_ENABLE
 #include "logf.h"
 
+#ifdef IPOD_VIDEO
+/* bcm overlay v62: what the iPod tells accessories it is.  Settings > General Settings > System > Accessory Identity:
+   "iPod video" (default) answers like Apple's own 5.5G firmware 1.3 -- the model ID is the hardware revision word
+   (0x000B0005 30 GB, 0x000B0006 60/80 GB), so accessories made for this iPod use their iPod-video path (video out
+   without authentication, which this generation never had); "iPod classic" keeps Rockbox's usual 160 GB classic. */
+uint32_t iap_ident_model(void);
+const char *iap_ident_variant(void);
+int iap_ident_fw(int part);
+bool iap_ident_stock(void);
+#define IAP_IPOD_MODEL           iap_ident_model()
+#define IAP_IPOD_VARIANT         iap_ident_variant()
+#define IAP_IPOD_FIRMWARE_MAJOR  iap_ident_fw(0)
+#define IAP_IPOD_FIRMWARE_MINOR  iap_ident_fw(1)
+#define IAP_IPOD_FIRMWARE_REV    iap_ident_fw(2)
+/* the accessory-identify resistor (dock pin 21), read the way Apple's firmware does: 0..15, 15 = nothing there */
+extern int iap_acc_id_code;
+int iap_acc_id_read(void);
+void iap_video_prefs_restore(void);
+/* v63: the dock / remotes control the video player (apps/debug_menu.c) while a video plays */
+enum { IAPV_TOGGLE = 1, IAPV_PLAY, IAPV_PAUSE, IAPV_STOP, IAPV_NEXT, IAPV_PREV, IAPV_FF, IAPV_REW, IAPV_FFREW_END,
+       IAPV_VOL_UP, IAPV_VOL_DOWN, IAPV_VOL_SET, IAPV_MUTE, IAPV_CH_NEXT, IAPV_CH_PREV, IAPV_OSD };
+bool bcm_video_active(void);
+int bcm_video_remote(int cmd, int arg);
+bool bcm_video_status(uint32_t *len_ms, uint32_t *pos_ms, int *state);
+#define IAP_VIDEO_ACTIVE() bcm_video_active()
+/* audio_status() as the accessory should see it: the video's play state while one plays */
+int iap_play_status(void);
+#else
+#define IAP_VIDEO_ACTIVE() false
+#define iap_play_status() audio_status()
 /* The Model ID of the iPod we emulate. Currently a 160GB classic */
 #define IAP_IPOD_MODEL (0x00130200U)
 #define IAP_IPOD_VARIANT "MC293"
@@ -36,6 +66,7 @@
 #define IAP_IPOD_FIRMWARE_MAJOR (2)
 #define IAP_IPOD_FIRMWARE_MINOR (0)
 #define IAP_IPOD_FIRMWARE_REV   (3)
+#endif
 
 /* Status code for IAP ack messages */
 #define IAP_ACK_OK          (0x00)  /* Success */

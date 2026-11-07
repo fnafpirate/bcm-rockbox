@@ -1069,6 +1069,31 @@ static bool view_battery(void)
                     x = (adc_read(ADC_4066_ISTAT) * 2400) / (1024 * 3);
                 lcd_putsf(0, 8, "Ibat: %d mA", x);
                 lcd_putsf(0, 9, "Vbat * Ibat: %d mW", x * y / 1000);
+#ifdef HAVE_BATTERY_SMOOTH_API
+                {   /* bcm overlay v58: the smoothed reading */
+                    struct battery_smooth_info bi;
+                    battery_smooth_info(&bi);
+                    lcd_putsf(0, 11, "Reading: %s  shown %d %%", bi.enabled ? "smooth" : "exact", battery_level());
+                    lcd_putsf(0, 12, "Exact %d %%  compensated %d.%d %%", bi.raw_percent,
+                              bi.est_permille / 10, bi.est_permille % 10);
+                    lcd_putsf(0, 13, "Battery resistance: %d mOhm", bi.resistance_mohm);
+                    lcd_putsf(0, 14, "Drop mV  light %d%s  boost %d%s", bi.sag_mv[0], bi.loads & 1 ? "*" : "",
+                              bi.sag_mv[1], bi.loads & 2 ? "*" : "");
+                    lcd_putsf(0, 15, "         play %d%s  video %d%s", bi.sag_mv[2], bi.loads & 4 ? "*" : "",
+                              bi.sag_mv[3], bi.loads & 8 ? "*" : "");
+                    lcd_putsf(0, 16, "Measured %d / %d / %d / %d times", bi.measured[0], bi.measured[1],
+                              bi.measured[2], bi.measured[3]);
+                    /* v59: Apple's ADC mode and battery curve */
+                    lcd_putsf(0, 18, "Apple ADC: %d  scale %s %d + %d.%03d/cnt (%d)", bi.sub_raw, bi.cal_ok ? "" : "?",
+                              bi.cal_a, bi.cal_b1000 / 1000, bi.cal_b1000 % 1000, bi.cal_n);
+                    lcd_putsf(0, 19, "Curve: %s (Apple table %d, hw %08x)", bi.apple_curve ? "Apple" : "Rockbox",
+                              bi.apple_table, bi.hw_rev);
+                    lcd_putsf(0, 20, "0-50%%: %d %d %d %d %d %d", bi.curve_mv[0], bi.curve_mv[1], bi.curve_mv[2],
+                              bi.curve_mv[3], bi.curve_mv[4], bi.curve_mv[5]);
+                    lcd_putsf(0, 21, "60-100%%: %d %d %d %d %d", bi.curve_mv[6], bi.curve_mv[7], bi.curve_mv[8],
+                              bi.curve_mv[9], bi.curve_mv[10]);
+                }
+#endif
 #elif defined TOSHIBA_GIGABEAT_S
                 int line = 3;
                 unsigned int st;
@@ -3110,6 +3135,105 @@ static bool m4_rd(uint32_t off, void *buf, uint32_t n)
    took 9-13 s to fill.  Now: table entries come from six 4 KB windows (LRU), sample data from a 64 KB read-ahead
    window, so a frame normally needs no disk access at all. */
 static int cfg_m4cache_ref(void);
+/* v59 read-ahead for solid-state storage (iFlash etc.; helps a hard disk too).  Up to v58 the player read the file in
+   64 KB pieces about once a second and the sample tables in 4 KB pieces, so the drive never got to sleep and every piece
+   paid a wake-up.  Now (one buffer from Rockbox's allocator, freed when the video ends):
+   - the whole 'moov' box (every sample table) is read into RAM once when the file is opened (up to cfg moov_kb);
+   - the sample data goes through a ring of cfg ra_kb (4 MB = ~1 min of a 500 kbit/s video): it is refilled in 64 KB
+     steps between frame requests whenever less than a quarter of it is still ahead, until it is full, and then the
+     drive is told to sleep at once (an SSD wakes from standby in milliseconds) -- one short burst a minute;
+   - a seek / FF / REW outside the ring restarts it at the new place with a small read. */
+static int cfg_ra_kb = 4096, cfg_moov_kb = 3072, cfg_ra_sleep = 1;
+static int ra_handle = -1;
+static uint8_t *ra_buf;               /* ring: cfg_ra_kb KB */
+static uint32_t ra_size;
+static uint32_t ra_lo, ra_hi;         /* file bytes [ra_lo, ra_hi) are in the ring at offset % ra_size */
+static uint32_t ra_fsize;
+static uint32_t ra_pos[2];            /* last data offsets read: video, audio */
+static int ra_stream;                 /* which of the two the next m4_rdd is for */
+static bool ra_filling, ra_slept;
+static uint32_t ra_bursts, ra_misses, ra_read_kb;
+static uint8_t *mv_buf;               /* the moov box */
+static uint32_t mv_s, mv_e;
+static void ra_free(void)
+{
+    if (ra_handle > 0) { core_unpin(ra_handle); core_free(ra_handle); }
+    ra_handle = -1; ra_buf = NULL; mv_buf = NULL; ra_size = 0; ra_lo = ra_hi = 0;
+}
+static bool ra_read_at(uint32_t off, uint32_t n)      /* file [off, off+n) -> ring; off == ra_hi */
+{
+    while (n)
+    {
+        uint32_t p = off % ra_size, c = ra_size - p;
+        ssize_t r;
+        if (c > n) c = n;
+        if (lseek(m4.fd, (off_t)off, SEEK_SET) != (off_t)off) return false;
+        r = read(m4.fd, ra_buf + p, c);
+        if (r <= 0) return false;
+        off += (uint32_t)r; n -= (uint32_t)r; ra_hi = off; ra_read_kb += (uint32_t)r / 1024;
+        if ((uint32_t)r < c) return n == 0;
+    }
+    return true;
+}
+/* restart the ring at off (seek / first read) */
+static bool ra_restart(uint32_t off, uint32_t need)
+{
+    uint32_t n = 65536;
+    if (need + 1024 > n) n = need + 1024;
+    if (n > ra_size) n = ra_size;
+    ra_lo = ra_hi = off & ~511u;
+    if (ra_hi + n > ra_fsize) n = ra_fsize - ra_hi;
+    ra_misses++;
+    ra_filling = true;
+    return ra_read_at(ra_hi, n);
+}
+static bool ra_get(uint32_t off, void *buf, uint32_t n)
+{
+    uint8_t *o = buf;
+    if (!(off >= ra_lo && off + n <= ra_hi))
+    {
+        if (!ra_restart(off, n)) return false;
+        if (!(off >= ra_lo && off + n <= ra_hi)) return false;
+    }
+    ra_pos[ra_stream & 1] = off;
+    while (n)
+    {
+        uint32_t p = off % ra_size, c = ra_size - p;
+        if (c > n) c = n;
+        memcpy(o, ra_buf + p, c); o += c; off += c; n -= c;
+    }
+    return true;
+}
+/* called from the playback loop between frame requests */
+static void ra_tick(void)
+{
+    uint32_t keep, lead, room, n, ahead;
+    int k, inside = 0;
+    if (!ra_buf || m4.fd < 0 || ra_hi >= ra_fsize) return;
+    keep = ra_hi; lead = ra_lo;
+    for (k = 0; k < 2; k++)                                                   /* only positions inside the ring count */
+        if (ra_pos[k] >= ra_lo && ra_pos[k] < ra_hi)
+        {
+            inside++;
+            if (ra_pos[k] < keep) keep = ra_pos[k];                           /* the stream that is furthest behind */
+            if (ra_pos[k] > lead) lead = ra_pos[k];
+        }
+    if (!inside) return;
+    keep = keep > ra_lo + 131072 ? keep - 131072 : ra_lo;                     /* keep 128 KB behind it */
+    ra_lo = keep;
+    ahead = ra_hi - lead;
+    if (!ra_filling && ahead < ra_size / 4) { ra_filling = true; ra_slept = false; ra_bursts++; }
+    if (!ra_filling) return;
+    room = ra_size - (ra_hi - ra_lo);
+    n = room < 65536 ? room : 65536;
+    if (ra_hi + n > ra_fsize) n = ra_fsize - ra_hi;
+    if (n < 4096 || !ra_read_at(ra_hi, n) || ra_hi >= ra_fsize || room - n < 65536)
+    {
+        ra_filling = false;
+        /* full: an SSD is put to sleep at once (wakes in ms); a hard disk keeps Rockbox's own spin-down timer */
+        if (cfg_ra_sleep && !ra_slept && ata_disk_isssd()) { storage_sleepnow(); ra_slept = true; }
+    }
+}
 #define M4C_WIN 4096
 #define M4C_N   6
 static struct { uint32_t base, len, use; uint8_t d[M4C_WIN]; } m4c[M4C_N];
@@ -3120,6 +3244,7 @@ static void m4c_reset(void) { int i; for (i = 0; i < M4C_N; i++) { m4c[i].len = 
 static bool m4_rdc(uint32_t off, void *buf, uint32_t n)
 {
     uint8_t *o = buf;
+    if (mv_buf && off >= mv_s && off + n <= mv_e) { memcpy(buf, mv_buf + (off - mv_s), n); return true; }   /* v59 */
     if (!cfg_m4cache_ref()) return m4_rd(off, buf, n);
     while (n)
     {
@@ -3147,6 +3272,11 @@ static bool m4_rdc(uint32_t off, void *buf, uint32_t n)
 /* sample data: served from the read-ahead window when it is inside it, else the window is refilled from there */
 static bool m4_rdd(uint32_t off, void *buf, uint32_t n)
 {
+    if (ra_buf && n <= ra_size / 2)
+    {   /* v59 -- unless the sound lies far from the picture in the file (not interleaved): then it uses the small window */
+        uint32_t d = ra_stream == 1 && ra_pos[0] ? (off > ra_pos[0] ? off - ra_pos[0] : ra_pos[0] - off) : 0;
+        if (d < ra_size / 2) return ra_get(off, buf, n);
+    }
     if (!cfg_m4cache_ref() || n > sizeof m4d / 2) return m4_rd(off, buf, n);
     if (!(m4d_len && off >= m4d_base && off + n <= m4d_base + m4d_len))
     {
@@ -3245,7 +3375,7 @@ static void m4_rewind(void)
     m4.stts_i = 0; m4.stts_left = m4_u32(m4.stts); m4.stts_delta = m4_u32(m4.stts + 4); m4.dts = 0;
 }
 
-static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; m4c_reset(); }
+static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; m4c_reset(); ra_free(); }
 
 /* v42: random access, the way the stock player does it (ARM positions its demuxer on a key frame, then sends
    "mp_seek <ms>"; the VC flushes and answers with PDS 0x43 {session, ms}; the stock 0x43 handler (rt 0x20b304)
@@ -3338,6 +3468,30 @@ static int mp4_open(const char *path)
     fsz = (uint32_t)sz;
     while (m4_box(&pos, fsz, &t, &ps, &pe)) if (t == FOURCC('m','o','o','v')) { moov_s = ps; moov_e = pe; break; }
     if (!moov_e) { m4_close(); return -3; }
+    {   /* v59: one buffer: the moov box + the read-ahead ring */
+        uint32_t mlen = moov_e - moov_s + 8, want;
+        long t0 = current_tick;
+        ra_fsize = fsz;
+        if (mlen > (uint32_t)cfg_moov_kb * 1024) mlen = 0;
+        want = mlen + (cfg_ra_kb > 0 ? (uint32_t)cfg_ra_kb * 1024 : 0);
+        if (want && (ra_handle = core_alloc_ex(want, NULL)) > 0)
+        {
+            uint8_t *p;
+            core_pin(ra_handle);
+            p = core_get_data(ra_handle);
+            if (mlen)
+            {
+                mv_s = moov_s - 8; mv_e = mv_s + mlen;
+                if (lseek(m4.fd, (off_t)mv_s, SEEK_SET) == (off_t)mv_s && read(m4.fd, p, mlen) == (ssize_t)mlen) mv_buf = p;
+                else mlen = 0;
+            }
+            if (cfg_ra_kb > 0) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ((uint32_t)cfg_ra_kb * 1024) & ~65535u; }
+            ra_lo = ra_hi = 0; ra_pos[0] = ra_pos[1] = 0; ra_filling = false; ra_bursts = ra_misses = ra_read_kb = 0;
+            BLOG("read-ahead: moov %u KB in RAM (%ld ms), ring %u KB%s", mv_buf ? mlen / 1024 : 0,
+                 (current_tick - t0) * 1000 / HZ, ra_size / 1024, ata_disk_isssd() ? " (solid-state drive)" : "");
+        }
+        else BLOG("read-ahead: no buffer (%u KB wanted) -- the v45 small caches are used", want / 1024);
+    }
     memset(&ma, 0, sizeof ma);                   /* v53: the AAC track too, if there is one */
     pos = moov_s;
     while (m4_box(&pos, moov_e, &t, &ps, &pe))
@@ -3388,6 +3542,7 @@ static int m4_next(uint32_t *ts_ms, bool *key)
     }
 
     *key = false;
+    ra_stream = 0;
     if (size == 0 || size > M4_RAW_MAX || !m4_rdd(off, m4_raw, size)) return -1;
     for (p = 0; p + m4.nal_len <= size; )                               /* pass 1: is there an IDR? */
     {
@@ -3550,6 +3705,7 @@ static int ma_next(uint32_t *ts_ms)
     ma.dts += ma.stts_delta;
     if (ma.stts_left && --ma.stts_left == 0 && ma.stts_i + 1 < ma.stts_n)
     { ma.stts_i++; ma.stts_left = m4_u32(ma.stts + 8 * ma.stts_i); ma.stts_delta = m4_u32(ma.stts + 8 * ma.stts_i + 4); }
+    ra_stream = 1;
     if (size == 0 || size > sizeof ma_buf || !m4_rdd(off, ma_buf, size)) return -1;
     return (int)size;
 }
@@ -3744,6 +3900,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "tv_extra")) cfg_tv_extra = v;
         else if (!strcmp(p, "tv_osd"))   cfg_tv_osd = v;
         else if (!strcmp(p, "boost"))    cfg_boost = v;
+        else if (!strcmp(p, "ra_kb"))    cfg_ra_kb = v;
+        else if (!strcmp(p, "moov_kb"))  cfg_moov_kb = v;
+        else if (!strcmp(p, "ra_sleep")) cfg_ra_sleep = v;
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
@@ -4114,7 +4273,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v57 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v63 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4428,6 +4587,7 @@ static bool av_vol_dirty;
 enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5 };
 static const char * const sm_name[6] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step" };
 static int sc_btn, sc_dir, sc_ticks, sc_method, sc_rate;
+static bool sc_remote;                   /* v63: FF/REW started by a dock / remote (StartFF ... EndFFRew) */
 static int sm_ff = SM_FFK, sm_rew = SM_FFK;      /* v47: the v46 probe: ff+keys 454 pictures / +21.5 s, rew+keys 452 / -22.2 s in 2.4 s */
 static long sc_press, sc_t0, sc_next;
 static bool sc_active, sc_was_playing;
@@ -4445,6 +4605,7 @@ static uint32_t pl_num(const char *r, const char *key)
     while (*q >= '0' && *q <= '9') v = v * 10 + (uint32_t)(*q++ - '0');
     return neg ? (uint32_t)-(int32_t)v : v;
 }
+static long vr_el_tick;                  /* v63: when pl_el_ms was read (dock status reports estimate from it) */
 static int pl_cmd(const char *c, bool log_ok)
 {
     static char r[400]; int rr;
@@ -4459,7 +4620,7 @@ static void pl_status(void)
     bcm_cmd_t0 = current_tick; rr = bcm_gencmd_watched("mp_get_status", r, sizeof r, 2);
     if (rr < 0) return;
     if ((v = pl_num(r, "duration=")) != 0xffffffffu) pl_dur_ms = v;
-    if ((v = pl_num(r, "elapsed="))  != 0xffffffffu) pl_el_ms = v;
+    if ((v = pl_num(r, "elapsed="))  != 0xffffffffu) { pl_el_ms = v; vr_el_tick = current_tick; }
     v = pl_num(r, "buffering="); pl_buffering = v == 0xffffffffu ? -1 : (int)v;
 }
 /* the picture on screen: Disp time / seq_num from mp_get_stats video */
@@ -5243,8 +5404,8 @@ static void pl_tap(int dir)
 static void bcm_osd_tick(void)
 {
     if (sc_btn && !sc_active && current_tick - sc_press >= (HZ * 4) / 10 && (button_status() & sc_btn))
-        scrub_begin(sc_btn == BUTTON_RIGHT ? 1 : -1);
-    if (sc_active && !sc_btn) scrub_end();
+        scrub_begin(sc_btn & (BUTTON_RIGHT | BUTTON_RC_RIGHT) ? 1 : -1);
+    if (sc_active && !sc_btn && !sc_remote) scrub_end();
     scrub_tick();
     mon_tick();
     av_tick();
@@ -5283,28 +5444,168 @@ static void bcm_osd_tick(void)
         if (osd_vol_only) osd_present_mask(4); else osd_present();
     }
 }
+/* ---- v63: the dock / remotes control the video (iAP: apps/iap/)
+   Accessories reach the player two ways:
+   * button-style (Simple Remote ContextButtonStatus: an Apple Universal Dock's IR remote, inline remotes, most AV docks):
+     they arrive as BUTTON_RC_* in the button queue with press / repeat / release, and are treated exactly like the
+     iPod's own buttons (>>| tap = jump, hold = FF; |<< likewise; play/pause; MENU = stop; centre = controls;
+     volume +/- and up/down = volume);
+   * commands (VideoButtonStatus, Extended Interface PlayControl, Display Remote volume, the ContextButtonStatus bits
+     that have no button: play, pause, stop, mute, chapters, power off): queued here by the iAP thread and run by the
+     player loop.  "Next / previous video" end this video and the file browser starts the next / previous video file of
+     the folder (previous restarts the video when it is more than 3 s in, like Apple's firmware). */
+enum { VR_TOGGLE = 1, VR_PLAY, VR_PAUSE, VR_STOP, VR_NEXT, VR_PREV, VR_FF, VR_REW, VR_FFREW_END,
+       VR_VOL_UP, VR_VOL_DOWN, VR_VOL_SET, VR_MUTE, VR_CH_NEXT, VR_CH_PREV, VR_OSD };
+static volatile bool bcm_video_running;
+static volatile unsigned char vr_q[16];
+static volatile short vr_qarg[16];
+static volatile unsigned vr_w, vr_r;
+static volatile long vr_status_asked;
+int bcm_video_next_request;              /* read by apps/filetree.c: +1 / -1 = play the next / previous video */
+bool bcm_video_active(void) { return bcm_video_running; }
+int bcm_video_remote(int cmd, int arg)
+{
+    if (!bcm_video_running) return 0;
+    if (vr_w - vr_r < 16) { vr_q[vr_w & 15] = (unsigned char)cmd; vr_qarg[vr_w & 15] = (short)arg; vr_w++; }
+    return 1;
+}
+/* state: 0 stopped, 1 playing, 2 paused, 3 FF, 4 REW (iAP numbering) */
+bool bcm_video_status(uint32_t *len_ms, uint32_t *pos_ms, int *state)
+{
+    uint32_t pos;
+    if (!bcm_video_running) return false;
+    vr_status_asked = current_tick;
+    pos = sc_active ? sc_pos : pl_el_ms;
+    if (!pl_paused && !sc_active && vr_el_tick) pos += (uint32_t)(current_tick - vr_el_tick) * (1000 / HZ);
+    if (pl_dur_ms && pos > pl_dur_ms) pos = pl_dur_ms;
+    if (len_ms) *len_ms = pl_dur_ms;
+    if (pos_ms) *pos_ms = pos;
+    if (state) *state = sc_active ? (sc_dir > 0 ? 3 : 4) : pl_paused ? 2 : 1;
+    return true;
+}
+static void pl_set_paused(bool pause, char *resp, size_t rn)
+{
+    const char *cmd = pause ? "mp_pause" : "mp_play";
+    int r2;
+    if (pause == pl_paused) return;
+    if (pause) av_hold();                              /* pausing: hold the sound now */
+    else pl_status();                                  /* v63: fresh position for the dock's status */
+    bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(cmd, resp, rn, 3); bcm_log_text(cmd, r2, resp);
+    pl_paused = pause;
+    if (!pl_paused) { av_resume(); mon_start("PLAY -> mp_play"); }
+    else pl_status();
+    osd_show_for(pl_paused ? 0 : 3000);
+}
+static void pl_restart(void)
+{
+    char c[24];
+    av_hold();
+    snprintf(c, sizeof c, "mp_seek %u", 0u);
+    pl_cmd(c, true);
+    pl_el_ms = 0; pl_target_ms = 0; vr_el_tick = current_tick;
+    av_prep(0, false);
+    mon_start("dock: restart");
+    osd_show_for(pl_paused ? 0 : 3000);
+}
+static void pl_vol_show(void)
+{
+    av_vol_until = current_tick + 2 * HZ;
+    av_vol_dirty = true;
+}
+static const char * const vr_name[] = { "?", "play/pause", "play", "pause", "stop", "next video", "previous video",
+    "FF", "REW", "end FF/REW", "volume +", "volume -", "volume", "mute", "next chapter", "previous chapter", "controls" };
+/* returns 1 to end the video */
+static int vr_drain(char *resp, size_t rn)
+{
+    static int mute_pct = -1;
+    while (vr_r != vr_w)
+    {
+        int c = vr_q[vr_r & 15], a = vr_qarg[vr_r & 15];
+        vr_r++;
+        if (c == VR_VOL_SET) BLOG("  dock: volume set to %d %%", a);
+        else BLOG("  dock: %s", c < (int)(sizeof vr_name / sizeof vr_name[0]) ? vr_name[c] : "?");
+        av_boost_until = current_tick + 3 * HZ;
+        if (!av_boosted && cfg_boost) av_boost(true);
+        switch (c)
+        {
+        case VR_TOGGLE: pl_set_paused(!pl_paused, resp, rn); break;
+        case VR_PLAY:   pl_set_paused(false, resp, rn); break;
+        case VR_PAUSE:  pl_set_paused(true, resp, rn); break;
+        case VR_STOP:   return 1;
+        case VR_NEXT:   bcm_video_next_request = 1; return 1;
+        case VR_PREV:
+            pl_status();
+            if (pl_el_ms > 3000) pl_restart();
+            else { bcm_video_next_request = -1; return 1; }
+            break;
+        case VR_FF: case VR_REW:
+            if (sc_active) scrub_end();
+            sc_btn = 0; sc_remote = true;
+            scrub_begin(c == VR_FF ? 1 : -1);
+            break;
+        case VR_FFREW_END: sc_remote = false; break;   /* bcm_osd_tick ends the scrub */
+        case VR_VOL_UP:   av_set_vol(av_vol_pct + cfg_vol_step); mute_pct = -1; pl_vol_show(); break;
+        case VR_VOL_DOWN: av_set_vol(av_vol_pct - cfg_vol_step); mute_pct = -1; pl_vol_show(); break;
+        case VR_VOL_SET:  av_set_vol(a); mute_pct = -1; pl_vol_show(); break;
+        case VR_MUTE:
+            if (mute_pct < 0) { mute_pct = av_vol_pct; av_set_vol(0); }
+            else { av_set_vol(mute_pct); mute_pct = -1; }
+            pl_vol_show();
+            break;
+        case VR_CH_NEXT: pl_tap(1); break;
+        case VR_CH_PREV: pl_tap(-1); break;
+        case VR_OSD: if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000); break;
+        }
+    }
+    return 0;
+}
+/* the dock's remote buttons (BUTTON_RC_*) behave like the iPod's own */
+static int rc_to_local(int base)
+{
+    switch (base)
+    {
+    case BUTTON_RC_RIGHT: return BUTTON_RIGHT;
+    case BUTTON_RC_LEFT: return BUTTON_LEFT;
+    case BUTTON_RC_PLAY: return BUTTON_PLAY;
+    case BUTTON_RC_MENU: return BUTTON_MENU;
+    case BUTTON_RC_SELECT: return BUTTON_SELECT;
+    case BUTTON_RC_VOL_UP: case BUTTON_RC_UP: return BUTTON_SCROLL_FWD;
+    case BUTTON_RC_VOL_DOWN: case BUTTON_RC_DOWN: return BUTTON_SCROLL_BACK;
+    default: return base;
+    }
+}
+
 /* returns 1 when the user wants to stop.  The wheel is the volume (v51), never seeking. */
 static int bcm_player_input(char *resp, size_t rn)
 {
-    int b = button_get_w_tmo(0), base, r2;
+    int b, base, raw;
+    if (vr_r != vr_w && vr_drain(resp, rn)) return 1;  /* v63 */
+    b = button_get_w_tmo(0);
     if (b == BUTTON_NONE) return 0;
     av_boost_until = current_tick + 3 * HZ;            /* v57 */
     if (!av_boosted && cfg_boost) av_boost(true);
-    base = b & ~(BUTTON_REPEAT | BUTTON_REL);
-    if (base == BUTTON_RIGHT || base == BUTTON_LEFT)
+    raw = b & ~(BUTTON_REPEAT | BUTTON_REL);
+    base = rc_to_local(raw);                           /* v63: a remote button = the same iPod button */
+    if (raw != base)
     {
+        b = (b & (BUTTON_REPEAT | BUTTON_REL)) | base;
+        if (raw == BUTTON_RC_RIGHT || raw == BUTTON_RC_LEFT) base = raw;   /* hold detection watches the remote bit */
+    }
+    if (base == BUTTON_RIGHT || base == BUTTON_LEFT || base == BUTTON_RC_RIGHT || base == BUTTON_RC_LEFT)
+    {
+        int dir = base & (BUTTON_RIGHT | BUTTON_RC_RIGHT) ? 1 : -1;
         if (b & BUTTON_REL)
         {
             if (sc_btn == base)
             {
                 sc_btn = 0;
-                if (!sc_active) pl_tap(base == BUTTON_RIGHT ? 1 : -1);   /* short press */
+                if (!sc_active) pl_tap(dir);           /* short press */
             }
             return 0;
         }
         if (!(b & BUTTON_REPEAT) && !sc_btn) { sc_btn = base; sc_press = current_tick; }
         else if ((b & BUTTON_REPEAT) && sc_btn == base && !sc_active && current_tick - sc_press >= (HZ * 4) / 10)
-            scrub_begin(base == BUTTON_RIGHT ? 1 : -1);
+            scrub_begin(dir);
         return 0;
     }
     if (base == BUTTON_SCROLL_FWD || base == BUTTON_SCROLL_BACK)
@@ -5323,14 +5624,7 @@ static int bcm_player_input(char *resp, size_t rn)
     if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
     if (b == BUTTON_MENU) return 1;
     if (b == BUTTON_PLAY)
-    {
-        const char *cmd = pl_paused ? "mp_play" : "mp_pause";
-        if (!pl_paused) av_hold();                     /* pausing: hold the sound now */
-        bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(cmd, resp, rn, 3); bcm_log_text(cmd, r2, resp);
-        pl_paused = !pl_paused;
-        if (!pl_paused) { av_resume(); mon_start("PLAY -> mp_play"); }
-        osd_show_for(pl_paused ? 0 : 3000);
-    }
+        pl_set_paused(!pl_paused, resp, rn);
     else if (b == BUTTON_SELECT)
     {
         if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000);
@@ -5414,6 +5708,9 @@ static void bcm_video_run(int secs)
         backlight_set_on_button_hold(2);                   /* v50: the hold switch does not turn the screen off while a video plays */
     }
     av_boost(true);                                    /* v51: boosted; v57: only while it is needed (av_boost_tick) */
+#ifdef HAVE_BATTERY_SMOOTH_API
+    powermgmt_set_load_hint(3, true);                  /* v58: the battery reading knows the video decoder is running */
+#endif
     av_open(bcm_play_path ? bcm_play_path : v_path);   /* v51: sound (starts when the picture moves) */
     backlight_on();
     bool hold_was = button_hold();
@@ -5427,9 +5724,14 @@ static void bcm_video_run(int secs)
     }
     mon_start("mp_play (start-up pre-buffer)");
     if (bcm_tv) osd_show_for(3000);                    /* v55: TV: controls + TV symbol on the LCD the whole time; v56: 3 s on the TV */
+    vr_r = vr_w; sc_remote = false; vr_el_tick = 0;      /* v63: dock commands from before this video are dropped */
+    bcm_video_running = true;
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
+        if (vr_status_asked && current_tick - vr_status_asked < 5 * HZ && !sc_active
+            && (!vr_el_tick || current_tick - vr_el_tick > 2 * HZ))
+            pl_status();                               /* v63: a dock shows the position: keep it fresh */
         if (bcm_check_dead()) break;
         if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
         if (button_hold() != hold_was)
@@ -5446,6 +5748,7 @@ static void bcm_video_run(int secs)
             reset_poweroff_timer();
         }
         av_boost_tick(run_t0);
+        ra_tick();                                     /* v59 */
         if (!probed && current_tick - run_t0 > 5 * HZ)
         {   /* v46: once per run, ~5 s in: measure the FF/REW candidates (buttons are not read meanwhile) */
             probed = true; mon_until = 0;
@@ -5495,6 +5798,9 @@ static void bcm_video_run(int secs)
         }
         if (!TIME_BEFORE(current_tick, next_log))
         {
+            if (ra_buf)
+                BLOG("  read-ahead: %u KB ahead of the picture, %u bursts, %u restarts, %u KB read, drive %s", ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1]) > ra_size ? 0 :
+                     (ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1])) / 1024, ra_bursts, ra_misses, ra_read_kb, ra_filling ? "reading" : "idle");
             BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d  cache misses: tables %u data %u",
                  v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
             gf_log = v_getframes;
@@ -5583,9 +5889,14 @@ static void bcm_video_run(int secs)
         else if (current_tick - last_req < HZ / 20) yield();
         else sleep(1);
     }
+    bcm_video_running = false;                         /* v63 */
+    sc_remote = false;
     bcm_sync_every = 0;
     av_close();
     av_boost(false);
+#ifdef HAVE_BATTERY_SMOOTH_API
+    powermgmt_set_load_hint(3, false);
+#endif
     backlight_set_on_button_hold(global_settings.backlight_on_button_hold);
     bcm_map_probe();
 }
@@ -5844,7 +6155,11 @@ static void bcm_tv_enable(bool on)
                  cfg_tv_enc >= 0 ? cfg_tv_enc : global_settings.bcm_tv_signal ? 1 : 5, cfg_tv_extra == 1 ? " svideo=1" : "");
         bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(cmd, resp, sizeof resp, 4); bcm_log_text(cmd, r, resp);
         bcm_tv_dac = true;
-        BLOG("  >>> TV OUT: %s %s%s -- the picture should be on the TV (dock connector or the headphone jack's AV cable)",
+        /* v62: S-video needs nothing extra: vmcs.bin's display-2 defaults (copied from file offset 0x1f7f8 at boot, word 0 =
+           0x01000088) already have the svideo bit (24, set by "display_control 2 svideo=", handler 0x5b7c) on, the same
+           as RenderServer.bin's "2 power=1 svideo=1 mode=0" -- composite and S-video come out together; Apple's ARM code
+           never sends svideo at all.  encoding 0..3 = PAL family, 4..5 = NTSC (handler 0x5b9e). */
+        BLOG("  >>> TV OUT: %s %s%s -- composite + S-video together (dock connector pins 8 / 9-10, or the headphone jack's AV cable)",
              global_settings.bcm_tv_signal ? "PAL" : "NTSC", global_settings.bcm_tv_picture ? "fill" : "letterbox",
              global_settings.bcm_tv_wide ? " widescreen" : "");
     }
@@ -6164,6 +6479,7 @@ static bool dbg_bcm_host(void) { return bcm_run(NULL); }
 bool bcm_video_play(const char *path)
 {   /* v55: Settings > General Settings > Video Out: On / Ask / Off (Ask = the stock "TV On / TV Off" choice) */
     int vo = global_settings.bcm_video_out;
+    bcm_video_next_request = 0;                        /* v63 */
     bcm_tv = vo == 0;
     if (vo == 1)
     {
@@ -6172,6 +6488,12 @@ bool bcm_video_play(const char *path)
         if (sel != 0 && sel != 1) return false;        /* backed out: no video */
         bcm_tv = sel == 0;
     }
+    return bcm_run(path);
+}
+/* v63: the dock asked for the next / previous video: same TV choice, no question */
+bool bcm_video_play_again(const char *path)
+{
+    bcm_video_next_request = 0;
     return bcm_run(path);
 }
 bool bcm_video_is_video(const char *path)
@@ -6200,9 +6522,23 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v57, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v63, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
+#ifdef HAVE_BATTERY_SMOOTH_API
+    {   /* v58 */
+        struct battery_smooth_info bi;
+        battery_smooth_info(&bi);
+        BLOG("battery reading: %s, exact %d %%, compensated %d.%d %%, R %d mOhm, drops %d/%d/%d/%d mV (measured %d/%d/%d/%d)",
+             bi.enabled ? "smooth" : "exact", bi.raw_percent, bi.est_permille / 10, bi.est_permille % 10, bi.resistance_mohm,
+             bi.sag_mv[0], bi.sag_mv[1], bi.sag_mv[2], bi.sag_mv[3], bi.measured[0], bi.measured[1], bi.measured[2], bi.measured[3]);
+        BLOG("battery curve: %s (Apple table %d, hw %08x); Apple-mode ADC %d, scale %s%d mV + %d.%03d mV/count after %d pairs; "
+             "curve mV %d %d %d %d %d %d %d %d %d %d %d", bi.apple_curve ? "Apple" : "Rockbox", bi.apple_table, bi.hw_rev,
+             bi.sub_raw, bi.cal_ok ? "" : "(not yet) ", bi.cal_a, bi.cal_b1000 / 1000, bi.cal_b1000 % 1000, bi.cal_n,
+             bi.curve_mv[0], bi.curve_mv[1], bi.curve_mv[2], bi.curve_mv[3], bi.curve_mv[4], bi.curve_mv[5],
+             bi.curve_mv[6], bi.curve_mv[7], bi.curve_mv[8], bi.curve_mv[9], bi.curve_mv[10]);
+    }
+#endif
     bcm_wd_last = current_tick; bcm_wd_on = 1;
     tick_add_task(bcm_wd_tick);
     bcm_load_cfg();

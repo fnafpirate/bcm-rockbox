@@ -69,6 +69,82 @@ static void cmd_pending(const unsigned char cmd, const uint32_t msdelay)
     iap_send_tx();
 }
 
+#ifdef IPOD_VIDEO
+#include "settings.h"
+/* bcm overlay v62: iPod Preferences (General lingo GetiPodPreferences 0x29 / SetiPodPreferences 0x2B) -- the video-out
+   classes an AV dock, car video kit or TV accessory uses -- mapped onto Settings > General Settings > Video Out.
+     0x00 video out      0 off, 1 on, 2 ask      -> Video Out (on / ask / off)
+     0x01 screen config  0 fill, 1 fit           -> TV Picture (fill / letterbox)
+     0x02 video signal   0 NTSC, 1 PAL           -> TV Signal
+     0x03 line out       0 not used, 1 used      (the dock line-out is always live)
+     0x08 connection     0 none, 1 composite, 2 S-video, 3 component (not on this iPod)
+                         (the VideoCore drives composite and S-video together: vmcs.bin's display-2 default is svideo=1)
+     0x09 captions, 0x0C subtitles, 0x0D alternate audio: remembered and reported
+     0x0A monitor aspect 0 4:3, 1 16:9           -> TV Widescreen
+   "Restore on exit": the old value comes back when the accessory goes away (it re-identifies, the iPod sees its ID
+   resistor go, or a USB / headphone-remote reset), as Apple's firmware does.  A change made for good is saved. */
+static unsigned char vpref_store[16] = { [0x03] = 1, [0x08] = 1 };
+static short vpref_saved[16];   /* value + 1 to restore, 0 = nothing to restore */
+static int vpref_get(int cls)
+{
+    static const unsigned char vo[3] = { 1, 2, 0 };   /* setting on/ask/off -> iAP on/ask/off */
+    switch (cls)
+    {
+        case 0x00: return vo[global_settings.bcm_video_out % 3];
+        case 0x01: return global_settings.bcm_tv_picture ? 0 : 1;
+        case 0x02: return global_settings.bcm_tv_signal ? 1 : 0;
+        case 0x0A: return global_settings.bcm_tv_wide ? 1 : 0;
+        case 0x03: case 0x08: case 0x09: case 0x0C: case 0x0D: return vpref_store[cls];
+        default: return -1;
+    }
+}
+static void vpref_put(int cls, int v)
+{
+    static const unsigned char vo[3] = { 2, 0, 1 };   /* iAP off/on/ask -> setting */
+    switch (cls)
+    {
+        case 0x00: global_settings.bcm_video_out = vo[v % 3]; break;
+        case 0x01: global_settings.bcm_tv_picture = v == 0; break;
+        case 0x02: global_settings.bcm_tv_signal = v ? 1 : 0; break;
+        case 0x0A: global_settings.bcm_tv_wide = v != 0; break;
+        default: vpref_store[cls & 15] = v; break;
+    }
+}
+static int vpref_set(int cls, int v, bool restore)
+{
+    int old = vpref_get(cls), max;
+    if (old < 0)
+        return IAP_ACK_BAD_PARAM;
+    max = cls == 0x00 ? 2 : cls == 0x08 ? 3 : 1;
+    if (v > max)
+        return IAP_ACK_BAD_PARAM;
+    if (cls == 0x08 && v == 3)
+        return IAP_ACK_CMD_FAILED;      /* component video: not on the 5G/5.5G */
+    if (restore)
+    {
+        if (!vpref_saved[cls])
+            vpref_saved[cls] = old + 1;
+    }
+    else
+        vpref_saved[cls] = 0;
+    vpref_put(cls, v);
+    if (!restore && (cls <= 0x02 || cls == 0x0A))
+        settings_save();
+    logf("iap: SetiPodPreferences class %d = %d%s", cls, v, restore ? " (restore on exit)" : "");
+    return 0;
+}
+void iap_video_prefs_restore(void)
+{
+    int c;
+    for (c = 0; c < 16; c++)
+        if (vpref_saved[c])
+        {
+            vpref_put(c, vpref_saved[c] - 1);
+            vpref_saved[c] = 0;
+        }
+}
+#endif
+
 void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
 {
     unsigned int cmd = buf[1];
@@ -969,7 +1045,12 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
              */
             IAP_TX_INIT(0x00, 0x25);
             IAP_TX_PUT_U32(0x00);
+#ifdef IPOD_VIDEO
+            /* bcm overlay v62: this iPod has video out (BCM2722 composite + S-video) and the dock line-out */
+            IAP_TX_PUT_U32(0x03);
+#else
             IAP_TX_PUT_U32(0x00);
+#endif
 
             iap_send_tx();
             break;
@@ -1062,6 +1143,22 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
         case 0x29:
         {
             CHECKLEN(3);
+#ifdef IPOD_VIDEO
+            /* bcm overlay v62: the 5G/5.5G answered these without authentication (that came with the classic) */
+            if (!iap_ident_stock())
+                CHECKAUTH;
+            {
+                int v = vpref_get(buf[2]);
+                if (v < 0) {
+                    cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                    break;
+                }
+                IAP_TX_INIT(0x00, 0x2A);
+                IAP_TX_PUT(buf[2]);
+                IAP_TX_PUT(v);
+                iap_send_tx();
+            }
+#else
             CHECKAUTH;
 
             IAP_TX_INIT(0x00, 0x2A);
@@ -1076,7 +1173,7 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
             } else {
                 cmd_ack(cmd, IAP_ACK_BAD_PARAM);
             }
-
+#endif
             break;
         }
 
@@ -1108,6 +1205,18 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
         case 0x2B:
         {
             CHECKLEN(5);
+#ifdef IPOD_VIDEO
+            /* bcm overlay v62: no authentication on this generation (see GetiPodPreferences) */
+            if (!iap_ident_stock())
+                CHECKAUTH;
+            {
+                int r = vpref_set(buf[2], buf[3], buf[4] != 0);
+                if (r == 0)
+                    cmd_ok(cmd);
+                else
+                    cmd_ack(cmd, r);
+            }
+#else
             CHECKAUTH;
 
             /* The only information really supported is 0x03, Line-out usage.
@@ -1125,7 +1234,7 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
             } else {
                 cmd_ack(cmd, IAP_ACK_BAD_PARAM);
             }
-
+#endif
             break;
         }
 

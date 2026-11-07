@@ -17418,3 +17418,105 @@
     ipodvideo: "SSD Power-Off Delay"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_BATTERY_READING
+  desc: battery menu: how the battery percentage is shown
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Battery Reading"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Battery Reading"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Battery Reading"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BATTERY_SMOOTH
+  desc: battery display: steady, load-compensated
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Smooth (like stock)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Smooth (like stock)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Smooth (like stock)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BATTERY_EXACT
+  desc: battery display: Rockbox voltage reading
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Exact (Rockbox)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Exact (Rockbox)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Exact (Rockbox)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_ACCESSORY_ID
+  desc: in system settings: which iPod model the dock accessories are told this is
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Accessory Identity"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Accessory Identity"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Accessory Identity"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_ACCESSORY_ID_VIDEO
+  desc: accessory identity: the real 5.5G, like the Apple firmware
+  user: core
+  <source>
+    *: none
+    ipodvideo: "iPod video (Apple)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "iPod video (Apple)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "iPod video (Apple)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_ACCESSORY_ID_CLASSIC
+  desc: accessory identity: Rockbox default
+  user: core
+  <source>
+    *: none
+    ipodvideo: "iPod classic (Rockbox)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "iPod classic (Rockbox)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "iPod classic (Rockbox)"
+  </voice>
+</phrase>

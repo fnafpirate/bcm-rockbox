@@ -72,6 +72,14 @@
 /* We don't use sizeof() here, because we *need* a multiple of 32 */
 #define MAX_CBW_SIZE 512
 
+/* bcm overlay v60 (iPod Video): Apple's disk mode writes in 32 KB halves of a double buffer (rt 0x1295c0: chunk =
+ * min(buffer/2, 32 KB)); Rockbox used 24 KB.  Flash (iFlash / SD / CF) gains most from larger writes, so a solid-state
+ * drive gets 64 KB chunks (the most one ARC transfer of 4 x 16 KB descriptors can carry), a hard disk Apple's 32 KB. */
+#if defined(IPOD_VIDEO) && !defined(USB_WRITE_BUFFER_SIZE) && !defined(BOOTLOADER)
+#define USB_WRITE_BUFFER_SIZE (1024*64)
+#define USB_STORAGE_RUNTIME_WRITE_CHUNK
+#endif
+
 #ifdef USB_WRITE_BUFFER_SIZE
 #define WRITE_BUFFER_SIZE USB_WRITE_BUFFER_SIZE
 #else
@@ -88,6 +96,13 @@
 #endif /* USB_WRITE_BUFFER_SIZE */
 
 #define ALLOCATE_BUFFER_SIZE (2*MAX(READ_BUFFER_SIZE,WRITE_BUFFER_SIZE))
+
+#ifdef USB_STORAGE_RUNTIME_WRITE_CHUNK
+static unsigned int write_chunk = 1024*32;
+#define WRITE_CHUNK write_chunk
+#else
+#define WRITE_CHUNK WRITE_BUFFER_SIZE
+#endif
 
 /* bulk-only class specific requests */
 #define USB_BULK_RESET_REQUEST   0xff
@@ -451,6 +466,9 @@ static int usb_handle = 0;
 static int usb_storage_init_connection(void)
 {
     logf("ums: set config");
+#ifdef USB_STORAGE_RUNTIME_WRITE_CHUNK
+    write_chunk = ata_disk_isssd() ? 1024*64 : 1024*32;     /* bcm overlay v60 */
+#endif
     /* prime rx endpoint. We only need room for commands */
     state = WAITING_FOR_COMMAND;
 
@@ -527,21 +545,21 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
             logf("scsi write %llu %d", cur_cmd.sector, cur_cmd.count);
             if(status==0) {
                 if((unsigned int)length!=(cur_cmd.block_size* cur_cmd.count)
-                  && (unsigned int)length!=WRITE_BUFFER_SIZE) {
+                  && (unsigned int)length!=WRITE_CHUNK) {
                     logf("unexpected length :%d",length);
                     break;
                 }
 
                 sector_t next_sector = cur_cmd.sector +
-                             (WRITE_BUFFER_SIZE/cur_cmd.block_size);
+                             (WRITE_CHUNK/cur_cmd.block_size);
                 unsigned int next_count = cur_cmd.count -
-                             MIN(cur_cmd.count,WRITE_BUFFER_SIZE/cur_cmd.block_size);
+                             MIN(cur_cmd.count,WRITE_CHUNK/cur_cmd.block_size);
                 int next_select = !cur_cmd.data_select;
 
                 if(next_count!=0) {
                     /* Ask the host to send more, to the other buffer */
                     receive_block_data(cur_cmd.data[next_select],
-                                       MIN(WRITE_BUFFER_SIZE,next_count*cur_cmd.block_size));
+                                       MIN(WRITE_CHUNK,next_count*cur_cmd.block_size));
                 }
 
                 /* Now write the data that just came in, while the host is
@@ -549,14 +567,14 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
 #ifdef USB_USE_RAMDISK
                 memcpy(ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
                         cur_cmd.data[cur_cmd.data_select],
-                        MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
+                        MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
                 int result = USBSTOR_WRITE_SECTORS_FILTER();
 
                 if (result == 0) {
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
-                        MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
+                        MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
                 }
 
@@ -1300,7 +1318,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
             }
             else {
                 receive_block_data(cur_cmd.data[0],
-                        MIN(WRITE_BUFFER_SIZE, cur_cmd.count*cur_cmd.block_size));
+                        MIN(WRITE_CHUNK, cur_cmd.count*cur_cmd.block_size));
             }
             break;
 #ifdef STORAGE_64BIT_SECTOR
@@ -1348,7 +1366,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
             }
             else {
                 receive_block_data(cur_cmd.data[0],
-                        MIN(WRITE_BUFFER_SIZE, cur_cmd.count*cur_cmd.block_size));
+                        MIN(WRITE_CHUNK, cur_cmd.count*cur_cmd.block_size));
             }
             break;
 #endif

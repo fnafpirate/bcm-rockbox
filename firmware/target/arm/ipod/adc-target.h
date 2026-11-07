@@ -25,7 +25,10 @@
 #define ADC_UNREG_POWER ADC_BATTERY
 #if defined(IPOD_VIDEO) || defined(IPOD_NANO)
 #define ADC_4066_ISTAT 2
-#define NUM_ADC_CHANNELS 3
+/* bcm overlay v59: the battery input in the PCF5060x's "subtractor" mode (ADCC2 mux 3) -- what Apple's firmware reads
+   (rt 0x265f74 -> 0x28341c(3, ...)): about twice the resolution of the resistive-divider mode Rockbox uses */
+#define ADC_BATTERY_SUBTR 3
+#define NUM_ADC_CHANNELS 4
 #else
 #define NUM_ADC_CHANNELS 2
 #endif

@@ -103,6 +103,38 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
         case 0x00:
         {
             unsigned long btn = BUTTON_NONE;
+#ifdef IPOD_VIDEO
+            /* v63: while a video plays, the ContextButtonStatus bits that are commands rather than buttons go to the
+             * video player (the button bits -- play/pause, volume, >>| |<<, FF/REW, menu, select, up/down -- reach it
+             * as BUTTON_RC_* like always).  Bit numbers as in the iAP spec: 7 stop, 8 play, 9 pause, 10 mute,
+             * 11/12 next/previous chapter, 18 power off. */
+            unsigned char vbuf[6];
+            static uint32_t vprev;
+            if (IAP_VIDEO_ACTIVE())
+            {
+                uint32_t bits = 0, pressed;
+                unsigned int i;
+                for (i = 2; i < len && i < 6; i++)
+                    bits |= (uint32_t)buf[i] << (8 * (i - 2));
+                pressed = bits & ~vprev;
+                vprev = bits;
+                if (pressed & BIT_N(7))  bcm_video_remote(IAPV_STOP, 0);
+                if (pressed & BIT_N(8))  bcm_video_remote(IAPV_PLAY, 0);
+                if (pressed & BIT_N(9))  bcm_video_remote(IAPV_PAUSE, 0);
+                if (pressed & BIT_N(10)) bcm_video_remote(IAPV_MUTE, 0);
+                if (pressed & BIT_N(11)) bcm_video_remote(IAPV_CH_NEXT, 0);
+                if (pressed & BIT_N(12)) bcm_video_remote(IAPV_CH_PREV, 0);
+                if (pressed & BIT_N(18)) bcm_video_remote(IAPV_STOP, 0);
+                bits &= ~(BIT_N(7) | BIT_N(8) | BIT_N(9) | BIT_N(10) | BIT_N(11) | BIT_N(12) | BIT_N(18));
+                memset(vbuf, 0, sizeof vbuf);
+                vbuf[0] = buf[0]; vbuf[1] = buf[1];
+                for (i = 2; i < len && i < 6; i++)
+                    vbuf[i] = (bits >> (8 * (i - 2))) & 0xff;
+                buf = vbuf;
+            }
+            else
+                vprev = 0;
+#endif
 
             if(buf[2] != 0)
             {
@@ -310,6 +342,42 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
          */
         case 0x03:
         {
+#ifdef IPOD_VIDEO
+            /* v63: video docks / AV remotes.  Bits: 0 play/pause, 1 next video, 2 previous video, 3 stop, 4 play,
+             * 5 pause, 6 begin FF, 7 begin REW (released = end), 8 next chapter, 9 previous chapter,
+             * 10/11 next/previous frame (not supported: ignored).  The 5G/5.5G took these without authentication. */
+            static uint32_t vprev;
+            uint32_t bits = 0, pressed, released;
+            unsigned int i;
+            if (!iap_ident_stock() && !DEVICE_AUTHENTICATED) {
+                cmd_ack(cmd, IAP_ACK_NO_AUTHEN);
+                break;
+            }
+            if (!IAP_VIDEO_ACTIVE()) {
+                vprev = 0;
+                cmd_ack(cmd, IAP_ACK_CMD_FAILED);   /* no video playing */
+                break;
+            }
+            for (i = 2; i < len && i < 6; i++)
+                bits |= (uint32_t)buf[i] << (8 * (i - 2));
+            pressed = bits & ~vprev;
+            released = vprev & ~bits;
+            vprev = bits;
+            if (pressed & BIT_N(0)) bcm_video_remote(IAPV_TOGGLE, 0);
+            if (pressed & BIT_N(1)) bcm_video_remote(IAPV_NEXT, 0);
+            if (pressed & BIT_N(2)) bcm_video_remote(IAPV_PREV, 0);
+            if (pressed & BIT_N(3)) bcm_video_remote(IAPV_STOP, 0);
+            if (pressed & BIT_N(4)) bcm_video_remote(IAPV_PLAY, 0);
+            if (pressed & BIT_N(5)) bcm_video_remote(IAPV_PAUSE, 0);
+            if (pressed & BIT_N(6)) bcm_video_remote(IAPV_FF, 0);
+            else if (pressed & BIT_N(7)) bcm_video_remote(IAPV_REW, 0);
+            if ((released & (BIT_N(6) | BIT_N(7))) && !(bits & (BIT_N(6) | BIT_N(7))))
+                bcm_video_remote(IAPV_FFREW_END, 0);
+            if (pressed & BIT_N(8)) bcm_video_remote(IAPV_CH_NEXT, 0);
+            if (pressed & BIT_N(9)) bcm_video_remote(IAPV_CH_PREV, 0);
+            cmd_ok(cmd);
+            break;
+#else
             if (!DEVICE_AUTHENTICATED) {
                 cmd_ack(cmd, IAP_ACK_NO_AUTHEN);
                 break;
@@ -317,6 +385,7 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
 
             cmd_ack(cmd, IAP_ACK_CMD_FAILED);
             break;
+#endif
         }
 
         /* AudioButtonStatus (0x04)
@@ -343,7 +412,11 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
         {
             unsigned char repeatbuf[6];
 
+#ifdef IPOD_VIDEO
+            if (!iap_ident_stock() && !DEVICE_AUTHENTICATED) {   /* v63: no authentication on the 5G/5.5G */
+#else
             if (!DEVICE_AUTHENTICATED) {
+#endif
                 cmd_ack(cmd, IAP_ACK_NO_AUTHEN);
                 break;
             }

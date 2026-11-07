@@ -93,6 +93,11 @@
 #else
 #define FUNCTYPE(a) {.func = a}
 #endif
+
+#ifdef HAVE_BATTERY_SMOOTH_API
+static void battery_reading_cb(int v) { battery_set_smooth(v == 0); }
+#endif
+
 #define NODEFAULT INT(0)
 
 #ifdef HAVE_TOUCHSCREEN
@@ -1322,6 +1327,10 @@ const struct settings_list settings[] = {
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
                    ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
     OFFON_SETTING(0, bcm_tv_wide, LANG_TV_WIDESCREEN, false, "tv widescreen", NULL),
+#ifdef HAVE_BATTERY_SMOOTH_API
+    CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "smooth,exact", battery_reading_cb, 2,
+                   ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),
+#endif
 #endif
     /* display */
      CHOICE_SETTING(F_TEMPVAR|F_THEMESETTING, cursor_style, LANG_INVERT_CURSOR,
@@ -1449,6 +1458,10 @@ const struct settings_list settings[] = {
 #ifdef HAVE_ACCESSORY_SUPPLY
     OFFON_SETTING(0, accessory_supply, LANG_ACCESSORY_SUPPLY,
                   true, "accessory power supply", accessory_supply_set),
+#endif
+#if defined(IPOD_ACCESSORY_PROTOCOL) && defined(IPOD_VIDEO)
+    CHOICE_SETTING(0, accessory_id, LANG_ACCESSORY_ID, 0, "accessory identity", "ipod video,ipod classic", NULL, 2,
+                   ID2P(LANG_ACCESSORY_ID_VIDEO), ID2P(LANG_ACCESSORY_ID_CLASSIC)),
 #endif
 #ifdef HAVE_LINEOUT_POWEROFF
     OFFON_SETTING(0, lineout_active, LANG_LINEOUT,

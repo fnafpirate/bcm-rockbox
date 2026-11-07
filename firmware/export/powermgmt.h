@@ -119,6 +119,31 @@ struct battery_tables_t {
 
 /* Returns battery status, filtered for runtime estimation */
 int battery_level(void); /* percent */
+#if defined(IPOD_VIDEO) && (CONFIG_BATTERY_MEASURE & VOLTAGE_MEASURE) && !(CONFIG_BATTERY_MEASURE & PERCENTAGE_MEASURE) && !defined(BOOTLOADER) && !defined(SIMULATOR)
+/* bcm overlay v58: smoothed, load-compensated battery percentage (see battery_smooth.h) */
+#define HAVE_BATTERY_SMOOTH_API
+struct battery_smooth_info {
+    bool enabled;
+    int raw_percent;          /* Rockbox's plain number */
+    int est_permille;         /* load-compensated estimate */
+    int resistance_mohm;      /* learned battery resistance */
+    unsigned loads;           /* bit 0 backlight, 1 boost, 2 playback, 3 video */
+    int sag_mv[4];            /* voltage drop per load in use */
+    int measured[4];          /* how often each drop was measured */
+    /* v59: Apple's curve */
+    int sub_raw;              /* subtractor-mode ADC reading */
+    bool cal_ok;              /* its mV scale is known */
+    int cal_a, cal_b1000;     /* mV = a + raw * b1000 / 1000 */
+    int cal_n;                /* pairs compared */
+    bool apple_curve;         /* Apple's battery curve in use */
+    int apple_table;          /* which of Apple's six tables (0..5) */
+    unsigned hw_rev;
+    unsigned short curve_mv[11];  /* curve in use: mV at 0, 10, ... 100 % */
+};
+void battery_set_smooth(bool on);
+void powermgmt_set_load_hint(int load, bool on);   /* load 3 = the video decoder (BCM) */
+void battery_smooth_info(struct battery_smooth_info *i);
+#endif
 int battery_time(void); /* minutes */
 int battery_voltage(void); /* filtered batt. voltage in millivolts */
 int battery_current(void); /* battery current in milliamps

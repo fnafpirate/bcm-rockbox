@@ -78,6 +78,21 @@ unsigned int power_input_status(void)
 }
 
 /* Returns true if the unit is charging the batteries. */
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+/* bcm overlay v60: the LTC4066's CHRG output flickers around the end of a charge and while the charge current is
+   limited (USB 100 mA, a FireWire supply sagging, the battery topping up again), which made "charging" / "charged"
+   (and the battery icon and percentage) flip back and forth.  A change is only reported once the pin has kept its new
+   level for 3 s; the very first read is taken as is. */
+bool charging_state(void) {
+    static bool shown, inited;
+    static long since;
+    bool raw = (GPIOB_INPUT_VAL & 0x01) ? false : true;
+    if (!inited) { inited = true; shown = raw; since = current_tick; return shown; }
+    if (raw == shown) since = current_tick;
+    else if (current_tick - since >= 3 * HZ) { shown = raw; since = current_tick; }
+    return shown;
+}
+#else
 bool charging_state(void) {
 #if defined(IPOD_COLOR)
     /* 0x70000088 appears to be the input value for GPO32 bits.
@@ -90,6 +105,7 @@ bool charging_state(void) {
     return (GPIOB_INPUT_VAL & 0x01)?false:true;
 #endif
 }
+#endif
 #endif /* CONFIG_CHARGING */
 
 

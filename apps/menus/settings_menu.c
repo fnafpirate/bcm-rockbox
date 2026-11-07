@@ -250,6 +250,9 @@ static int filemenu_callback(int action,
 #if BATTERY_CAPACITY_INC > 0
 MENUITEM_SETTING(battery_capacity, &global_settings.battery_capacity, NULL);
 #endif
+#ifdef HAVE_BATTERY_SMOOTH_API
+MENUITEM_SETTING(battery_reading, &global_settings.battery_reading, NULL);
+#endif
 
 #ifdef HAVE_USB_CHARGING_ENABLE
 static int usbcharging_callback(int action,
@@ -271,6 +274,9 @@ MENUITEM_SETTING(usb_charging, &global_settings.usb_charging, usbcharging_callba
 MAKE_MENU(battery_menu, ID2P(LANG_BATTERY_MENU), 0, Icon_NOICON,
 #if BATTERY_CAPACITY_INC > 0
             &battery_capacity,
+#endif
+#ifdef HAVE_BATTERY_SMOOTH_API
+            &battery_reading,
 #endif
 #ifdef HAVE_USB_CHARGING_ENABLE
             &usb_charging,
@@ -366,6 +372,9 @@ MENUITEM_SETTING(serial_bitrate, &global_settings.serial_bitrate, NULL);
 #endif
 #ifdef HAVE_ACCESSORY_SUPPLY
 MENUITEM_SETTING(accessory_supply, &global_settings.accessory_supply, NULL);
+#endif
+#if defined(IPOD_ACCESSORY_PROTOCOL) && defined(IPOD_VIDEO)
+MENUITEM_SETTING(accessory_id, &global_settings.accessory_id, NULL);
 #endif
 #ifdef HAVE_LINEOUT_POWEROFF
 MENUITEM_SETTING(lineout_onoff, &global_settings.lineout_active, NULL);
@@ -465,6 +474,9 @@ MAKE_MENU(system_menu, ID2P(LANG_SYSTEM),
 #endif
 #ifdef HAVE_ACCESSORY_SUPPLY
             &accessory_supply,
+#endif
+#if defined(IPOD_ACCESSORY_PROTOCOL) && defined(IPOD_VIDEO)
+            &accessory_id,
 #endif
 #ifdef HAVE_LINEOUT_POWEROFF
             &lineout_onoff,

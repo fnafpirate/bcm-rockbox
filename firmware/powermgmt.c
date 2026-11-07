@@ -35,6 +35,7 @@
 #include "backlight.h"
 #include "lcd.h"
 #include "rtc.h"
+#include "hwcompat.h"
 #if CONFIG_TUNER
 #include "fmradio.h"
 #endif
@@ -139,6 +140,121 @@ static const char power_thread_name[] = "power";
 int _battery_level(void) { return -1; }
 #endif
 static int percent_now; /* Cached to avoid polling too often */
+#if defined(IPOD_VIDEO) && (CONFIG_BATTERY_MEASURE & VOLTAGE_MEASURE) && !(CONFIG_BATTERY_MEASURE & PERCENTAGE_MEASURE) && !defined(BOOTLOADER) && !defined(SIMULATOR)
+#define HAVE_BATTERY_SMOOTH
+extern bool pcm_is_playing(void);
+/* bcm overlay v58: stock-like battery percentage (firmware/export/battery_smooth.h) */
+#include "battery_smooth.h"
+static struct bsm bsm;
+static bool bsm_on = true;
+static unsigned bsm_hints;          /* loads reported by the apps (the video player) */
+static long bsm_tick;
+static int bsm_sample = -1;         /* latest raw voltage sample */
+static int percent_raw = -1;        /* Rockbox's own number, for the debug screen */
+void battery_set_smooth(bool on) { bsm_on = on; }
+void powermgmt_set_load_hint(int load, bool on)
+{
+    if (on) bsm_hints |= 1u << load; else bsm_hints &= ~(1u << load);
+}
+/* the LTC4066's charge-current monitor (same scaling as the battery debug screen) */
+static int bsm_charge_ma(void)
+{
+    if (!charging_state()) return 0;
+    if (probed_ramsize == 64) return (adc_read(ADC_4066_ISTAT) * 2400) / (1024 * 2);
+    return (adc_read(ADC_4066_ISTAT) * 2400) / (1024 * 3);
+}
+/* ---- v59: Apple's battery curve ----
+   Apple's firmware (rt 0x264ee8) turns the subtractor-mode ADC reading into a level 0..15 with one of six 15-entry
+   threshold tables picked by hardware model ((hw >> 16) - 4: 0,1 -> A; 2,4,6 and others -> B; 3 -> C; 5 -> D; 7 -> E;
+   8 -> F; image 0x69c13c, RAM 0x1081de98).  The UI (rt 0x1dfe44) scales level/15 to 20 icon steps, lets it fall at
+   most one step per update and re-reads only every 7th update on external power.
+   Rockbox reads the resistive-divider mode in mV; the subtractor mode's scale is not documented, so the two are compared
+   while running (least squares over all pairs since boot) and, once the fit is solid, Apple's thresholds are converted
+   to mV and used as the battery curve, and the finer subtractor reading is used as the voltage. */
+static const unsigned short apple_tab[6][15] = {
+    { 282, 287, 305, 315, 319, 324, 331, 341, 351, 367, 388, 400, 423, 450, 472 },
+    { 275, 286, 302, 312, 316, 321, 327, 334, 342, 354, 373, 389, 404, 419, 445 },
+    { 287, 292, 312, 322, 325, 329, 335, 343, 358, 376, 393, 407, 422, 456, 475 },
+    { 291, 303, 314, 321, 324, 328, 332, 339, 348, 363, 379, 391, 405, 414, 440 },
+    { 283, 302, 311, 317, 319, 325, 330, 338, 350, 365, 382, 395, 404, 436, 454 },
+    { 277, 295, 306, 315, 320, 325, 331, 340, 353, 368, 382, 397, 415, 434, 456 },
+};
+static int apple_table_index(void)
+{
+    static const signed char map[9] = { 0, 0, 1, 2, 1, 3, 1, 4, 5 };
+    int m = (int)(IPOD_HW_REVISION >> 16) - 4;
+    return (m >= 0 && m < 9) ? map[m] : 1;
+}
+static int64_t cal_n, cal_sx, cal_sy, cal_sxx, cal_sxy;
+static int32_t cal_a, cal_b16;           /* mV = cal_a + raw * cal_b16 / 65536 */
+static bool cal_ok;
+static unsigned short apple_curve[11];   /* Apple's curve in mV, 0..100 % by 10 */
+static bool apple_curve_ok;
+static int bsm_sub_raw = -1;
+
+static void cal_add(int raw, int mv)
+{
+    int64_t den;
+    if (raw <= 0 || raw >= 1023 || mv <= 0) return;
+    cal_n++; cal_sx += raw; cal_sy += mv; cal_sxx += (int64_t)raw * raw; cal_sxy += (int64_t)raw * mv;
+    if (cal_n < 1200 || (cal_n & 255)) return;              /* >= 10 min of pairs, refit every ~2 min */
+    den = cal_n * cal_sxx - cal_sx * cal_sx;                 /* n^2 * variance of raw */
+    if (den < cal_n * cal_n * 16) return;                    /* raw must have moved: std dev >= 4 counts */
+    {
+        int64_t b16 = ((cal_n * cal_sxy - cal_sx * cal_sy) << 16) / den;
+        int32_t a = (int32_t)((cal_sy - ((b16 * cal_sx) >> 16)) / cal_n);
+        int k;
+        /* sane? (resistive mode is 5.86 mV/count; the subtractor reads finer) */
+        if (b16 < 65536 * 3 / 2 || b16 > 65536 * 5) return;
+        cal_a = a; cal_b16 = (int32_t)b16; cal_ok = true;
+        /* Apple's thresholds -> mV: threshold k = level k+1 = (k+1)/15 of the capacity; 0 % at the shutoff voltage */
+        {
+            const unsigned short *t = apple_tab[apple_table_index()];
+            int mvk[16];
+            mvk[0] = battery_level_shutoff;
+            for (k = 0; k < 15; k++) mvk[k + 1] = cal_a + (int32_t)(((int64_t)t[k] * cal_b16) >> 16);
+            if (mvk[1] < 3150 || mvk[1] > 3850 || mvk[15] < 3900 || mvk[15] > 4350) { apple_curve_ok = false; return; }
+            for (k = 0; k <= 10; k++)
+            {   /* p % = level p*15/100 on the 0..15 scale */
+                int lv10 = k * 15;                           /* level x10 */
+                int i = lv10 / 10, f = lv10 % 10;
+                apple_curve[k] = (unsigned short)(i >= 15 ? mvk[15] : mvk[i] + (mvk[i + 1] - mvk[i]) * f / 10);
+            }
+            for (k = 0; k < 10; k++) if (apple_curve[k + 1] <= apple_curve[k]) apple_curve[k + 1] = apple_curve[k] + 1;
+            apple_curve_ok = true;
+        }
+    }
+}
+void battery_smooth_info(struct battery_smooth_info *i)
+{
+    int k;
+    i->sub_raw = bsm_sub_raw;
+    i->cal_ok = cal_ok;
+    i->cal_a = cal_a;
+    i->cal_b1000 = (int)(((int64_t)cal_b16 * 1000) >> 16);
+    i->cal_n = (int)(cal_n > 2000000000 ? 2000000000 : cal_n);
+    i->apple_curve = apple_curve_ok;
+    i->apple_table = apple_table_index();
+    i->hw_rev = (unsigned)IPOD_HW_REVISION;
+    for (k = 0; k < 11; k++) i->curve_mv[k] = apple_curve_ok ? apple_curve[k] : percent_to_volt_discharge[k];
+    i->enabled = bsm_on;
+    i->raw_percent = percent_raw;
+    i->est_permille = bsm.target_pm;
+    i->resistance_mohm = bsm.r_mohm;
+    i->loads = bsm.cls;
+    for (k = 0; k < 4; k++) { i->sag_mv[k] = bsm.sag[k]; i->measured[k] = bsm.learned[k]; }
+}
+static unsigned bsm_loads(void)
+{
+    unsigned c = bsm_hints;
+    if (is_backlight_on(true)) c |= 1u << BSM_BACKLIGHT;
+#ifdef HAVE_ADJUSTABLE_CPU_FREQ
+    if (cpu_frequency > CPUFREQ_NORMAL) c |= 1u << BSM_BOOST;
+#endif
+    if (pcm_is_playing()) c |= 1u << BSM_AUDIO;
+    return c;
+}
+#endif
 
 #if !(CONFIG_BATTERY_MEASURE & TIME_MEASURE)
 int _battery_time(void) { return -1; }
@@ -277,6 +393,9 @@ static void average_init(void)
 #endif /* HAVE_DISK_STORAGE */
 
     voltage_avg = voltage_now * BATT_AVE_SAMPLES;
+#ifdef HAVE_BATTERY_SMOOTH
+    bsm_sample = voltage_now;
+#endif
 #endif /* CONFIG_BATTERY_MEASURE & VOLTAGE_MEASURE */
 
 #if CONFIG_BATTERY_MEASURE & CURRENT_MEASURE
@@ -291,6 +410,13 @@ static void average_step(bool low_battery)
 {
 #if CONFIG_BATTERY_MEASURE & VOLTAGE_MEASURE
     int millivolts = _battery_voltage();
+#ifdef HAVE_BATTERY_SMOOTH
+    bsm_sample = millivolts;
+    bsm_sub_raw = adc_read(ADC_BATTERY_SUBTR);
+    if (!charger_inserted()) cal_add(bsm_sub_raw, millivolts);
+    if (cal_ok && bsm_sub_raw > 0)                            /* the finer reading, on the same mV scale */
+        bsm_sample = cal_a + (int32_t)(((int64_t)bsm_sub_raw * cal_b16) >> 16);
+#endif
     if(low_battery) {
         voltage_now = (millivolts + voltage_now + 1) / 2;
         voltage_avg += voltage_now - voltage_avg / BATT_AVE_SAMPLES;
@@ -447,6 +573,18 @@ static void battery_status_update(void)
         time_now = 0;
 #endif
 
+#ifdef HAVE_BATTERY_SMOOTH
+    percent_raw = level;
+    if (level >= 0 && bsm_sample > 0)
+    {
+        long now = current_tick;
+        int shown = bsm_step(&bsm, bsm_sample, bsm.inited ? (now - bsm_tick) * (1000 / HZ) : 0, bsm_loads(),
+                             charger_inserted(), charging_state(), bsm_charge_ma(), battery_capacity,
+                             apple_curve_ok ? apple_curve : percent_to_volt_discharge);
+        bsm_tick = now;
+        if (bsm_on) level = shown;
+    }
+#endif
     percent_now = level;
     send_battery_level_event(level);
 }

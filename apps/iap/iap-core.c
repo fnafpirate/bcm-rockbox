@@ -198,6 +198,102 @@ enum interface_state interface_state = IST_STANDARD;
 
 struct device_t device;
 
+#ifdef IPOD_VIDEO
+#include "hwcompat.h"
+#include "pcf5060x.h"
+#include "pcf50605.h"
+#include "i2c-pp.h"
+/* bcm overlay v62: accessory identity (see iap-core.h) */
+bool iap_ident_stock(void)
+{
+    return global_settings.accessory_id == 0;
+}
+uint32_t iap_ident_model(void)
+{
+    if (iap_ident_stock())
+    {
+        uint32_t r = IPOD_HW_REVISION;
+        return (r >> 16) == 0xb ? r : 0x000B0005U;
+    }
+    return 0x00130200U;
+}
+const char *iap_ident_variant(void)
+{
+    if (iap_ident_stock())   /* 5.5G white: MA444 30 GB, MA448 80 GB */
+        return (IPOD_HW_REVISION & 0xffff) >= 6 ? "MA448" : "MA444";
+    return "MC293";
+}
+int iap_ident_fw(int part)
+{
+    static const unsigned char stock[3] = { 1, 3, 0 }, classic[3] = { 2, 0, 3 };
+    return (iap_ident_stock() ? stock : classic)[part];
+}
+
+/* The accessory-identify resistor on dock pin 21, read like Apple's RsistrAccsryMgr task (rt 0xfebf8 -> 0x266034):
+   the PCF's ADC bias is switched on (ADCC1 = 0x08, rt 0x2835cc), it settles for 80 ms, then one 8-bit conversion of mux 4
+   (BATTEMP input = pin 21 on the 5G/5.5G, hw 0xB) is taken with ADCC1 = 0x10 (rt 0x28341c, mode 3), which also leaves the
+   bias off again.  Apple uses the top four bits: 15 = nothing connected; 3 = the accessory wants power (accessory supply on,
+   rt 0x264d78(3)); 0 and 1 send their own events. */
+int iap_acc_id_code = -1;
+static int acc_id_raw = -1;
+static void acc_id_bias_on(void)
+{
+    pcf50605_write(PCF5060X_ADCC1, 0x08);
+}
+static int acc_id_convert(void)
+{
+    unsigned char c[2] = { 0x10, (4 << 1) | 0x01 | 0x80 }, d[2];
+    int n;
+    i2c_lock();
+    pcf50605_write_multiple(PCF5060X_ADCC1, c, 2);
+    for (n = 0; n < 50; n++)
+    {
+        pcf50605_read_multiple(PCF5060X_ADCS1, d, 2);
+        if (d[1] & 0x80)
+            break;
+    }
+    pcf50605_write(PCF5060X_ADCC1, 0x00);
+    i2c_unlock();
+    acc_id_raw = d[0];
+    return d[0] >> 4;
+}
+int iap_acc_id_read(void)
+{
+    acc_id_bias_on();
+    sleep(HZ / 12 + 1);
+    return acc_id_convert();
+}
+/* polled from iap_periodic(): bias on at one tick, convert one tick (100 ms) later, once a second */
+static void acc_id_poll(void)
+{
+    static int phase, last = -1, stable;
+    if (++phase == 9)
+        acc_id_bias_on();
+    else if (phase >= 10)
+    {
+        int c = acc_id_convert();
+        phase = 0;
+        if (c == last)
+        {
+            if (++stable == 2 && c != iap_acc_id_code)
+            {
+                int was = iap_acc_id_code;
+                iap_acc_id_code = c;
+                /* an accessory that identified itself by resistor was unplugged: undo its temporary video settings */
+                if (c == 15 && was >= 0 && was < 15)
+                    iap_video_prefs_restore();
+            }
+        }
+        else
+        {
+            last = c;
+            stable = 0;
+        }
+    }
+}
+#endif
+
+
 #ifdef IAP_MALLOC_DYNAMIC
 static int iap_move_callback(int handle, void* current, void* new);
 
@@ -328,6 +424,10 @@ void iap_reset_state(IF_IAP_MP_NONVOID(int port))
 
 void iap_reset_device(struct device_t* device)
 {
+#ifdef IPOD_VIDEO
+    /* v62: a new (or re-identifying) accessory: undo the previous one's "restore on exit" preferences */
+    iap_video_prefs_restore();
+#endif
     iap_reset_auth(&(device->auth));
     device->lingoes = 0;
     device->notifications = 0;
@@ -742,9 +842,24 @@ void iap_get_trackinfo(const unsigned int track, struct mp3entry* id3)
 uint32_t iap_get_trackpos(void)
 {
     struct mp3entry *id3 = audio_current_track();
+#ifdef IPOD_VIDEO
+    uint32_t pos;
+    if (bcm_video_status(NULL, &pos, NULL))   /* v63: a video plays: its position */
+        return pos;
+#endif
 
     return id3->elapsed;
 }
+
+#ifdef IPOD_VIDEO
+int iap_play_status(void)
+{
+    int st;
+    if (bcm_video_status(NULL, NULL, &st))
+        return st == 2 ? (AUDIO_STATUS_PLAY | AUDIO_STATUS_PAUSE) : AUDIO_STATUS_PLAY;
+    return audio_status();
+}
+#endif
 
 uint32_t iap_get_trackindex(void)
 {
@@ -758,6 +873,10 @@ void iap_periodic(void)
     static int count;
 
     if(!iap_setupflag) return;
+
+#ifdef IPOD_VIDEO
+    acc_id_poll();
+#endif
 
     /* Handle pending authentication tasks */
     switch (device.auth.state)
@@ -933,8 +1052,7 @@ void iap_periodic(void)
     /* Are we in Extended Mode */
     if (interface_state == IST_EXTENDED) {
         /* Return Track Position */
-        struct mp3entry *id3 = audio_current_track();
-        unsigned long time_elapsed = id3->elapsed;
+        unsigned long time_elapsed = iap_get_trackpos();   /* v63: the video's, while one plays */
         IAP_TX_INIT4(0x04, 0x0027);
         IAP_TX_PUT(0x04);
         IAP_TX_PUT_U32(time_elapsed);
@@ -1026,7 +1144,7 @@ void iap_periodic(void)
     {
         unsigned char play_status;
 
-        play_status = audio_status();
+        play_status = iap_play_status();
         if (device.play_status != play_status)
         {
 			/* If play_status = PAUSE/STOP we should mute else
@@ -1481,6 +1599,21 @@ bool dbg_iap(void)
         lcd_putsf(0, 1, "lin: %08x", device.lingoes);
         lcd_putsf(0, 2, "notif: %08x", device.notifications);
         lcd_putsf(0, 3, "cap: %08x/%08x", device.capabilities, device.capabilities_queried);
+#ifdef IPOD_VIDEO
+        {   /* v62 */
+            static long next;
+            static int code = -1;
+            if (TIME_AFTER(current_tick, next))
+            {
+                code = iap_acc_id_read();
+                next = current_tick + HZ;
+            }
+            lcd_putsf(0, 4, "id: %08lx %s %d.%d.%d", (unsigned long)IAP_IPOD_MODEL, IAP_IPOD_VARIANT,
+                      IAP_IPOD_FIRMWARE_MAJOR, IAP_IPOD_FIRMWARE_MINOR, IAP_IPOD_FIRMWARE_REV);
+            lcd_putsf(0, 5, "pin21: adc %d code %d%s", acc_id_raw, code,
+                      code == 15 ? " (none)" : code == 3 ? " (power)" : "");
+        }
+#endif
 
         // frame_state.state
         // serial state

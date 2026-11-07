@@ -81,6 +81,10 @@ static void get_volume_params(int db, int *dac, int *amp)
     }
 }
 
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+static int cur_fsel = -1;     /* bcm overlay v60: rate the PLL is programmed for (-1 = unknown) */
+#endif
+
 static void audiohw_mute(bool mute)
 {
     if (mute) {
@@ -92,6 +96,9 @@ static void audiohw_mute(bool mute)
 
 void audiohw_preinit(void)
 {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    cur_fsel = -1;
+#endif
     /* Set low bias mode */
     wmcodec_write(BIASCTRL, BIASCTRL_BIASCUT);
     /* Enable HPCOM, LINECOM */
@@ -128,9 +135,18 @@ void audiohw_preinit(void)
 
 void audiohw_postinit(void)
 {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    /* bcm overlay v61: Apple's firmware runs the codec with VMIDSEL = 01 (100k divider; its power-up sequence ends with
+       R1 = 0x02d, rt 0x283af8).  Rockbox used the 500k divider to save a few uA, which makes the mid-rail reference of
+       every output stage much weaker against supply noise -- audible as hiss/hum on the dock line-out when an accessory
+       powered by the iPod (a Bluetooth transmitter) pulls current in bursts. */
+    wmcodec_write(PWRMGMT1, PWRMGMT1_PLLEN | PWRMGMT1_BIASEN
+                          | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_100K);
+#else
     wmcodec_write(PWRMGMT1, PWRMGMT1_PLLEN | PWRMGMT1_BIASEN
                           | PWRMGMT1_BUFIOEN | PWRMGMT1_VMIDSEL_500K);
                           /* lower the VMID power consumption */
+#endif
     wmcodec_write(BIASCTRL, 0);
     audiohw_mute(false);
 }
@@ -260,6 +276,18 @@ void audiohw_set_frequency(int fsel)
     };
 
     int i;
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    /* bcm overlay v60: reprogramming the PLL while the DAC plays makes a click on both outputs -- loud through a dock
+       line-out accessory such as a Bluetooth transmitter.  Skip it when the rate does not change, otherwise ramp the
+       DAC down (soft mute) first and back up once the PLL has settled. */
+    if (fsel == cur_fsel)
+        return;
+    if (cur_fsel >= 0)
+    {
+        wmcodec_write(DACCTRL, DACCTRL_SOFTMUTE | DACCTRL_DACOSR128);
+        udelay(4000);
+    }
+#endif
 
     /* PLLN, PLLK1, PLLK2, PLLK3 are contiguous (at 0x24 to 0x27) */
     for (i = 0; i < 4; i++)
@@ -274,6 +302,14 @@ void audiohw_set_frequency(int fsel)
     wmcodec_write(ADDCTRL, (freq_setups[fsel] & ADDCTRL_SR_MASK)
                          | ADDCTRL_SLOWCLKEN);
     /* SLOWCLK enabled for zero cross timeout to work */
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    if (cur_fsel >= 0)
+    {
+        udelay(2000);                                   /* PLL lock */
+        wmcodec_write(DACCTRL, DACCTRL_DACOSR128);      /* unmute (the normal running state, see audiohw_mute) */
+    }
+    cur_fsel = fsel;
+#endif
 }
 
 void audiohw_enable_recording(bool source_mic)
