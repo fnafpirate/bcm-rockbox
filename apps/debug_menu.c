@@ -3599,7 +3599,8 @@ static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1; 
 static int cfg_ff_accel = 1;                                                        /* v47 */
 static int cfg_sound = 2, cfg_av_tol = 150, cfg_av_lead = 0, cfg_vol_start = 50, cfg_vol_step = 3;  /* v51 (v53: sound 2 = stock route) */
 static int cfg_asc_n = 2, cfg_av_offset = 0, cfg_av_stall = 7;  /* v53 */
-static int cfg_av_hz = 48000, cfg_av_mix = 1, cfg_vcvol = -1;  /* v53 stock route: codec rate, AUX into the output mixer, mp_setvol after mp_play */
+static int cfg_av_hz = 48000, cfg_av_mix = 1, cfg_vcvol = -1;
+static int cfg_vol_direct = 1;       /* v54: volume bar written straight into the visible window's image */  /* v53 stock route: codec rate, AUX into the output mixer, mp_setvol after mp_play */
 static int v_sound;                  /* v53: route in use this run (cfg_sound, or 1 after a stall fallback) */
 static bool v_fallback;              /* v53: the stock route stalled -> restart the video with Rockbox's sound */
 static int cfg_av_ready = 8;                       /* v52: PCM chunks buffered before the sound counts as ready */
@@ -3710,6 +3711,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "av_hz"))    cfg_av_hz = v;
         else if (!strcmp(p, "av_mix"))   cfg_av_mix = v;
         else if (!strcmp(p, "vcvol"))    cfg_vcvol = v;
+        else if (!strcmp(p, "vol_direct")) cfg_vol_direct = v;
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
@@ -4079,7 +4081,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v53 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v54 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4566,12 +4568,14 @@ static void osd_upload(struct osd_strip *s, int back)
     }
 }
 /* v53: mask = which strips to redraw (1 icon, 2 battery, 4 bottom); the volume bar redraws only the bottom strip */
+static bool osd_bottom_vol;            /* v54: the visible bottom window shows the volume bar */
 static void osd_present_mask(int mask)
 {
     uint32_t o[4], pl[8], w4[4];
     int k, back[OSD_NS];
     if (osd_ok <= 0) return;
     osd_draw();
+    if (mask & 4) osd_bottom_vol = av_vol_until && TIME_BEFORE(current_tick, av_vol_until);
     for (k = 0; k < OSD_NS; k++)
     {
         back[k] = osd_s[k].front < 0 ? 0 : 1 - osd_s[k].front;
@@ -4600,6 +4604,23 @@ static void osd_present_mask(int mask)
 }
 static bool osd_vol_only;              /* v53: only the volume bar is up (the wheel was turned while the overlay was hidden) */
 static void osd_present(void) { osd_vol_only = false; osd_present_mask(7); }
+/* v54: the volume bar while it is already on screen: redraw and write only the bar's 247x25 pixels straight into the image the
+   visible window shows (no new window, no RPCs; the VC composes the layers again for every video frame) -- ~25 KB instead of
+   66 KB + 4 round trips + a status query per update. */
+static int vol_direct_n, vol_full_n;
+static unsigned long vol_us_direct, vol_us_full;
+static void osd_vol_direct(void)
+{
+    struct osd_strip *s = &osd_s[2];
+    int y;
+    osd_draw();
+    for (y = 6; y < 31; y++)
+    {
+        bcm_io_lock();
+        bcm_io_write(s->addr[s->front] + ((unsigned)y * s->w + 13) * 4, s->cvp + y * s->w + 13, 296 * 4);   /* speakers + bar, x 13..308 */
+        bcm_io_unlock();
+    }
+}
 static void osd_hide(void)
 {
     uint32_t o[4], w4[4];
@@ -4613,7 +4634,7 @@ static void osd_hide(void)
         { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
     }
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
-    osd_visible = false; osd_vol_only = false;
+    osd_visible = false; osd_vol_only = false; osd_bottom_vol = false;
 }
 static void osd_init(void)
 {
@@ -4876,7 +4897,14 @@ static void av_codec_vc(bool on)
     if (on)
     {
         av_hz_saved = mixer_get_frequency();
-        if (cfg_av_hz > 0) mixer_set_frequency((unsigned)cfg_av_hz);
+        if (cfg_av_hz > 0)
+        {   /* v54: v53 asked for 48 kHz, but the mixer's *pending* rate was already 48 kHz (Rockbox's last track) while the
+               codec still ran at 44.1 kHz, so mixer_set_frequency() returned without touching the codec: the VC's 48 kHz
+               sound came out at 44.1 kHz (-8 %, deep) and its clock -- and the picture -- ran 8 % slow.  Switching to
+               another rate first forces pcm_apply_settings() to program the codec. */
+            mixer_set_frequency(cfg_av_hz == 44100 ? 48000 : 44100);
+            mixer_set_frequency((unsigned)cfg_av_hz);
+        }
         if (cfg_av_mix & 1)
         {   /* R50/R51: DAC + AUX (AUXxMIXVOL 5 = 0 dB) */
             wmcodec_write(LOUTMIX, LOUTMIX_DACL2LMIX | (1 << 5) | (5 << 6));
@@ -5133,20 +5161,38 @@ static void bcm_osd_tick(void)
     scrub_tick();
     mon_tick();
     av_tick();
-    if (av_vol_dirty && current_tick - av_vol_drawn >= HZ / 10 && cfg_osd)
-    {   /* v53: volume bar */
-        av_vol_dirty = false; av_vol_drawn = current_tick;
-        if (osd_ok < 0) osd_init();
-        if (!osd_visible) osd_vol_only = true;
-        osd_present_mask(4);
-        if (!pl_paused && !sc_active && (!osd_hide_at || TIME_BEFORE(osd_hide_at, av_vol_until))) osd_hide_at = av_vol_until;
-        osd_next = current_tick + HZ;
+    if (av_vol_dirty && cfg_osd)
+    {   /* v53: volume bar.  v54: once the bar is on screen, every click is drawn at once straight into the visible image */
+        struct osd_strip *b = &osd_s[2];
+        bool direct = cfg_vol_direct && osd_ok > 0 && osd_type == 15 && osd_visible && osd_bottom_vol && b->front >= 0 && b->win[b->front];
+        if (direct || current_tick - av_vol_drawn >= HZ / 20)
+        {
+            unsigned long t0 = USEC_TIMER;
+            av_vol_dirty = false; av_vol_drawn = current_tick;
+            if (direct) { osd_vol_direct(); vol_direct_n++; vol_us_direct += USEC_TIMER - t0; }
+            else
+            {
+                if (osd_ok < 0) osd_init();
+                if (!osd_visible) osd_vol_only = true;
+                osd_present_mask(4);
+                vol_full_n++; vol_us_full += USEC_TIMER - t0;
+            }
+            if (!pl_paused && !sc_active && (!osd_hide_at || TIME_BEFORE(osd_hide_at, av_vol_until))) osd_hide_at = av_vol_until;
+            osd_next = current_tick + HZ;
+        }
+    }
+    if (vol_direct_n + vol_full_n && av_vol_until && !TIME_BEFORE(current_tick, av_vol_until))
+    {   /* v54: one line per volume burst */
+        BLOG("  volume %d %%: %d direct bar updates (avg %lu us), %d full (avg %lu us)", av_vol_pct, vol_direct_n,
+             vol_direct_n ? vol_us_direct / vol_direct_n : 0, vol_full_n, vol_full_n ? vol_us_full / vol_full_n : 0);
+        vol_direct_n = vol_full_n = 0; vol_us_direct = vol_us_full = 0;
     }
     if (!osd_visible || sc_active) return;
     if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused) { osd_hide(); return; }
     if (!TIME_BEFORE(current_tick, osd_next))
     {
         osd_next = current_tick + HZ;
+        if (av_vol_until && TIME_BEFORE(current_tick, av_vol_until)) return;   /* v54: the volume bar is drawn directly */
         pl_status();
         if (osd_vol_only) osd_present_mask(4); else osd_present();
     }
@@ -5266,6 +5312,7 @@ static void bcm_video_run(int secs)
     bool hold_was = button_hold();
     bool probed = !cfg_trickprobe;
     bool av_checked = false;
+    uint32_t rate_e0 = 0; long rate_t0 = 0; int rate_seeks = 0;   /* v54: VC clock speed vs real time */
     if (v_sound == 2 && cfg_vcvol >= 0)
     {   char c[24]; int r2;
         snprintf(c, sizeof c, "mp_setvol %d", cfg_vcvol);
@@ -5315,11 +5362,26 @@ static void bcm_video_run(int secs)
                 v_fallback = true;
                 break;
             }
+            if (e != 0xffffffffu) { rate_e0 = e; rate_t0 = current_tick; rate_seeks = v_seeks; }
             if (a_frames == 0)
             {   int pct = av_vol_pct;
                 BLOG("  audio: the VC plays the picture but never asked for sound -> Rockbox plays it (sound=1)");
                 av_close(); v_sound = 1; av_open(bcm_play_path ? bcm_play_path : v_path); av_set_vol(pct);
             }
+        }
+        if (rate_t0 && current_tick - rate_t0 > 6 * HZ)
+        {   /* v54: the VC's clock follows its sound output: 100 % = the sound plays at the right speed/pitch */
+            if (!pl_paused && !sc_active && v_seeks == rate_seeks)
+            {
+                uint32_t e = av_vc_elapsed();
+                long ms = (current_tick - rate_t0) * 1000 / HZ;
+                if (e != 0xffffffffu && e > rate_e0)
+                    BLOG("  audio: VC clock speed %ld.%ld %% of real time (%u ms in %ld ms)%s", (long)(e - rate_e0) * 100 / ms,
+                         ((long)(e - rate_e0) * 1000 / ms) % 10, (unsigned)(e - rate_e0), ms,
+                         (e - rate_e0) * 100 / ms < 96 ? " -- SLOW: the codec is not at the VC's sample rate (sound too deep)" : "");
+                rate_t0 = 0;
+            }
+            else { rate_t0 = current_tick; rate_e0 = av_vc_elapsed(); rate_seeks = v_seeks; if (rate_e0 == 0xffffffffu) rate_t0 = 0; }
         }
         if (!TIME_BEFORE(current_tick, next_log))
         {
@@ -5974,7 +6036,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_fd = creat(BCM_LOG_PATH, 0666);
     bcm_t_start = current_tick;
-    BLOG("bcm host test v53, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v54, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
