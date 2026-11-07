@@ -110,6 +110,7 @@ static struct {
     bool     gfx_wait; uint32_t gfx_seq; bool gfx_done; uint32_t gfx_op; uint16_t gfx_len; uint8_t gfx_pl[48];
     /* VCFS */
     char     vfs_root[96];
+    bool     vfs_flat;
     int      vfs_fd[8];
     /* PDS */
     const struct bcm_pds_ops *pds_ops;
@@ -467,12 +468,17 @@ int bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], ui
     c->seq = (c->seq + 1) & 0x7fffffffu;
     hi.gfx_wait = true; hi.gfx_done = false; hi.gfx_seq = c->seq;
     if (hi_tx(c, op, c->seq, in, inlen) < 0) { hi.gfx_wait = false; return -1; }
-    for (int i = 0; i < max_polls; i++)
+    uint32_t t0 = bcm_io_us();
+    for (int i = 0; i < max_polls; )
     {
         if (bcm_io_dead()) { hi.gfx_wait = false; return -5; }
         bcm_host_service();
         if (hi.gfx_done) break;
+        /* v56: the VC answers graphics RPCs in well under a millisecond; sleeping a whole tick per poll made every RPC cost
+           10-20 ms (a full overlay present = 8 RPCs = ~160 ms: the laggy volume bar / FF / REW).  Spin for 20 ms first. */
+        if (bcm_io_us() - t0 < 20000) { bcm_io_yield(); continue; }
         bcm_io_idle();
+        i++;
     }
     hi.gfx_wait = false;
     if (!hi.gfx_done) return -2;
@@ -482,6 +488,8 @@ int bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], ui
 }
 
 /* ------------------------------------------------------------------ VCFS ------ */
+void bcm_vfs_set_flat(bool flat) { hi.vfs_flat = flat; }
+
 void bcm_vfs_set_root(const char *root)
 {
     size_t n = strlen(root);
@@ -518,6 +526,12 @@ static void vcfs_dispatch(struct hi_chan *c, const struct hi_msg *m)
             for (size_t i = 0; ok && i + 1 < rl; i++)               /* no path traversal */
                 if (req[i] == '.' && req[i + 1] == '.') ok = false;
             size_t rootl = strlen(hi.vfs_root);
+            if (ok && hi.vfs_flat) {                      /* v56: keep only the file name */
+                size_t b = rl;
+                while (b > 0 && req[b - 1] != '/') b--;
+                memmove(req + 1, req + b, rl - b + 1);
+                req[0] = '/'; rl = rl - b + 1;
+            }
             if (ok && rootl + rl + 5 < sizeof path) {
                 memcpy(path, hi.vfs_root, rootl);
                 memcpy(path + rootl, req, rl);

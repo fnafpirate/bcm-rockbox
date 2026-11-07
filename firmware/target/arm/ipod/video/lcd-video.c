@@ -426,6 +426,16 @@ void bcm_io_idle(void)
     sleep(1);                        /* one tick; bcm_host.c poll counts are in ticks */
 }
 
+void bcm_io_yield(void)
+{
+    yield();
+}
+
+uint32_t bcm_io_us(void)
+{
+    return (uint32_t)USEC_TIMER;
+}
+
 #ifdef HAVE_LCD_SLEEP
 /* Replace the VideoCore OS image used by bcm_init() and power-cycle the BCM so that it boots from it.
    `img` must stay valid for as long as the LCD may sleep/wake (bcm_init() re-uploads it each
@@ -468,6 +478,15 @@ int bcm_restore_rom_vmcs(void)
     lcd_state.blocked = false;
     lcd_state.state = LCD_INITIAL;
     lcd_awake();                                       /* bcm_init() + first LCD update */
+    {   /* v56: lcd_awake() returns when the first update has been KICKED; the ROM firmware initialises the panel during that
+           update (~200 ms).  Turning the backlight on before it finishes showed the uninitialised (white) panel.  Wait until
+           the update is done, push the frame buffer once more, wait again, then light it. */
+        long t = current_tick + HZ / 2;
+        while (lcd_state.display_on && lcd_state.state != LCD_IDLE && TIME_BEFORE(current_tick, t)) yield();
+        lcd_update();
+        t = current_tick + HZ / 4;
+        while (lcd_state.display_on && lcd_state.state != LCD_IDLE && TIME_BEFORE(current_tick, t)) yield();
+    }
     _backlight_hw_enable(true);
     if (bcm_init_failed) return -3;
     return lcd_state.display_on ? 0 : -2;

@@ -63,6 +63,8 @@ int  bcm_gencmd_poll(char *resp, size_t resp_sz);
 /* Paths the VC sends start with "/Resources/". They are mapped to root + path.
  * Example: bcm_vfs_set_root("/.rockbox/vc") -> /.rockbox/vc/Resources/VideoCore/Library/h264dec.vll */
 void bcm_vfs_set_root(const char *root);
+/* v56: flat folder: every requested "/Resources/.../<name>" is served from <root>/<name> (e.g. /.rockbox/VideoCore/mplayer.vll) */
+void bcm_vfs_set_flat(bool flat);
 
 /* ---- channel 7: VCPD (passthrough data stream: frames for the player) --------- */
 

@@ -17384,3 +17384,20 @@
     ipodvideo: "TV Off"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_TV_WIDESCREEN
+  desc: video out: the TV is 16:9
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Widescreen TV"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Widescreen TV"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Widescreen TV"
+  </voice>
+</phrase>

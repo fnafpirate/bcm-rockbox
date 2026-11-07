@@ -34,6 +34,9 @@ void bcm_io_status(unsigned v[4]) { v[0] = v[1] = v[2] = v[3] = 0; }
 static int mock_dead;
 int bcm_io_dead(void) { return mock_dead; }
 void bcm_io_idle(void) { if (idle_hook) idle_hook(); }
+void bcm_io_yield(void) { if (idle_hook) idle_hook(); }
+static uint32_t mock_us;
+uint32_t bcm_io_us(void) { return mock_us += 1000; }   /* each call = 1 ms, so the 20 ms spin phase ends */
 void bcm_io_read(uint32_t a, void *d, size_t n)  { if ((a | n) & 3) { printf("BAD unaligned read %x/%zu\n", a, n); exit(2); }
     if ((uint64_t)a + n > sizeof vcram) { memset(d, 0xFF, n); return; }   /* unmapped VC address reads as ones */
     memcpy(d, vcram + a, n); }

@@ -2877,6 +2877,7 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 
 #define BCM_VC_ROOT    "/.rockbox/vc"
 #define BCM_VMCS_PATH  BCM_VC_ROOT "/Resources/VideoCore/Boot/vmcs.bin"
+#define BCM_VC_FLAT    "/.rockbox/VideoCore"    /* v56: everything in one folder: vmcs.bin, mplayer.vll, h264dec.vll, aacdec.vll, ... */
 #define BCM_LOG_PATH   "/bcm_host_log.txt"
 #include "playlist.h"     /* v51: the video's sound is played by Rockbox's playback engine */
 #include "sound.h"
@@ -2884,10 +2885,26 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 #include "pcm_mixer.h"    /* v53: the codec's sample rate for the VideoCore's sound */
 #include "wmcodec.h"
 #include "wm8758.h"
+#include "backlight-target.h"   /* v56: _backlight_hw_enable() -- dark before the panel is switched off */
 #define BCM_TESTFILE_PATH BCM_VC_ROOT "/../../testfile.txt"   /* -> /.rockbox/testfile.txt: first line = video path */
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
 static int bcm_log_fd = -1;
+static bool bcm_vc_flat;               /* v56: the VideoCore files are in /.rockbox/VideoCore/ */
+/* v56: the log file is overwritten in place (no truncate + new clusters: on the 2 TB FAT32 volume v55 spent 0.8 s before the
+   second log line) and cut to its length when it is closed */
+static void bcm_log_open(void)
+{
+    bcm_log_fd = open(BCM_LOG_PATH, O_WRONLY);
+    if (bcm_log_fd < 0) bcm_log_fd = creat(BCM_LOG_PATH, 0666);
+}
+static void bcm_log_close(void)
+{
+    if (bcm_log_fd < 0) return;
+    ftruncate(bcm_log_fd, lseek(bcm_log_fd, 0, SEEK_CUR));
+    close(bcm_log_fd);
+    bcm_log_fd = -1;
+}
 static const char *bcm_play_path;   /* v47: set when started from the file browser ("player mode") */
 static bool bcm_player_mode;
 
@@ -2969,7 +2986,8 @@ static int bcm_gencmd_watched(const char *cmd, char *resp, size_t resp_sz, int m
 {
     BLOG("sending: %s", cmd);
     if (bcm_gencmd_start(cmd) < 0) { BLOG("  (not attached)"); return -1; }
-    long t0 = current_tick, last_beat = t0;
+    long t0 = current_tick, last_beat = t0, last_act = t0;
+    uint32_t rx0 = bcm_host_get_stats()->rx_msgs;
     int r = -3;
     while (r == -3) {
         r = bcm_gencmd_poll(resp, resp_sz);
@@ -2982,7 +3000,10 @@ static int bcm_gencmd_watched(const char *cmd, char *resp, size_t resp_sz, int m
         if (current_tick - t0 >= max_secs * HZ) { r = -2; break; }
         /* v45: was sleep(HZ/20): while a command was pending the frame feed (serviced inside the poll) dropped to 20/s.
            Most replies arrive within 100 ms, so poll without sleeping for that long, then once per tick. */
-        if (current_tick - t0 < HZ / 10) yield(); else sleep(1);
+        /* v56: ...and keep polling without sleeping while the VC is sending requests (VCFS reads of the .vll files: a 10 ms
+           sleep per read made loading mplayer + H264dec + AACdec take ~2.5 s) */
+        if (bcm_host_get_stats()->rx_msgs != rx0) { rx0 = bcm_host_get_stats()->rx_msgs; last_act = current_tick; }
+        if (current_tick - t0 < HZ / 10 || current_tick - last_act < HZ / 10) yield(); else sleep(1);
     }
     return r;
 }
@@ -3601,7 +3622,7 @@ static int cfg_sound = 2, cfg_av_tol = 150, cfg_av_lead = 0, cfg_vol_start = 50,
 static int cfg_asc_n = 2, cfg_av_offset = 0, cfg_av_stall = 7;  /* v53 */
 static int cfg_av_hz = 48000, cfg_av_mix = 1, cfg_vcvol = -1;
 static int cfg_vol_direct = 1;
-static int cfg_tv = -1, cfg_tv_enc = -1, cfg_tv_extra = 0;   /* v55: force TV on/off, encoding number, 1 = add svideo=1 */
+static int cfg_tv = -1, cfg_tv_enc = -1, cfg_tv_extra = 0, cfg_tv_osd = 1;   /* v55: force TV on/off, encoding number, 1 = add svideo=1 */
 static int bcm_tv;                     /* v55: this video goes to the TV (display 2) */       /* v54: volume bar written straight into the visible window's image */  /* v53 stock route: codec rate, AUX into the output mixer, mp_setvol after mp_play */
 static int v_sound;                  /* v53: route in use this run (cfg_sound, or 1 after a stall fallback) */
 static bool v_fallback;              /* v53: the stock route stalled -> restart the video with Rockbox's sound */
@@ -3717,6 +3738,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "tv"))       cfg_tv = v;
         else if (!strcmp(p, "tv_enc"))   cfg_tv_enc = v;
         else if (!strcmp(p, "tv_extra")) cfg_tv_extra = v;
+        else if (!strcmp(p, "tv_osd"))   cfg_tv_osd = v;
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
@@ -4054,13 +4076,14 @@ static void bcm_hold_ms(int ms)
 {
     long t;
     if (cfg_fast_ref() && ms > 150) ms = 150;        /* v46 fast start: no "LOOK" pauses */
+    if (cfg_fast_ref() && bcm_player_mode && ms > 30) ms = 30;   /* v56: player: just let the panel settle */
     t = current_tick + (HZ * ms) / 1000;
     while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); sleep(HZ / 100); }
 }
 /* v36: a stock-like double-buffered UI layer (display class rt 0x164f44 present / rt 0x1b02d8 boot-time UI layer):
    two VC images, each frame: op 1, op 4 (remove the front window), bulk-write the back image, op 3 (window for the back image,
    A=0 B=-50 x=y=0), swap.  The picture is the Rockbox frame buffer, into which we draw a live status screen. */
-static uint32_t gfx_img[2], gfx_addr[2], gfx_win[2];
+static uint32_t gfx_img[2], gfx_addr[2], gfx_win[2], gfx_black[2];
 static int gfx_front = -1, gfx_presents;
 static long gfx_next;
 static int bcm_gfx_alloc(uint32_t *img, uint32_t *addr)
@@ -4086,7 +4109,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v55 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v56 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4123,13 +4146,14 @@ static void bcm_gfx_present_m(int mode)
             uint32_t t[4] = { gfx_img[back], 1, 0, 0 };
             bcm_gfx_rpc(0x10, t, 8, o, NULL, 300);
         }
-        for (y = 0; y < LCD_HEIGHT; y += 16)
-        {
+        for (y = 0; y < LCD_HEIGHT && !(bcm_player_mode && gfx_black[back] == gfx_addr[back]); y += 16)
+        {   /* v56: player mode: each image is black after its first write -- do not send 150 KB of zeros again */
             bcm_io_lock();
             bcm_io_write(gfx_addr[back] + (unsigned)y * LCD_WIDTH * 2, bcm_player_mode ? black : fb + y * LCD_WIDTH, 16 * LCD_WIDTH * 2);
             bcm_io_unlock();
             bcm_host_service();
         }
+        if (bcm_player_mode) gfx_black[back] = gfx_addr[back];
         if (gfx_presents <= 2 && !bcm_player_mode)
         {
             uint16_t rb[8];
@@ -4373,15 +4397,17 @@ static void cv_text(struct cv *c, int x, int y, const char *s)
 
 /* ---- windows */
 #define OSD_NS 4
-struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; };
+struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; uint32_t *shadow; uint32_t tvwin; };
 static uint32_t osd_cv0[48 * 48], osd_cv1[112 * 24], osd_cv2[320 * 52], osd_cv3[96 * 80];
+/* v56: what each VC image holds now -- updates write only the pixels that changed, straight into the visible image */
+static uint32_t osd_sh0[48 * 48], osd_sh1[112 * 24], osd_sh2[320 * 52], osd_sh3[96 * 80];
 static struct osd_strip osd_s[OSD_NS] = {
     /* status icon (stock box 33x33 at 15,15).  v47.1: 48x48 -- with a 40-pixel-wide image the icon came out sheared on the iPod:
        VC images evidently want widths in multiples of 16 pixels (the 80 and 320 wide windows were fine) */
-    { 8, 8, 48, 48, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0 },
-    { 200, 12, 112, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1 },     /* hold lock, charging bolt, battery %, top right (v50: 112 wide) */
-    { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2 },      /* stock bottom panel (y 192, h 43) */
-    { 112, 78, 96, 80, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv3 },     /* v55: TV pictogram in the middle of the LCD while the video is on the TV */
+    { 8, 8, 48, 48, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0, osd_sh0, 0 },
+    { 200, 12, 112, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1, osd_sh1, 0 },     /* hold lock, charging bolt, battery %, top right (v50: 112 wide) */
+    { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2, osd_sh2, 0 },      /* stock bottom panel (y 192, h 43) */
+    { 112, 78, 96, 80, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv3, osd_sh3, 0 },     /* v55: TV pictogram in the middle of the LCD while the video is on the TV */
 };
 static int osd_ok = -1, osd_type = 15;
 static bool osd_visible, pl_paused;
@@ -4562,83 +4588,122 @@ static void osd_draw(void)
     cv_text(&c2, 20, 28, a);
     cv_text(&c2, 300 - cv_text_w(d), 28, d);
 }
-static void osd_upload(struct osd_strip *s, int back)
+/* v56 overlay model (v55 logs: the bus moves ~1 MB/s, every RPC cost a 10 ms tick, a full present ~110-270 ms, a volume step 36 ms):
+   one VC image per strip, its window stays up while the overlay is shown, and every update writes only the changed pixel spans
+   of each row straight into that image (the VC composes all layers again for every frame).  Windows are added / removed only
+   when the overlay appears / disappears.  On the TV the same images get a second window on display 2 (op 3 A = 2, stock
+   rt 0x16982c: A = TV ? 2 : 0), which disappears after 3 s like the stock TV overlay while the iPod's own screen keeps it. */
+static bool osd_bottom_vol;            /* v54: the visible bottom window shows the volume bar */
+static bool osd_vol_only;              /* v53: only the volume bar is up (the wheel was turned while the overlay was hidden) */
+static long osd_tv_until;              /* v56: TV overlay shown until this tick (while playing) */
+static unsigned osd_bytes;             /* v56: bytes written by the last update (log) */
+static bool osd_tv_want(int k)
 {
-    int y, x;
+    return bcm_tv && cfg_tv_osd && k != 3 && (pl_paused || sc_active || TIME_BEFORE(current_tick, osd_tv_until));
+}
+static void osd_tv_xy(const struct osd_strip *s, int *x, int *y)
+{   /* the strip's centre scaled from the 320x240 panel to the TV raster (720x480 NTSC / 720x576 PAL, stock rt 0x1c77b8) */
+    int th = global_settings.bcm_tv_signal ? 576 : 480;
+    *x = (s->x * 2 + s->w) * 720 / 640 - s->w / 2;
+    *y = (s->y * 2 + s->h) * th / 480 - s->h / 2;
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+}
+static void osd_write_span(struct osd_strip *s, int y, int x0, int x1)
+{
+    const uint32_t *row = s->cvp + y * s->w;
+    if (osd_type == 15)
+    {
+        bcm_io_lock(); bcm_io_write(s->addr[0] + ((unsigned)y * s->w + x0) * 4, row + x0, (unsigned)(x1 - x0 + 1) * 4); bcm_io_unlock();
+    }
+    else
+    {   /* RGB565 fallback: composite over a dark panel colour; 32-bit aligned spans */
+        int x;
+        x0 &= ~1; x1 |= 1; if (x1 >= s->w) x1 = s->w - 1;
+        for (x = x0; x <= x1; x++)
+        {
+            uint32_t p = row[x], a = p >> 24, r = ((p >> 16) & 255) * a / 255 + 20 * (255 - a) / 255,
+                     g = ((p >> 8) & 255) * a / 255 + 20 * (255 - a) / 255, b = (p & 255) * a / 255 + 24 * (255 - a) / 255;
+            osd_row[x - x0] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        }
+        bcm_io_lock(); bcm_io_write(s->addr[0] + ((unsigned)y * s->w + x0) * 2, osd_row, (unsigned)(x1 - x0 + 1) * 2); bcm_io_unlock();
+    }
+    osd_bytes += (unsigned)(x1 - x0 + 1) * (osd_type == 15 ? 4 : 2);
+}
+/* full = whole image (it is not on screen yet) */
+static void osd_update(struct osd_strip *s, bool full)
+{
+    int y;
     for (y = 0; y < s->h; y++)
     {
-        const uint32_t *row = s->cvp + y * s->w;
-        if (osd_type == 15)
+        const uint32_t *a = s->cvp + y * s->w;
+        uint32_t *b = s->shadow + y * s->w;
+        int x0 = 0, x1 = s->w - 1;
+        if (!full)
         {
-            bcm_io_lock(); bcm_io_write(s->addr[back] + (unsigned)y * s->w * 4, row, (unsigned)s->w * 4); bcm_io_unlock();
+            while (x0 < s->w && a[x0] == b[x0]) x0++;
+            if (x0 == s->w) continue;
+            while (a[x1] == b[x1]) x1--;
         }
-        else
-        {   /* RGB565 fallback: composite over a dark panel colour */
-            for (x = 0; x < s->w; x++)
-            {
-                uint32_t p = row[x], a = p >> 24, r = ((p >> 16) & 255) * a / 255 + 20 * (255 - a) / 255,
-                         g = ((p >> 8) & 255) * a / 255 + 20 * (255 - a) / 255, b = (p & 255) * a / 255 + 24 * (255 - a) / 255;
-                osd_row[x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-            }
-            bcm_io_lock(); bcm_io_write(s->addr[back] + (unsigned)y * s->w * 2, osd_row, (unsigned)s->w * 2); bcm_io_unlock();
-        }
-        if ((y & 7) == 7) bcm_host_service();
+        osd_write_span(s, y, x0, x1);
+        memcpy(b + x0, a + x0, (size_t)(x1 - x0 + 1) * 4);
+        if (full && (y & 15) == 15) bcm_host_service();
     }
 }
-/* v53: mask = which strips to redraw (1 icon, 2 battery, 4 bottom); the volume bar redraws only the bottom strip */
-static bool osd_bottom_vol;            /* v54: the visible bottom window shows the volume bar */
+/* mask = strips to show with fresh content (1 icon, 2 battery, 4 bottom, 8 TV symbol) */
 static void osd_present_mask(int mask)
 {
     uint32_t o[4], pl[8], w4[4];
-    int k, back[OSD_NS];
+    int k, adds = 0;
+    bool open = false;
     if (osd_ok <= 0) return;
+    osd_bytes = 0;
     osd_draw();
     if (mask & 4) osd_bottom_vol = av_vol_until && TIME_BEFORE(current_tick, av_vol_until);
     for (k = 0; k < OSD_NS; k++)
     {
-        back[k] = osd_s[k].front < 0 ? 0 : 1 - osd_s[k].front;
-        if (mask & (1 << k)) osd_upload(&osd_s[k], back[k]);
-    }
-    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    for (k = 0; k < OSD_NS; k++)
-    {
         struct osd_strip *s = &osd_s[k];
         if (!(mask & (1 << k))) continue;
-        if (s->front >= 0 && s->win[s->front])
-        { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
+        osd_update(s, !s->win[0] && !s->tvwin);
     }
     for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
-        if (!(mask & (1 << k))) continue;
-        memset(pl, 0, sizeof pl);
-        pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[back[k]];
-        ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
-        if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->win[back[k]] = o[0];
-        s->front = back[k];
+        bool tv = osd_tv_want(k) && ((mask & (1 << k)) || s->win[0]);
+        if (!(mask & (1 << k)) && !(s->tvwin && !tv)) continue;
+        if ((mask & (1 << k)) && !s->win[0])
+        {
+            if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
+            memset(pl, 0, sizeof pl);
+            pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[0];
+            ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
+            if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->win[0] = o[0] ? o[0] : 0xffffffffu;   /* (0 is a valid handle) */
+            adds++;
+        }
+        if (tv && !s->tvwin)
+        {
+            int tx, ty;
+            if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
+            osd_tv_xy(s, &tx, &ty);
+            memset(pl, 0, sizeof pl);
+            pl[0] = 2; pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[0];
+            ((uint16_t *)pl)[8] = (uint16_t)tx; ((uint16_t *)pl)[9] = (uint16_t)ty; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
+            if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->tvwin = o[0] ? o[0] : 0xffffffffu;
+            adds++;
+        }
+        else if (!tv && s->tvwin)
+        {
+            if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
+            memset(w4, 0, sizeof w4); w4[0] = s->tvwin == 0xffffffffu ? 0 : s->tvwin; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->tvwin = 0;
+        }
+        s->front = 0;
     }
-    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    if (open) bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = true;
 }
-static bool osd_vol_only;              /* v53: only the volume bar is up (the wheel was turned while the overlay was hidden) */
 static void osd_present(void) { osd_vol_only = false; osd_present_mask(bcm_tv ? 15 : 7); }
-/* v54: the volume bar while it is already on screen: redraw and write only the bar's 247x25 pixels straight into the image the
-   visible window shows (no new window, no RPCs; the VC composes the layers again for every video frame) -- ~25 KB instead of
-   66 KB + 4 round trips + a status query per update. */
 static int vol_direct_n, vol_full_n;
 static unsigned long vol_us_direct, vol_us_full;
-static void osd_vol_direct(void)
-{
-    struct osd_strip *s = &osd_s[2];
-    int y;
-    osd_draw();
-    for (y = 6; y < 31; y++)
-    {
-        bcm_io_lock();
-        bcm_io_write(s->addr[s->front] + ((unsigned)y * s->w + 13) * 4, s->cvp + y * s->w + 13, 296 * 4);   /* speakers + bar, x 13..308 */
-        bcm_io_unlock();
-    }
-}
 static void osd_hide(void)
 {
     uint32_t o[4], w4[4];
@@ -4648,8 +4713,8 @@ static void osd_hide(void)
     for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
-        if (s->front >= 0 && s->win[s->front])
-        { memset(w4, 0, sizeof w4); w4[0] = s->win[s->front]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[s->front] = 0; }
+        if (s->win[0]) { memset(w4, 0, sizeof w4); w4[0] = s->win[0] == 0xffffffffu ? 0 : s->win[0]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[0] = 0; }
+        if (s->tvwin) { memset(w4, 0, sizeof w4); w4[0] = s->tvwin == 0xffffffffu ? 0 : s->tvwin; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->tvwin = 0; }
     }
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = false; osd_vol_only = false; osd_bottom_vol = false;
@@ -4660,18 +4725,16 @@ static void osd_init(void)
     vui_load();
     osd_type = cfg_osd_argb ? 15 : 1;
     for (k = 0; k < OSD_NS && ok; k++)
-        ok = osd_alloc(osd_type, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0 &&
-             osd_alloc(osd_type, osd_s[k].w, osd_s[k].h, &osd_s[k].img[1], &osd_s[k].addr[1]) == 0;
+        ok = osd_alloc(osd_type, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0;   /* v56: one image each */
     if (!ok && osd_type == 15)
     {
         BLOG("  OSD: 32-bit ARGB images (type 15) refused -- falling back to RGB565 on a dark panel");
         osd_type = 1; ok = 1;
         for (k = 0; k < OSD_NS && ok; k++)
-            ok = osd_alloc(1, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0 &&
-                 osd_alloc(1, osd_s[k].w, osd_s[k].h, &osd_s[k].img[1], &osd_s[k].addr[1]) == 0;
+            ok = osd_alloc(1, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0;
     }
     osd_ok = ok;
-    BLOG("  OSD: 3 windows, VC image type %d (%s), layer %d -> %s", osd_type, osd_type == 15 ? "ARGB, drawn over the video" : "RGB565",
+    BLOG("  OSD: %d strips, VC image type %d (%s), layer %d -> %s", OSD_NS, osd_type, osd_type == 15 ? "ARGB, drawn over the video" : "RGB565",
          cfg_osd_layer, ok ? "ok" : "FAILED");
 }
 static void osd_show_for(int ms)
@@ -4679,6 +4742,7 @@ static void osd_show_for(int ms)
     if (!cfg_osd) return;
     if (osd_ok < 0) osd_init();
     if (!sc_active) pl_status();
+    if (bcm_tv) osd_tv_until = current_tick + ((ms ? ms : 3000) * HZ) / 1000;   /* v56: the TV copy goes after 3 s */
     osd_present();
     osd_hide_at = ms && !bcm_tv ? current_tick + (ms * HZ) / 1000 : 0;   /* v55: on the TV the LCD keeps the controls up */
     osd_next = current_tick + HZ;
@@ -5181,20 +5245,17 @@ static void bcm_osd_tick(void)
     av_tick();
     if (av_vol_dirty && cfg_osd)
     {   /* v53: volume bar.  v54: once the bar is on screen, every click is drawn at once straight into the visible image */
-        struct osd_strip *b = &osd_s[2];
-        bool direct = cfg_vol_direct && osd_ok > 0 && osd_type == 15 && osd_visible && osd_bottom_vol && b->front >= 0 && b->win[b->front];
-        if (direct || current_tick - av_vol_drawn >= HZ / 20)
-        {
+        bool direct = osd_ok > 0 && osd_s[2].win[0] && (!bcm_tv || !cfg_tv_osd || osd_s[2].tvwin);
+        (void)cfg_vol_direct;
+        {   /* v56: every click: only the bar pixels that changed (a 3 % step = ~7 columns x 24 rows) */
             unsigned long t0 = USEC_TIMER;
             av_vol_dirty = false; av_vol_drawn = current_tick;
-            if (direct) { osd_vol_direct(); vol_direct_n++; vol_us_direct += USEC_TIMER - t0; }
-            else
-            {
-                if (osd_ok < 0) osd_init();
-                if (!osd_visible) osd_vol_only = true;
-                osd_present_mask(4);
-                vol_full_n++; vol_us_full += USEC_TIMER - t0;
-            }
+            if (osd_ok < 0) osd_init();
+            if (!osd_visible) osd_vol_only = true;
+            if (bcm_tv && (!osd_tv_until || TIME_BEFORE(osd_tv_until, av_vol_until))) osd_tv_until = av_vol_until;
+            osd_present_mask(4);
+            if (direct) { vol_direct_n++; vol_us_direct += USEC_TIMER - t0; }
+            else { vol_full_n++; vol_us_full += USEC_TIMER - t0; }
             if (!bcm_tv && !pl_paused && !sc_active && (!osd_hide_at || TIME_BEFORE(osd_hide_at, av_vol_until))) osd_hide_at = av_vol_until;
             osd_next = current_tick + HZ;
         }
@@ -5205,6 +5266,8 @@ static void bcm_osd_tick(void)
              vol_direct_n ? vol_us_direct / vol_direct_n : 0, vol_full_n, vol_full_n ? vol_us_full / vol_full_n : 0);
         vol_direct_n = vol_full_n = 0; vol_us_direct = vol_us_full = 0;
     }
+    if (bcm_tv && osd_visible && (osd_s[0].tvwin || osd_s[2].tvwin) && !osd_tv_want(0))
+        osd_present_mask(0);                           /* v56: removes the TV windows (the iPod screen keeps its overlay) */
     if (!osd_visible || sc_active) return;
     if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused) { osd_hide(); return; }
     if (!TIME_BEFORE(current_tick, osd_next))
@@ -5337,7 +5400,7 @@ static void bcm_video_run(int secs)
         bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(c, resp, sizeof resp, 2); bcm_log_text(c, r2, resp);
     }
     mon_start("mp_play (start-up pre-buffer)");
-    if (bcm_tv) osd_show_for(0);                       /* v55: TV: controls + TV picture on the LCD the whole time */
+    if (bcm_tv) osd_show_for(3000);                    /* v55: TV: controls + TV symbol on the LCD the whole time; v56: 3 s on the TV */
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
         bcm_host_service();
@@ -5736,14 +5799,28 @@ static void bcm_tv_enable(bool on)
     char cmd[96], resp[256]; int r;
     if (on)
     {
-        snprintf(cmd, sizeof cmd, "mp_region display=2 dest=fullscreen mode=%s", global_settings.bcm_tv_picture ? "fill" : "letterbox");
+        if (global_settings.bcm_tv_picture || !m4.width || !m4.height)
+            snprintf(cmd, sizeof cmd, "mp_region display=2 dest=fullscreen mode=fill");
+        else
+        {   /* v56 letterbox computed here, for the TV's real shape: the raster is 720 x 480/576 shown as 4:3 (or 16:9 with
+               Widescreen TV), so its pixels are not square.  v55's "dest=fullscreen mode=letterbox" assumed square pixels: a
+               4:3 video then filled the 4:3 TV exactly as "fill" did (no visible difference) and was stretched on a 16:9 TV. */
+            int tw = 720, th = global_settings.bcm_tv_signal ? 576 : 480, an = global_settings.bcm_tv_wide ? 16 : 4,
+                ad = global_settings.bcm_tv_wide ? 9 : 3, dw, dh;
+            dh = (int)((long)an * th * m4.height / ((long)ad * m4.width));     /* full width */
+            dw = tw;
+            if (dh > th) { dh = th; dw = (int)((long)m4.width * tw * ad / ((long)m4.height * an)); }
+            dw &= ~1; dh &= ~1;
+            snprintf(cmd, sizeof cmd, "mp_region display=2 dest=\"%d %d %d %d\" mode=fill", (tw - dw) / 2, (th - dh) / 2, dw, dh);
+        }
         bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(cmd, resp, sizeof resp, 4); bcm_log_text(cmd, r, resp);
         snprintf(cmd, sizeof cmd, "display_control 2 dac=1 encoding=%d%s",
                  cfg_tv_enc >= 0 ? cfg_tv_enc : global_settings.bcm_tv_signal ? 1 : 5, cfg_tv_extra == 1 ? " svideo=1" : "");
         bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched(cmd, resp, sizeof resp, 4); bcm_log_text(cmd, r, resp);
         bcm_tv_dac = true;
-        BLOG("  >>> TV OUT: %s %s -- the picture should be on the TV (dock connector or the headphone jack's AV cable)",
-             global_settings.bcm_tv_signal ? "PAL" : "NTSC", global_settings.bcm_tv_picture ? "fill" : "letterbox");
+        BLOG("  >>> TV OUT: %s %s%s -- the picture should be on the TV (dock connector or the headphone jack's AV cable)",
+             global_settings.bcm_tv_signal ? "PAL" : "NTSC", global_settings.bcm_tv_picture ? "fill" : "letterbox",
+             global_settings.bcm_tv_wide ? " widescreen" : "");
     }
     else if (bcm_tv_dac)
     {
@@ -5879,8 +5956,7 @@ static void bcm_playback_probe(void)
     BLOG("test video opened OK");
 
     if (cfg_tv >= 0) bcm_tv = cfg_tv;
-    if (bcm_tv) bcm_tv_enable(true);                   /* v55: the TV region replaces the LCD region */
-    else if (cfg_region_when & 1) bcm_region("before mp_selectplay");
+    if (!bcm_tv && (cfg_region_when & 1)) bcm_region("before mp_selectplay");
 
     {   int mr = mp4_open(video);
         if (mr == 0)
@@ -5918,6 +5994,7 @@ static void bcm_playback_probe(void)
             bcm_pds_set_ops(&pds_probe_ops);
         }
     }
+    if (bcm_tv) bcm_tv_enable(true);                   /* v55: the TV region replaces the LCD region; v56: after mp4_open (size) */
     bcm_step("mp_region");
 again:
     bcm_setvol();                                      /* v28: stock order: mp_setvol 0, audio_enable 1, pm_set_policy min, mp_selectplay */
@@ -6047,9 +6124,9 @@ static void bcm_reset_run_state(void)
     v_frames = v_bytes = v_getframes = v_empty = v_eos = v_seeks = v_skips = 0;
     v_stop = v_live = false; v_eos_tick = 0;
     tf_dir = 0; tf_fed = 0;
-    gfx_front = -1; gfx_presents = 0; memset(gfx_win, 0, sizeof gfx_win);
+    gfx_front = -1; gfx_presents = 0; memset(gfx_win, 0, sizeof gfx_win); memset(gfx_black, 0, sizeof gfx_black);
     osd_ok = -1; osd_visible = false;
-    for (k = 0; k < OSD_NS; k++) { osd_s[k].front = -1; memset(osd_s[k].win, 0, sizeof osd_s[k].win); }
+    for (k = 0; k < OSD_NS; k++) { osd_s[k].front = -1; memset(osd_s[k].win, 0, sizeof osd_s[k].win); osd_s[k].tvwin = 0; }
     pl_paused = false; pl_el_ms = 0; pl_dur_ms = 0; pl_target_ms = 0;
     sc_active = false; sc_btn = 0; mon_until = 0;
     av_have = false; av_state = 0; av_vol_until = 0;
@@ -6095,9 +6172,9 @@ static bool bcm_run(const char *play_path)
 
     bcm_play_path = play_path; bcm_player_mode = play_path != NULL;
     bcm_reset_run_state();
-    bcm_log_fd = creat(BCM_LOG_PATH, 0666);
+    bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v55, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v56, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
     bcm_wd_last = current_tick; bcm_wd_on = 1;
@@ -6106,16 +6183,31 @@ static bool bcm_run(const char *play_path)
     if (!cfg_fast) bcm_sync_every = 0;
     bcm_apply_variant();
 
-    fd = open(BCM_VMCS_PATH, O_RDONLY);
-    if (fd < 0)
+    /* v56: /.rockbox/VideoCore/ (all files in one folder) first, else the old /.rockbox/vc/Resources/VideoCore/... tree.
+       vmcs.bin stays in RAM after the first video (it is re-sent to the BCM for every boot) */
     {
-        BLOG("cannot open %s", BCM_VMCS_PATH);
-        splash(HZ*3, "vmcs.bin not found");
-        bcm_play_path = NULL;                          /* nothing was changed: no display restore needed */
-        goto out;
+        static int vmcs_cached;
+        static bool flat_cached;
+        fd = -1;
+        if (vmcs_cached > 0) { r = vmcs_cached; bcm_vc_flat = flat_cached; BLOG("vmcs.bin from RAM (%s)", bcm_vc_flat ? BCM_VC_FLAT : BCM_VC_ROOT); }
+        else
+        {
+            fd = open(BCM_VC_FLAT "/vmcs.bin", O_RDONLY);
+            bcm_vc_flat = fd >= 0;
+            if (fd < 0) fd = open(BCM_VMCS_PATH, O_RDONLY);
+            if (fd < 0)
+            {
+                BLOG("cannot open %s or %s", BCM_VC_FLAT "/vmcs.bin", BCM_VMCS_PATH);
+                splash(HZ*3, "vmcs.bin not found");
+                bcm_play_path = NULL;                  /* nothing was changed: no display restore needed */
+                goto out;
+            }
+            r = read(fd, bcm_vmcs_buf, sizeof bcm_vmcs_buf);
+            close(fd);
+            BLOG("vmcs.bin read from %s", bcm_vc_flat ? BCM_VC_FLAT : BCM_VMCS_PATH);
+            if (r > 0 && r < (int)sizeof bcm_vmcs_buf) { vmcs_cached = r; flat_cached = bcm_vc_flat; }
+        }
     }
-    r = read(fd, bcm_vmcs_buf, sizeof bcm_vmcs_buf);
-    close(fd);
     if (r <= 0 || r >= (int)sizeof bcm_vmcs_buf)
     {
         BLOG("vmcs.bin read failed (%d)", r);
@@ -6151,8 +6243,7 @@ static bool bcm_run(const char *play_path)
         if (r != 0 || snap[2] != 1 || snap[3] == 0)
         {
             BLOG("BAD BOOT: the VideoCore did not start the uploaded image. Not touching the LCD; rebooting the iPod -- run the test again.");
-            if (bcm_log_fd >= 0) close(bcm_log_fd);
-            bcm_log_fd = -1;
+            bcm_log_close();
             system_reboot();
         }
     }
@@ -6177,7 +6268,7 @@ static bool bcm_run(const char *play_path)
     {   unsigned st[4]; bcm_io_status(st);
         BLOG("bus status after boot: BCM_CONTROL=%04x RD_ADDR=%04x ALT_CONTROL=%04x ALT_RD_ADDR=%04x", st[0], st[1], st[2], st[3]); }
 
-    bcm_verify_upload((unsigned)(sizeof bcm_vmcs_buf < 201376 ? sizeof bcm_vmcs_buf : 201376));
+    if (!cfg_fast) bcm_verify_upload((unsigned)(sizeof bcm_vmcs_buf < 201376 ? sizeof bcm_vmcs_buf : 201376));   /* v56: 0.14 s, diagnostics only */
     bcm_dump("build string in VC RAM", 0x1F540, 64);
 
     for (i = 0; i < 3; i++)
@@ -6203,7 +6294,8 @@ static bool bcm_run(const char *play_path)
     if (r != 0)
         goto out;
 
-    bcm_vfs_set_root(BCM_VC_ROOT);
+    bcm_vfs_set_root(bcm_vc_flat ? BCM_VC_FLAT : BCM_VC_ROOT);
+    bcm_vfs_set_flat(bcm_vc_flat);
     bcm_host_set_trace(bcm_trace_cb);
     bcm_host_set_vchr47_len((uint32_t)cfg_vchr47);
     bcm_host_set_pds_flags_legacy(cfg_flags_legacy);       /* v29: stock chunk flags unless flags_legacy=1 */       /* v28: 0 = stock zero-length reply to VCHR op 0x47 */
@@ -6224,8 +6316,8 @@ static bool bcm_run(const char *play_path)
             bcm_host_service();
             if (bcm_host_get_stats()->rx_msgs != last_rx) { last_rx = bcm_host_get_stats()->rx_msgs; quiet = current_tick; }
             /* v46 fast start: stop listening once the VC has been quiet for 0.3 s (mplayer.vll is loaded by then) */
-            if (cfg_fast && current_tick - t0 > HZ / 3 && current_tick - quiet > HZ * 3 / 10) break;
-            sleep(HZ/100);
+            if (cfg_fast && current_tick - t0 > HZ / 10 && current_tick - quiet > HZ / 10) break;   /* v56: 0.1 s (was 0.3) */
+            if (cfg_fast) yield(); else sleep(HZ/100);
         }
         const struct bcm_host_stats *st = bcm_host_get_stats();
         BLOG("rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u",
@@ -6272,14 +6364,30 @@ out:
         tick_remove_task(bcm_wd_tick);
         if (bcm_play_path)
         {
+            /* v56: panel off first, then the VideoCore (it may stop answering after power_control); backlight off before
+               the panel is (a lit panel that loses its picture shows white).  bcm_restore_rom_vmcs() lights it again after
+               the first complete picture from Rockbox's display firmware. */
+            _backlight_hw_enable(false);
+            if (!bcm_io_dead())
+            {   /* v50: panel off the stock way (display state 0 -> power=0) before the BCM loses power; v49 sometimes left
+                   the panel white when Rockbox's firmware took over (most often when leaving right after the start) */
+                char c[48]; int pr2; long t1 = current_tick;
+                snprintf(c, sizeof c, "display_control 0 model=%d power=0", bcm_hw_model(0));
+                pr2 = bcm_gencmd_start(c);
+                if (pr2 == 0) do { pr2 = bcm_gencmd_poll(resp, sizeof resp); if (pr2 != -3) break; yield(); } while (current_tick - t1 < HZ / 2);
+                BLOG("player: %s -> %d (%ld ms)", c, pr2, (current_tick - t1) * 1000 / HZ);
+            }
             /* stock VC shutdown (rt 0x289470): "power_control videocore 0", wait until VC[0x1F0] reads {0, magic},
                then GPIO 0x77 and 0x76 low (GPO32 bits 15, 14; in bcm_restore_rom_vmcs) */
             if (!bcm_io_dead())
             {
                 uint32_t w1f0 = 0; long t0 = current_tick; int pr;
                 /* v48 log: no reply within 2 s and VC[0x1F0] already read a5a50000 -> wait at most 0.3 s for the reply */
+                /* v56: the v50..v55 loop ended after ONE poll (it tested pr == 0 after pr had become -3), so neither this nor the
+                   panel-off command below was ever waited for (logs: "-> -3"): the BCM lost power with the panel still on ->
+                   the occasional white screen.  Now both are waited for. */
                 pr = bcm_gencmd_start("power_control videocore 0");
-                while (pr == 0 && (pr = bcm_gencmd_poll(resp, sizeof resp)) == -3 && current_tick - t0 < HZ * 3 / 10) yield();
+                if (pr == 0) do { pr = bcm_gencmd_poll(resp, sizeof resp); if (pr != -3) break; yield(); } while (current_tick - t0 < HZ * 3 / 10);
                 BLOG("player: power_control videocore 0 -> %d", pr);
                 do {
                     bcm_host_service();
@@ -6289,15 +6397,6 @@ out:
                 } while (current_tick - t0 < HZ);
                 BLOG("player: VC[0x1F0] = %08x after %ld ms (stock waits for low half 0)", (unsigned)w1f0, (current_tick - t0) * 1000 / HZ);
             }
-            if (!bcm_io_dead())
-            {   /* v50: panel off the stock way (display state 0 -> power=0) before the BCM loses power; v49 sometimes left
-                   the panel white when Rockbox's firmware took over (most often when leaving right after the start) */
-                char c[48]; int pr2; long t1 = current_tick;
-                snprintf(c, sizeof c, "display_control 0 model=%d power=0", bcm_hw_model(0));
-                pr2 = bcm_gencmd_start(c);
-                while (pr2 == 0 && (pr2 = bcm_gencmd_poll(resp, sizeof resp)) == -3 && current_tick - t1 < HZ / 2) yield();
-                BLOG("player: %s -> %d", c, pr2);
-            }
             bcm_host_detach();
             BLOG("player: GPO32 = %08lx -- powering the BCM down and booting Rockbox's display firmware", *(volatile unsigned long *)0x70000080);
             rr = bcm_restore_rom_vmcs();
@@ -6306,13 +6405,11 @@ out:
             if (rr != 0 && rr != -2)
             {
                 BLOG("player: the display did not come back -- rebooting instead of freezing");
-                if (bcm_log_fd >= 0) close(bcm_log_fd);
-                bcm_log_fd = -1;
+                bcm_log_close();
                 system_reboot();
             }
         }
-        if (bcm_log_fd >= 0) close(bcm_log_fd);
-        bcm_log_fd = -1;
+        bcm_log_close();
         bcm_sync_every = 0; bcm_player_mode = false; bcm_play_path = NULL;
         backlight_on();
         lcd_update();                                  /* the frame buffer still holds the browser exactly as it was */
@@ -6322,15 +6419,12 @@ out:
     {
         /* The LCD code spins forever on a dead BCM, so do NOT touch it: save the log and reboot cleanly. */
         BLOG(bcm_dead_seen ? "VC dead -- log saved, rebooting the iPod" : "test finished -- log saved, rebooting the iPod (cfg reboot_end=0 to stay)");
-        if (bcm_log_fd >= 0) close(bcm_log_fd);
-        bcm_log_fd = -1;
+        bcm_log_close();
         system_reboot();
     }
     bcm_wd_on = 0;
     tick_remove_task(bcm_wd_tick);
-    if (bcm_log_fd >= 0)
-        close(bcm_log_fd);
-    bcm_log_fd = -1;
+    bcm_log_close();
     splash(HZ*2, "log: " BCM_LOG_PATH);
     return false;
 }

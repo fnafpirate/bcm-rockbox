@@ -1321,6 +1321,7 @@ const struct settings_list settings[] = {
                    ID2P(LANG_TV_NTSC), ID2P(LANG_TV_PAL)),
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
                    ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
+    OFFON_SETTING(0, bcm_tv_wide, LANG_TV_WIDESCREEN, false, "tv widescreen", NULL),
 #endif
     /* display */
      CHOICE_SETTING(F_TEMPVAR|F_THEMESETTING, cursor_style, LANG_INVERT_CURSOR,

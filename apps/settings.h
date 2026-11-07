@@ -758,6 +758,7 @@ struct user_settings
     int bcm_video_out;   /* video player TV output: 0 on, 1 ask, 2 off */
     int bcm_tv_signal;   /* 0 NTSC, 1 PAL */
     int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
+    bool bcm_tv_wide;    /* the TV is 16:9 (stock "Widescreen") */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

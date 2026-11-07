@@ -842,8 +842,9 @@ MENUITEM_FUNCTION_W_PARAM(browse_langs, 0, ID2P(LANG_LANGUAGE),
 MENUITEM_SETTING(bcm_video_out_item, &global_settings.bcm_video_out, NULL);
 MENUITEM_SETTING(bcm_tv_signal_item, &global_settings.bcm_tv_signal, NULL);
 MENUITEM_SETTING(bcm_tv_picture_item, &global_settings.bcm_tv_picture, NULL);
+MENUITEM_SETTING(bcm_tv_wide_item, &global_settings.bcm_tv_wide, NULL);
 MAKE_MENU(video_out_menu, ID2P(LANG_VIDEO_OUT), 0, Icon_Display_menu,
-          &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_picture_item);
+          &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_wide_item, &bcm_tv_picture_item);
 #endif
 
 MAKE_MENU(settings_menu_item, ID2P(LANG_GENERAL_SETTINGS), 0,

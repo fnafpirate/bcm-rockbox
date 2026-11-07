@@ -30,6 +30,8 @@ int  bcm_io_dead(void);     /* nonzero once a host bus wait timed out (VC not an
 void bcm_lcd_freeze(bool on);        /* v26: stop the legacy LCD driver from touching the BCM (tick kicks, updates) */
 void bcm_io_status(unsigned v[4]);   /* BCM_CONTROL, BCM_RD_ADDR, BCM_ALT_CONTROL, BCM_ALT_RD_ADDR (status bits) */
 void bcm_io_idle(void);     /* called while waiting; sleep(1) on target, so poll counts are ~10 ms units */
+void bcm_io_yield(void);    /* v56: short wait without giving up the tick (yield() on target) */
+uint32_t bcm_io_us(void);   /* v56: free-running microsecond counter (USEC_TIMER on target) */
 
 /* Target only (lcd-video.c): replace the VideoCore OS image and power-cycle the BCM so that it
  * boots from `img` (16-bit aligned, must stay valid). */
