@@ -4273,7 +4273,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v63 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v64 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6522,7 +6522,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v63, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v64, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
 #ifdef HAVE_BATTERY_SMOOTH_API
@@ -6792,6 +6792,123 @@ out:
 }
 #endif /* IPOD_VIDEO */
 
+#ifdef IPOD_VIDEO
+/* v64: exFAT / Rockbox-only research (README v64).  Writes /storage_report.txt: what the drive reports (ATA IDENTIFY),
+   the raw MBR (and GPT header if there is one), each partition's first sector read in 512-byte AND 2048-byte units (which
+   one holds the firmware-partition "]ih[" header / the FAT boot sector tells which units the MBR uses), the firmware
+   partition's image directory, what Rockbox mounted -- and copies the 1 MB flash ROM (Apple's boot loader + disk mode)
+   to /flashrom_5g.bin so its partition / sector-size handling can be reverse engineered.  Reads only. */
+static unsigned char sr_buf[4096] __attribute__((aligned(16)));
+static void sr_hex(int fd, const unsigned char *b, int n)
+{
+    int i, j;
+    for (i = 0; i < n; i += 16)
+    {
+        char line[96]; int k = snprintf(line, sizeof line, "  %03x:", i);
+        for (j = 0; j < 16 && i + j < n; j++) k += snprintf(line + k, sizeof line - k, " %02x", b[i + j]);
+        k += snprintf(line + k, sizeof line - k, "  ");
+        for (j = 0; j < 16 && i + j < n; j++) line[k++] = b[i + j] >= 32 && b[i + j] < 127 ? b[i + j] : '.';
+        line[k] = 0;
+        fdprintf(fd, "%s\n", line);
+    }
+}
+static int sr_read(sector_t lba512, int count)
+{
+    return storage_read_sectors(IF_MD(0,) lba512, count, sr_buf);
+}
+static uint32_t sr_le32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static bool dbg_storage_report(void)
+{
+    int fd, i, rc;
+    unsigned short *id = ata_get_identify();
+    struct storage_info si;
+    uint32_t pstart[4], psize[4]; unsigned char ptype[4];
+    splash(0, "Writing /storage_report.txt ...");
+    fd = creat("/storage_report.txt", 0666);
+    if (fd < 0) { splash(HZ * 2, "cannot create /storage_report.txt"); return false; }
+    fdprintf(fd, "storage report (bcm overlay v64)\n\n");
+    storage_get_info(0, &si);
+    fdprintf(fd, "storage_get_info: sector_size %u, num_sectors %llu (%llu MiB), vendor '%s' product '%s' rev '%s'\n",
+             (unsigned)si.sector_size, (unsigned long long)si.num_sectors,
+             (unsigned long long)si.num_sectors * si.sector_size >> 20, si.vendor ? si.vendor : "", si.product ? si.product : "",
+             si.revision ? si.revision : "");
+    if (id)
+    {
+        uint64_t lba28 = (uint32_t)id[60] | (uint32_t)id[61] << 16;
+        uint64_t lba48 = (uint64_t)id[100] | (uint64_t)id[101] << 16 | (uint64_t)id[102] << 32 | (uint64_t)id[103] << 48;
+        fdprintf(fd, "ATA IDENTIFY: LBA28 %llu, LBA48 supported %d, LBA48 %llu, word106 %04x, words117-118 %04x %04x, word209 %04x\n",
+                 (unsigned long long)lba28, !!(id[83] & 0x400), (unsigned long long)lba48, id[106], id[117], id[118], id[209]);
+        fdprintf(fd, "ATA IDENTIFY words 0..255:\n");
+        sr_hex(fd, (const unsigned char *)id, 512);
+    }
+#ifdef MAX_VIRT_SECTOR_SIZE
+    fdprintf(fd, "\nRockbox: disk sector multiplier %d (USB shows %d-byte sectors)\n", disk_get_sector_multiplier(IF_MD(0)),
+             disk_get_sector_multiplier(IF_MD(0)) * 512);
+#endif
+    for (i = 0; i < NUM_VOLUMES; i++)
+    {
+        struct partinfo pi;
+        if (disk_partinfo(i, &pi) == 0 && pi.type)
+            fdprintf(fd, "Rockbox partinfo %d: type %02x start %llu size %llu (512-byte units after Rockbox's scaling)\n", i,
+                     pi.type, (unsigned long long)pi.start, (unsigned long long)pi.size);
+    }
+    {
+        sector_t sz = 0, fr = 0;
+        volume_size(IF_MV(0,) &sz, &fr);
+        fdprintf(fd, "volume 0: size %llu KiB, free %llu KiB, cluster %u bytes\n",
+                 (unsigned long long)sz, (unsigned long long)fr, (unsigned)volume_get_cluster_size(IF_MV(0)));
+    }
+    rc = sr_read(0, 1);
+    fdprintf(fd, "\nLBA 0 (MBR), read rc %d:\n", rc);
+    sr_hex(fd, sr_buf, 512);
+    for (i = 0; i < 4; i++)
+    {
+        unsigned char *e = sr_buf + 0x1be + 16 * i;
+        ptype[i] = e[4]; pstart[i] = sr_le32(e + 8); psize[i] = sr_le32(e + 12);
+        fdprintf(fd, "MBR entry %d: boot %02x type %02x start %lu size %lu  (= %llu MiB if 512-byte units, %llu MiB if 2048)\n", i, e[0],
+                 ptype[i], (unsigned long)pstart[i], (unsigned long)psize[i], (unsigned long long)psize[i] >> 11,
+                 (unsigned long long)psize[i] >> 9);
+    }
+    for (i = 0; i < 4; i++)
+    {
+        int u;
+        if (!psize[i]) continue;
+        if (ptype[i] == 0xee)
+        {
+            rc = sr_read(1, 1); fdprintf(fd, "\nGPT header at LBA 1 (512), rc %d:\n", rc); sr_hex(fd, sr_buf, 128);
+            rc = sr_read(4, 1); fdprintf(fd, "GPT header at 2048-byte LBA 1, rc %d:\n", rc); sr_hex(fd, sr_buf, 128);
+            continue;
+        }
+        for (u = 1; u <= 4; u *= 4)
+        {
+            rc = sr_read((sector_t)pstart[i] * u, 1);
+            fdprintf(fd, "\npartition %d first sector read as %s-byte units (LBA %llu), rc %d:%s%s\n", i, u == 1 ? "512" : "2048",
+                     (unsigned long long)pstart[i] * u, rc, !memcmp(sr_buf + 0x100, "]ih[", 4) ? "  <-- firmware partition header ]ih[" : "",
+                     sr_buf[510] == 0x55 && sr_buf[511] == 0xaa ? "  <-- boot sector signature" : "");
+            sr_hex(fd, sr_buf, i == 0 ? 0x120 : 0x80);
+            if (!memcmp(sr_buf + 0x100, "]ih[", 4))
+            {   /* the image directory: header +0x104 = directory offset, +0x10a = format version */
+                uint32_t dir = sr_le32(sr_buf + 0x104) + 0x200;
+                int ver = sr_buf[0x10a] | sr_buf[0x10b] << 8;
+                fdprintf(fd, "  firmware partition: directory at +0x%lx, format version %d\n", (unsigned long)dir, ver);
+                rc = sr_read((sector_t)pstart[i] * u + dir / 512, 1);
+                sr_hex(fd, sr_buf + (dir % 512), 5 * 40);
+            }
+        }
+    }
+    close(fd);
+    /* the flash ROM: Apple's boot loader, disk mode and diagnostics */
+    fd = creat("/flashrom_5g.bin", 0666);
+    if (fd >= 0)
+    {
+        write(fd, (void *)0x20000000, FLASH_SIZE);
+        close(fd);
+    }
+    splash(HZ * 3, "Done: /storage_report.txt + /flashrom_5g.bin");
+    return false;
+}
+#endif
+
 /****** The menu *********/
 static const struct {
     unsigned char *desc; /* string or ID */
@@ -6805,6 +6922,7 @@ static const struct {
 #endif
 #ifdef IPOD_VIDEO
         { "BCM host test", dbg_bcm_host },
+        { "Storage report (exFAT prep)", dbg_storage_report },
 #endif
 #if defined(CPU_COLDFIRE) || defined(CPU_PP) \
     || CONFIG_CPU == S3C2440 || CONFIG_CPU == IMX31L || CONFIG_CPU == AS3525 \
