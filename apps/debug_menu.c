@@ -4273,7 +4273,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v64 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v65 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6522,7 +6522,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v64, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v65, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
 #ifdef HAVE_BATTERY_SMOOTH_API
@@ -6796,8 +6796,7 @@ out:
 /* v64: exFAT / Rockbox-only research (README v64).  Writes /storage_report.txt: what the drive reports (ATA IDENTIFY),
    the raw MBR (and GPT header if there is one), each partition's first sector read in 512-byte AND 2048-byte units (which
    one holds the firmware-partition "]ih[" header / the FAT boot sector tells which units the MBR uses), the firmware
-   partition's image directory, what Rockbox mounted -- and copies the 1 MB flash ROM (Apple's boot loader + disk mode)
-   to /flashrom_5g.bin so its partition / sector-size handling can be reverse engineered.  Reads only. */
+   partition's image directory, what Rockbox mounted.  Reads only.  (The flash ROM copy is dbg_flash_dump, v65.) */
 static unsigned char sr_buf[4096] __attribute__((aligned(16)));
 static void sr_hex(int fd, const unsigned char *b, int n)
 {
@@ -6897,14 +6896,48 @@ static bool dbg_storage_report(void)
         }
     }
     close(fd);
-    /* the flash ROM: Apple's boot loader, disk mode and diagnostics */
+    splash(HZ * 3, "Done: /storage_report.txt");
+    return false;
+}
+/* v65: the flash ROM, copied 4 KB at a time through RAM (v64 wrote the 1 MB straight from 0x20000000 in one call and
+   froze), with the progress on screen and in /flashrom_5g.txt (written after every 64 KB), so a stall shows exactly where */
+static bool dbg_flash_dump(void)
+{
+    int fd, lf, n;
+    unsigned off, nonff = 0, sum = 0;
+    lf = creat("/flashrom_5g.txt", 0666);
     fd = creat("/flashrom_5g.bin", 0666);
-    if (fd >= 0)
+    if (fd < 0 || lf < 0) { splash(HZ * 2, "cannot create /flashrom_5g.*"); if (fd >= 0) close(fd); if (lf >= 0) close(lf); return false; }
+    fdprintf(lf, "flash ROM dump (bcm overlay v65): 0x20000000, %u bytes, 4 KB chunks\n", (unsigned)FLASH_SIZE);
+    for (off = 0; off < FLASH_SIZE; off += sizeof sr_buf)
     {
-        write(fd, (void *)0x20000000, FLASH_SIZE);
-        close(fd);
+        unsigned i;
+        const volatile uint32_t *src = (const volatile uint32_t *)(0x20000000 + off);
+        uint32_t *dst = (uint32_t *)sr_buf;
+        if ((off & 0xffff) == 0)
+        {
+            splashf(0, "flash ROM %u / %u KB", off >> 10, (unsigned)FLASH_SIZE >> 10);
+            fdprintf(lf, "reading 0x%08x\n", 0x20000000 + off);
+            fsync(lf);
+        }
+        for (i = 0; i < sizeof sr_buf / 4; i++)
+        {
+            dst[i] = src[i];
+            if (dst[i] != 0xffffffff) nonff++;
+            sum += dst[i];
+        }
+        n = write(fd, sr_buf, sizeof sr_buf);
+        if (n != (int)sizeof sr_buf)
+        {
+            fdprintf(lf, "write failed at 0x%x: %d\n", off, n);
+            break;
+        }
     }
-    splash(HZ * 3, "Done: /storage_report.txt + /flashrom_5g.bin");
+    fdprintf(lf, "done: %u bytes, %u words not 0xffffffff, sum %08x, first words %08x %08x %08x %08x\n", off, nonff, sum,
+             (unsigned)((uint32_t *)0x20000000)[0], (unsigned)((uint32_t *)0x20000000)[1], (unsigned)((uint32_t *)0x20000000)[2],
+             (unsigned)((uint32_t *)0x20000000)[3]);
+    close(fd); close(lf);
+    splash(HZ * 3, "Done: /flashrom_5g.bin");
     return false;
 }
 #endif
@@ -6923,6 +6956,7 @@ static const struct {
 #ifdef IPOD_VIDEO
         { "BCM host test", dbg_bcm_host },
         { "Storage report (exFAT prep)", dbg_storage_report },
+        { "Dump flash ROM (exFAT prep)", dbg_flash_dump },
 #endif
 #if defined(CPU_COLDFIRE) || defined(CPU_PP) \
     || CONFIG_CPU == S3C2440 || CONFIG_CPU == IMX31L || CONFIG_CPU == AS3525 \
