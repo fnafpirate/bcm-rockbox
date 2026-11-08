@@ -413,9 +413,9 @@ void* main(void)
             printf(loader_strerror(rc));
         }
 
-        /* Everything failed - just loop forever */
         printf("No RetailOS detected");
-
+        /* bcm overlay v68: an iPod set up with only Rockbox (exFAT setup tool)
+           has no Apple OS -- start Rockbox instead of stopping here */
     } else if (btn==BUTTON_PLAY) {
         printf("Loading Linux...");
         rc=load_raw_firmware(loadbuffer, "/linux.bin", MAX_LOADSIZE);
@@ -426,7 +426,9 @@ void* main(void)
         } else {
             return (void*)DRAM_START;
         }
-    } else {
+    }
+
+    if (btn != BUTTON_PLAY) {
         printf("Loading Rockbox...");
         rc=load_firmware(loadbuffer, BOOTFILE, MAX_LOADSIZE);
         if (rc > 0) {

@@ -219,8 +219,33 @@ uint32_t iap_ident_model(void)
 }
 const char *iap_ident_variant(void)
 {
-    if (iap_ident_stock())   /* 5.5G white: MA444 30 GB, MA448 80 GB */
-        return (IPOD_HW_REVISION & 0xffff) >= 6 ? "MA448" : "MA444";
+    if (iap_ident_stock())
+    {
+        /* v66: the real model number from the flash SysCfg block (0x20004000:
+           "gfCS" header, then 4-byte tag + 16-byte value records; "#doM" =
+           ModN, e.g. "MA450" = 80 GB black 5.5G); MA448 if it is unreadable */
+        static char model[17];
+        if (!model[0])
+        {
+            const unsigned char *f = (const unsigned char *)0x20004000;
+            strcpy(model, "MA448");
+            if (!memcmp(f, "gfCS", 4))
+                for (unsigned int i = 0x18; i + 20 <= 0x200; i += 4)
+                    if (!memcmp(f + i, "#doM", 4))
+                    {
+                        unsigned int n = 0;
+                        while (n < 16 && f[i + 4 + n] >= 0x20 && f[i + 4 + n] < 0x7f)
+                            n++;
+                        if (n >= 4)
+                        {
+                            memcpy(model, f + i + 4, n);
+                            model[n] = 0;
+                        }
+                        break;
+                    }
+        }
+        return model;
+    }
     return "MC293";
 }
 int iap_ident_fw(int part)

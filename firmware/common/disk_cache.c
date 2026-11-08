@@ -270,6 +270,56 @@ void dc_commit_all(IF_MV_NONVOID(int volume))
     }
 }
 
+/* bcm overlay v67: drop any cached copies (dirty or not) of the sectors
+   [start, start + count) of a volume -- used before those sectors are
+   overwritten directly (e.g. zeroing a new directory cluster in big writes) */
+void dc_discard_range(IF_MV(int volume,) sector_t start, unsigned long count)
+{
+    FOR_EACH_BITARRAY_SET_BIT(&CACHE_VOL_MAP(volume), index)
+    {
+        struct disk_cache_entry *dce = &cache_entry[index];
+        if (dce->flags && dce->sector >= start && dce->sector - start < count)
+            cache_discard_entry(dce, index);
+    }
+}
+
+/* bcm overlay v67: write back the dirty cached sectors of [start, start + count)
+   (lets a file system put allocation data on disk before what points at it) */
+void dc_commit_range(IF_MV(int volume,) sector_t start, unsigned long count)
+{
+    FOR_EACH_BITARRAY_SET_BIT(&CACHE_VOL_MAP(volume), index)
+    {
+        struct disk_cache_entry *dce = &cache_entry[index];
+        unsigned int flags = dce->flags;
+        if ((flags & DCE_DIRTY) && dce->sector >= start && dce->sector - start < count)
+        {
+            dc_writeback_callback(IF_MV(volume,) dce->sector, cache_buffer[index]);
+            dce->flags = flags & ~DCE_DIRTY;
+        }
+    }
+}
+
+/* bcm overlay v67: the cached buffer of a sector, or NULL; the caller holds
+   the cache lock */
+void * dc_find_sector(IF_MV(int volume,) sector_t sector)
+{
+    FOR_EACH_BITARRAY_SET_BIT(&CACHE_MAP_ENTRY(volume, map_sector(sector)), index)
+    {
+        struct disk_cache_entry *dce = &cache_entry[index];
+        if ((dce->flags & DCE_INUSE) && dce->sector == sector)
+            return cache_buffer[index];
+    }
+    return NULL;
+}
+
+/* bcm overlay v67: the caller wrote this buffer's sector itself */
+void dc_clean_buf(void *buf)
+{
+    unsigned int index = DCIDX_FROM_BUF(buf);
+    if (index < DC_NUM_ENTRIES)
+        cache_entry[index].flags &= ~DCE_DIRTY;
+}
+
 /* discard all cache entries from the specified volume */
 void dc_discard_all(IF_MV_NONVOID(int volume))
 {

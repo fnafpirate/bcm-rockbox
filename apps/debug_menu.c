@@ -4273,7 +4273,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v65 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v70 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6522,7 +6522,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v65, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v70, built %s %s", __DATE__, __TIME__);
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
 #ifdef HAVE_BATTERY_SMOOTH_API

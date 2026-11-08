@@ -41,6 +41,10 @@ void dc_dirty_buf(void *buf);
 void dc_discard_buf(void *buf);
 void dc_commit_all(IF_MV_NONVOID(int volume));
 void dc_discard_all(IF_MV_NONVOID(int volume));
+void dc_discard_range(IF_MV(int volume,) sector_t start, unsigned long count);
+void dc_commit_range(IF_MV(int volume,) sector_t start, unsigned long count);
+void * dc_find_sector(IF_MV(int volume,) sector_t sector);
+void dc_clean_buf(void *buf);
 
 void dc_init(void) INIT_ATTR;
 

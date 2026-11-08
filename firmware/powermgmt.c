@@ -32,6 +32,10 @@
 #include "audio.h"
 #include "usb.h"
 #include "powermgmt.h"
+#if (CONFIG_PLATFORM & PLATFORM_NATIVE) && !defined(BOOTLOADER)
+#include "fat.h"
+#include "file_internal.h"
+#endif
 #include "backlight.h"
 #include "lcd.h"
 #include "rtc.h"
@@ -1168,6 +1172,15 @@ void shutdown_hw(enum shutdown_type sd_type)
 
     if (battery_level_safe()) { /* do not save on critical battery */
         font_unload_all();
+
+#if (CONFIG_PLATFORM & PLATFORM_NATIVE) && !defined(BOOTLOADER)
+        /* bcm overlay v67: exFAT volumes written in this session are marked
+           clean again (an unclean stop leaves them "dirty" so a PC checks
+           them) */
+        file_internal_lock_WRITER();
+        fat_mark_clean();
+        file_internal_unlock_WRITER();
+#endif
 
 /* Commit pending writes if needed. Even though we don't do write caching,
    things like flash translation layers may need this to commit scattered
