@@ -71,6 +71,10 @@ static void cmd_pending(const unsigned char cmd, const uint32_t msdelay)
 
 #ifdef IPOD_VIDEO
 #include "settings.h"
+#include "bcm_dock.h"
+#include <stdio.h>
+#include "string-extra.h"
+#include "misc.h"
 /* bcm overlay v62: iPod Preferences (General lingo GetiPodPreferences 0x29 / SetiPodPreferences 0x2B) -- the video-out
    classes an AV dock, car video kit or TV accessory uses -- mapped onto Settings > General Settings > Video Out.
      0x00 video out      0 off, 1 on, 2 ask      -> Video Out (on / ask / off)
@@ -87,10 +91,10 @@ static unsigned char vpref_store[16] = { [0x03] = 1, [0x08] = 1 };
 static short vpref_saved[16];   /* value + 1 to restore, 0 = nothing to restore */
 static int vpref_get(int cls)
 {
-    static const unsigned char vo[3] = { 1, 2, 0 };   /* setting on/ask/off -> iAP on/ask/off */
+    static const unsigned char vo[4] = { 1, 2, 0, 1 };   /* setting on/ask/off/auto -> iAP on/ask/off/on */
     switch (cls)
     {
-        case 0x00: return vo[global_settings.bcm_video_out % 3];
+        case 0x00: return vo[global_settings.bcm_video_out & 3];
         case 0x01: return global_settings.bcm_tv_picture ? 0 : 1;
         case 0x02: return global_settings.bcm_tv_signal ? 1 : 0;
         case 0x0A: return global_settings.bcm_tv_wide ? 1 : 0;
@@ -128,6 +132,8 @@ static int vpref_set(int cls, int v, bool restore)
     else
         vpref_saved[cls] = 0;
     vpref_put(cls, v);
+    if (cls == 0x00 && v == 1)
+        iap_dock_video_interest();      /* v74: it turned video out on: a video dock */
     if (!restore && (cls <= 0x02 || cls == 0x0A))
         settings_save();
     logf("iap: SetiPodPreferences class %d = %d%s", cls, v, restore ? " (restore on exit)" : "");
@@ -142,6 +148,237 @@ void iap_video_prefs_restore(void)
             vpref_put(c, vpref_saved[c] - 1);
             vpref_saved[c] = 0;
         }
+}
+
+/* ---- bcm overlay v74: docks.  What is plugged in, a notice for it, and each dock's own TV settings.
+   - An accessory that identifies (IdentifyDeviceLingoes / Identify) is "connected" 2 s later, when it has had time to
+     send its name (RetAccessoryInfo type 1; maker 6, model 7).  One that only has an ID resistor on pin 21 (AV cables,
+     simple docks) is connected when the resistor has been there 5 s.  Unplugged = the resistor goes (pin 21 = 15).
+   - Its key (name + model, or the lingoes and the resistor) picks its line in /.rockbox/bcm_docks.txt:
+       key|name|tv|signal|wide|picture      tv: -1 not known, 0 iPod screen, 1 TV; the others as the settings
+     When it connects, its TV signal / widescreen / picture are applied for as long as it stays ("restore on exit", like
+     an accessory's own SetiPodPreferences); when it goes, the settings in use are written back to its line, so a change
+     made while docked is remembered for that dock only.
+   - Video Out "Auto": TV on a dock that is known to want it (it asked for / set the video preferences, sent video
+     buttons, or you chose TV on it before), the iPod's screen otherwise.  "Ask" starts on that dock's last answer.
+   - Notices (Settings > General Settings > Video Out > Dock Notifications): connected / disconnected, and the power
+     source: USB power without a computer (a charger), FireWire / dock power. */
+#include "splash.h"
+#include "file.h"
+#include "power.h"
+#include "usb.h"
+#include "lang.h"
+#define DOCK_FILE ROCKBOX_DIR "/bcm_docks.txt"
+#define DOCK_MAX 32
+static struct {
+    volatile int state;                /* 0 none, 1 identified (waiting for its name), 2 connected */
+    long since;
+    uint32_t lingoes;
+    int pin;
+    volatile bool video;
+    char name[40], maker[32], model[24], key[72];
+    volatile bool ui_connect, ui_disconnect, ui_power;
+    int snap[3], prof_tv, gone_tv;     /* snap: picture, signal, wide while docked */
+    char gone_key[72], gone_name[40];
+    int pin_since_code; long pin_since;
+    unsigned power, power_new, power_added; long power_since;
+} dk = { .prof_tv = -1, .pin_since_code = 15 };
+static const unsigned char dk_cls[3] = { 0x01, 0x02, 0x0A };
+
+static void dk_clean(char *d, size_t n, const unsigned char *s, int len)
+{
+    int i, o = 0;
+    for (i = 0; i < len && s[i] && o + 1 < (int)n; i++)
+        d[o++] = s[i] < 0x20 || s[i] == '|' ? ' ' : (char)s[i];
+    while (o && d[o - 1] == ' ') o--;
+    d[o] = 0;
+}
+void iap_dock_identified(uint32_t lingoes)
+{
+    if (dk.state == 2 && lingoes == dk.lingoes)
+        return;                                       /* the same accessory identifying again (wake-up, reset) */
+    if (dk.state == 2 && dk.lingoes != 0)
+        iap_dock_pin21(15, dk.pin);                   /* another accessory: the old one is gone */
+    /* (dk.lingoes == 0: it was known by its resistor only and now says who it is: no "disconnected" for that) */
+    dk.name[0] = dk.maker[0] = dk.model[0] = 0;
+    dk.lingoes = lingoes;
+    dk.pin = iap_acc_id_code;
+    dk.video = false;
+    dk.since = current_tick;
+    dk.state = 1;
+}
+void iap_dock_accinfo(int type, const unsigned char *s, int len)
+{
+    if (type == 0x01) dk_clean(dk.name, sizeof dk.name, s, len);
+    else if (type == 0x06) dk_clean(dk.maker, sizeof dk.maker, s, len);
+    else if (type == 0x07) dk_clean(dk.model, sizeof dk.model, s, len);
+}
+void iap_dock_video_interest(void)
+{
+    dk.video = true;
+}
+static void dk_connected(void)
+{
+    if (dk.name[0])
+        snprintf(dk.key, sizeof dk.key, "%s/%s/%s", dk.name, dk.maker, dk.model);
+    else
+        snprintf(dk.key, sizeof dk.key, "lingoes %08lx pin21 %d", (unsigned long)dk.lingoes, dk.pin);
+    dk.prof_tv = -1;
+    dk.state = 2;
+    dk.ui_connect = true;
+    queue_broadcast(SYS_IAP_DOCK, 1);
+}
+/* the resistor on pin 21 changed (iap thread, before the accessory's "restore on exit" values go back) */
+void iap_dock_pin21(int code, int was)
+{
+    if (code == 15 && dk.state == 2)
+    {
+        int i;
+        for (i = 0; i < 3; i++) dk.snap[i] = vpref_get(dk_cls[i]);
+        strlcpy(dk.gone_key, dk.key, sizeof dk.gone_key);
+        strlcpy(dk.gone_name, dk.name, sizeof dk.gone_name);
+        dk.gone_tv = dk.prof_tv;
+        dk.state = 0;
+        dk.ui_disconnect = true;
+        queue_broadcast(SYS_IAP_DOCK, 0);
+    }
+    else if (code == 15)
+        dk.state = 0;
+    (void)was;
+}
+/* every 100 ms from the iap thread */
+void iap_dock_poll(void)
+{
+    unsigned p;
+    if (dk.state == 1 && TIME_AFTER(current_tick, dk.since + 2 * HZ))
+        dk_connected();
+    /* a resistor-only accessory */
+    if (iap_acc_id_code != dk.pin_since_code) { dk.pin_since_code = iap_acc_id_code; dk.pin_since = current_tick; }
+    else if (dk.state == 0 && iap_acc_id_code >= 0 && iap_acc_id_code < 15 && TIME_AFTER(current_tick, dk.pin_since + 5 * HZ))
+    {
+        dk.name[0] = dk.maker[0] = dk.model[0] = 0;
+        dk.lingoes = 0; dk.pin = iap_acc_id_code; dk.video = false;
+        dk_connected();
+    }
+    /* the power source: USB power with no computer after 12 s (in USB mode Rockbox shows its own screen), FireWire */
+    p = power_input_status() & (POWER_INPUT_MAIN_CHARGER | POWER_INPUT_USB_CHARGER);
+    {   /* what is already there at start-up is not news */
+        static bool first = true;
+        if (first) { first = false; dk.power = dk.power_new = p; dk.power_since = current_tick; }
+    }
+    if (p != dk.power_new) { dk.power_new = p; dk.power_since = current_tick; }
+    else if (p != dk.power &&
+             TIME_AFTER(current_tick, dk.power_since +
+                        ((p & ~dk.power & POWER_INPUT_MAIN_CHARGER) == POWER_INPUT_MAIN_CHARGER ? 2 * HZ : 12 * HZ)))
+    {
+        unsigned add = p & ~dk.power;
+        dk.power = p;
+        if (add && !usb_inserted())
+        {
+            dk.power_added = add;
+            dk.ui_power = true;
+            queue_broadcast(SYS_IAP_DOCK, 2);
+        }
+    }
+}
+/* ---- the dock file */
+struct dk_line { char key[72], name[40]; int tv, v[3]; };
+static int dk_read(struct dk_line *t, int max)
+{
+    char line[200];
+    int fd = open(DOCK_FILE, O_RDONLY), n = 0;
+    if (fd < 0) return 0;
+    while (n < max && read_line(fd, line, sizeof line) > 0)
+    {
+        char *f[6], *p = line;
+        int k;
+        for (k = 0; k < 6; k++) { f[k] = p; p = strchr(p, '|'); if (!p) break; *p++ = 0; }
+        if (k < 5) continue;
+        strlcpy(t[n].key, f[0], sizeof t[n].key);
+        strlcpy(t[n].name, f[1], sizeof t[n].name);
+        t[n].tv = atoi(f[2]); t[n].v[1] = atoi(f[3]); t[n].v[2] = atoi(f[4]); t[n].v[0] = atoi(f[5]);
+        n++;
+    }
+    close(fd);
+    return n;
+}
+static void dk_write(const struct dk_line *t, int n)
+{
+    int fd = open(DOCK_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666), i;
+    if (fd < 0) return;
+    fdprintf(fd, "# bcm overlay: TV settings per dock -- key|name|tv(-1/0/1)|signal|wide|picture\n");
+    for (i = 0; i < n; i++)
+        fdprintf(fd, "%s|%s|%d|%d|%d|%d\n", t[i].key, t[i].name, t[i].tv, t[i].v[1], t[i].v[2], t[i].v[0]);
+    close(fd);
+}
+static struct dk_line dk_tab[DOCK_MAX];
+/* UI thread (default_event_handler on SYS_IAP_DOCK, and the video player before it starts): notices, profiles */
+void iap_dock_ui(void)
+{
+    bool notify = global_settings.bcm_dock_notify;
+    if (dk.ui_disconnect)
+    {
+        int n = dk_read(dk_tab, DOCK_MAX), i;
+        dk.ui_disconnect = false;
+        for (i = 0; i < n && strcmp(dk_tab[i].key, dk.gone_key); i++) ;
+        if (i == n && n == DOCK_MAX) { memmove(dk_tab, dk_tab + 1, sizeof dk_tab[0] * (DOCK_MAX - 1)); i = n - 1; }
+        else if (i == n) { n++; dk_tab[i].tv = -1; }
+        strlcpy(dk_tab[i].key, dk.gone_key, sizeof dk_tab[i].key);
+        strlcpy(dk_tab[i].name, dk.gone_name, sizeof dk_tab[i].name);
+        if (dk.gone_tv >= 0) dk_tab[i].tv = dk.gone_tv;
+        dk_tab[i].v[0] = dk.snap[0]; dk_tab[i].v[1] = dk.snap[1]; dk_tab[i].v[2] = dk.snap[2];
+        dk_write(dk_tab, n);
+        logf("dock gone: %s", dk.gone_key);
+        if (notify) splash(HZ * 2, ID2P(LANG_DOCK_DISCONNECTED));
+    }
+    if (dk.ui_connect)
+    {
+        int n = dk_read(dk_tab, DOCK_MAX), i, k;
+        bool applied = false;
+        dk.ui_connect = false;
+        for (i = 0; i < n; i++)
+            if (!strcmp(dk_tab[i].key, dk.key))
+            {
+                dk.prof_tv = dk_tab[i].tv;
+                for (k = 0; k < 3; k++)
+                    if (dk_tab[i].v[k] >= 0 && dk_tab[i].v[k] != vpref_get(dk_cls[k]))
+                    {
+                        vpref_set(dk_cls[k], dk_tab[i].v[k], true);
+                        applied = true;
+                    }
+                break;
+            }
+        logf("dock: %s%s", dk.key, applied ? " (its TV settings applied)" : "");
+        if (notify)
+        {
+            if (dk.name[0])
+                splashf(HZ * 2, "%s: %s%s", str(LANG_DOCK_CONNECTED), dk.name, applied ? " *" : "");
+            else
+                splashf(HZ * 2, "%s%s", str(LANG_DOCK_CONNECTED), applied ? " *" : "");
+        }
+    }
+    if (dk.ui_power)
+    {
+        dk.ui_power = false;
+        if (notify)
+            splash(HZ * 2, (dk.power_added & POWER_INPUT_MAIN_CHARGER) == POWER_INPUT_MAIN_CHARGER ?
+                           ID2P(LANG_FIREWIRE_POWER) : ID2P(LANG_USB_POWER_ONLY));
+    }
+}
+/* for the video player: -1 = no dock / nothing known, 0 = iPod screen, 1 = TV */
+int iap_dock_tv_choice(void)
+{
+    if (dk.state != 2) return -1;
+    if (dk.prof_tv >= 0) return dk.prof_tv;
+    return dk.video ? 1 : -1;
+}
+void iap_dock_remember_tv(bool tv)
+{
+    if (dk.state == 2) dk.prof_tv = tv ? 1 : 0;
+}
+const char *iap_dock_name(void)
+{
+    return dk.state == 2 ? (dk.name[0] ? dk.name : dk.key) : NULL;
 }
 #endif
 
@@ -203,6 +440,9 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
              */
             iap_interface_state_change(IST_STANDARD);
             iap_reset_device(&device);
+#ifdef IPOD_VIDEO
+            iap_dock_identified(BIT_N(lingo & 31) | 1);    /* v74 */
+#endif
 
             switch (lingo) {
                 case 0x04:
@@ -647,6 +887,9 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
             }
             iap_reset_device(&device);
             device.lingoes = lingoes;
+#ifdef IPOD_VIDEO
+            iap_dock_identified(lingoes);    /* v74 */
+#endif
 
             /* Devices using IdentifyDeviceLingoes get power off notifications */
             device.do_power_notify = true;
@@ -1102,6 +1345,11 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
                     break;
                 }
 
+#ifdef IPOD_VIDEO
+                case 0x01: case 0x06: case 0x07:    /* v74: name, manufacturer, model: the dock's notice and key */
+                    iap_dock_accinfo(buf[0x02], &buf[0x03], (int)len - 3);
+                    break;
+#endif
                 /* For now, ignore all other information */
                 default:
                 {
@@ -1144,6 +1392,8 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
         {
             CHECKLEN(3);
 #ifdef IPOD_VIDEO
+            if (buf[2] <= 0x02 || buf[2] == 0x08 || buf[2] == 0x0A)
+                iap_dock_video_interest();    /* v74: asks about video output: a video dock */
             /* bcm overlay v62: the 5G/5.5G answered these without authentication (that came with the classic) */
             if (!iap_ident_stock())
                 CHECKAUTH;

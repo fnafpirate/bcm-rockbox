@@ -568,6 +568,58 @@ extern bool bcm_video_play(const char *path);      /* apps/debug_menu.c */
 extern bool bcm_video_play_again(const char *path);
 extern bool bcm_video_is_video(const char *path);
 extern int bcm_video_next_request;
+extern bool bcm_tvs_episode, bcm_tvs_stop_after, bcm_video_finished;   /* v74 */
+#include "bcm_tvshow.h"
+#include "font.h"
+#include "action.h"
+#include "backlight.h"
+/* v74: TV series autoplay -- "Up next" with a countdown; true = play it (SELECT / PLAY = now, MENU = stop) */
+static bool ft_tvs_countdown(const char *label)
+{
+    struct screen *d = &screens[SCREEN_MAIN];
+    const int total = 10 * HZ;
+    long end = current_tick + total;
+    char l1[80], l2[120];
+    const char *nl = strchr(label, '\n');
+    if (nl)
+    {
+        snprintf(l1, sizeof l1, "%.*s", (int)(nl - label), label);
+        snprintf(l2, sizeof l2, "%s", nl + 1);
+    }
+    else { snprintf(l1, sizeof l1, "%s", label); l2[0] = 0; }
+    backlight_on();
+    while (1)
+    {
+        long left = end - current_tick;
+        int fh, w, h, y, a, bw = d->lcdwidth - 40;
+        char t[64];
+        if (left <= 0) return true;
+        d->set_viewport(NULL);
+        d->setfont(FONT_UI);
+        d->clear_display();
+        fh = font_get(FONT_UI)->height;
+        y = d->lcdheight / 2 - fh * 3;
+#define FT_CENTER(s) do { d->getstringsize((const unsigned char *)(s), &w, &h); \
+                          d->putsxy((d->lcdwidth - w) / 2 > 0 ? (d->lcdwidth - w) / 2 : 0, y, (const unsigned char *)(s)); y += fh + 2; } while (0)
+        FT_CENTER(str(LANG_TVS_UP_NEXT));
+        y += fh / 2;
+        FT_CENTER(l1);
+        if (l2[0]) FT_CENTER(l2);
+        y += fh / 2;
+        snprintf(t, sizeof t, str(LANG_TVS_PLAYING_IN), (int)((left + HZ - 1) / HZ));
+        FT_CENTER(t);
+        d->drawrect(20, y, bw, 8);
+        d->fillrect(20, y, (int)((long)bw * (total - left) / total), 8);
+        y += 14;
+        FT_CENTER(str(LANG_TVS_HINT));
+#undef FT_CENTER
+        d->update();
+        a = get_action(CONTEXT_TREE, HZ / 10);
+        if (a == ACTION_STD_OK || a == ACTION_TREE_WPS) return true;
+        if (a == ACTION_STD_CANCEL || a == ACTION_STD_MENU) return false;
+        if (IS_SYSEVENT(a) && default_event_handler(a) == SYS_USB_CONNECTED) return false;
+    }
+}
 /* v63: a dock / remote asked for the next (+1) or previous (-1) video: the neighbouring video file of this folder
    (wrapping round), selected in the browser and played; 0 = none */
 static bool ft_video_neighbour(struct tree_context *c, int dir, char *buf, size_t n)
@@ -623,11 +675,35 @@ int ft_enter(struct tree_context* c)
         if (bcm_video_is_video(buf))
         {
             int guard = 0;
+            char first[MAX_PATH], nxt[MAX_PATH], label[160], root[MAX_PATH];
+            strlcpy(first, buf, sizeof first);
+            /* v74: an episode of a TV show (".../TV Show/<show>/...") with Settings > Video > Autoplay Next Episode */
+            bcm_tvs_stop_after = false;
+            bcm_tvs_episode = global_settings.bcm_tv_autoplay && tvs_show_root(buf, root, sizeof root, NULL, 0);
             bcm_video_play(buf);
-            while (bcm_video_next_request && guard++ < 1000
-                   && ft_video_neighbour(c, bcm_video_next_request, buf, sizeof buf))
-                bcm_video_play_again(buf);              /* v63 */
+            while (guard++ < 1000)
+            {
+                if (bcm_video_next_request)
+                {   /* v63: the dock's next / previous video -- in episode order for a show */
+                    if (bcm_tvs_episode ? !tvs_next(buf, bcm_video_next_request, nxt, sizeof nxt, NULL, 0)
+                                        : !ft_video_neighbour(c, bcm_video_next_request, nxt, sizeof nxt))
+                        break;
+                }
+                else if (bcm_tvs_episode && bcm_video_finished && !bcm_tvs_stop_after
+                         && tvs_next(buf, 1, nxt, sizeof nxt, label, sizeof label))
+                {
+                    if (!ft_tvs_countdown(label))
+                        break;
+                }
+                else
+                    break;
+                strlcpy(buf, nxt, sizeof buf);
+                bcm_video_play_again(buf);
+            }
             bcm_video_next_request = 0;
+            bcm_tvs_episode = false;
+            if (strcmp(buf, first))
+                set_current_file(buf);                  /* v74: the browser shows the last episode played */
             return GO_TO_PREVIOUS;
         }
 #endif

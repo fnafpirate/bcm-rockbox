@@ -83,6 +83,9 @@ static int timedate_set(void)
 MENUITEM_FUNCTION(time_set, 0, ID2P(LANG_SET_TIME),
                   timedate_set, NULL, Icon_NOICON);
 MENUITEM_SETTING(timeformat, &global_settings.timeformat, NULL);
+#ifdef IPOD_VIDEO
+MENUITEM_SETTING(bcm_clock_sync_item, &global_settings.bcm_clock_sync, NULL);   /* bcm overlay v74 */
+#endif
 #ifdef HAVE_RTC_ALARM
 MENUITEM_FUNCTION(alarm_screen_call, 0, ID2P(LANG_ALARM_MOD_ALARM_MENU),
                   alarm_screen, NULL, Icon_NOICON);
@@ -238,6 +241,9 @@ MAKE_MENU(time_menu, ID2P(LANG_TIME_MENU), time_menu_callback, Icon_NOICON,
 #endif
 #if defined(HAVE_RDS_CAP) && defined(CONFIG_RTC)
           &sync_rds_time,
+#endif
+#ifdef IPOD_VIDEO
+          &bcm_clock_sync_item,
 #endif
           &timeformat);
 

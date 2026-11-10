@@ -17520,3 +17520,445 @@
     ipodvideo: "iPod classic (Rockbox)"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_SUBTITLES
+  desc: video player: subtitles on/off, its menu, the notice when switching
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Subtitles"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Subtitles"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Subtitles"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_SIZE
+  desc: subtitles: text size
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Subtitle Size"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Subtitle Size"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Subtitle Size"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_SMALL
+  desc: subtitle size
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Small"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Small"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Small"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_MEDIUM
+  desc: subtitle size
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Medium"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Medium"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Medium"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_LARGE
+  desc: subtitle size
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Large"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Large"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Large"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_STYLE
+  desc: subtitles: outlined text or a dark box
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Subtitle Style"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Subtitle Style"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Subtitle Style"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_OUTLINE
+  desc: subtitle style
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Outline"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Outline"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Outline"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_SUBTITLE_BOX
+  desc: subtitle style
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Box"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Box"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Box"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_OUT_AUTO
+  desc: Video Out: TV on a dock that wants it
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Auto (Dock)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Auto (Dock)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Auto (Dock)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_SETTINGS
+  desc: the Video menu in General Settings
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Video"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Video"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Video"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_BUFFERING
+  desc: video read-ahead mode
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Video Buffering"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Video Buffering"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Video Buffering"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BUFFER_LOW_POWER
+  desc: video buffering
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Low-Power"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Low-Power"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Low-Power"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BUFFER_BALANCED
+  desc: video buffering
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Balanced"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Balanced"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Balanced"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BUFFER_PERFORMANCE
+  desc: video buffering
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Performance"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Performance"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Performance"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_AUTOPLAY
+  desc: TV shows: play the next episode
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Autoplay Next Episode"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Autoplay Next Episode"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Autoplay Next Episode"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_UP_NEXT
+  desc: TV shows: countdown title
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Up Next"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Up Next"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Up Next"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_PLAYING_IN
+  desc: TV shows: countdown, %d = seconds
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Playing in %d s"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Playing in %d s"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Playing in  s"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_HINT
+  desc: TV shows: countdown buttons
+  user: core
+  <source>
+    *: none
+    ipodvideo: "SELECT: now   MENU: stop"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "SELECT: now   MENU: stop"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "SELECT now   MENU stop"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_STOP_AFTER
+  desc: TV shows: notice
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Stop after this episode"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Stop after this episode"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Stop after this episode"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_PLAY_NEXT
+  desc: TV shows: notice
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Next episode will play"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Next episode will play"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Next episode will play"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_DOCK_NOTICES
+  desc: notices for docks and power
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Dock Notifications"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Dock Notifications"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Dock Notifications"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_DOCK_CONNECTED
+  desc: notice
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Dock connected"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Dock connected"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Dock connected"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_DOCK_DISCONNECTED
+  desc: notice
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Dock disconnected"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Dock disconnected"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Dock disconnected"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_POWER_ONLY
+  desc: notice: USB power, no computer
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB power: charging"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB power: charging"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB power charging"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_FIREWIRE_POWER
+  desc: notice: FireWire / dock power
+  user: core
+  <source>
+    *: none
+    ipodvideo: "FireWire power: charging"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "FireWire power: charging"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "FireWire power charging"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_CLOCK_FROM_PC
+  desc: Time & Date: set the clock from the computer over USB
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Set Clock From Computer"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Set Clock From Computer"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Set Clock From Computer"
+  </voice>
+</phrase>

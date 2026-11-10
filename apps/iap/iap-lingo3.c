@@ -525,7 +525,7 @@ void iap_handlepkt_mode3(const unsigned int len, const unsigned char *buf)
                     tm = get_time();
 
                     /* Year */
-                    IAP_TX_PUT_U16(tm->tm_year);
+                    IAP_TX_PUT_U16(tm->tm_year + 1900);   /* bcm overlay v74: the full year (2026), as iAP wants -- it sent 126 */
 
                     /* Month */
                     IAP_TX_PUT(tm->tm_mon+1);

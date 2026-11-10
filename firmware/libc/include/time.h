@@ -26,7 +26,12 @@ struct tm
 };
 
 #if !defined(_TIME_T_DEFINED) && !defined(_TIME_T_DECLARED)
-typedef long time_t;
+/* bcm overlay v74: the Year-2038 problem.  A signed 32-bit time_t ends at 2038-01-19 03:14:07 and then jumps to
+   1901: file dates (browser, dircache, "file changed" checks), the playback log's timestamps and plugins such as
+   the TOTP authenticator would all go wrong.  Nothing here ever needs a time before 1970 (the RTC counts
+   2000-2099, FAT / exFAT dates start in 1980), so time_t is unsigned: same size (no structure or plugin-interface
+   change), good until 2106-02-07 06:28:15 -- past the RTC's own 2099 and FAT's 2107. */
+typedef unsigned long time_t;
 
 /* this define below is used by the mingw headers to prevent duplicate
    typedefs */

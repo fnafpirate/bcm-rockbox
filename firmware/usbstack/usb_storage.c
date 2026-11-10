@@ -338,6 +338,52 @@ static void send_command_result(void *data,int size);
 static void send_command_failed_result(void);
 static void send_block_data(void *data,int size);
 static void receive_block_data(void *data,int size);
+#if CONFIG_RTC && defined(IPOD_VIDEO)
+/* bcm overlay v74: clock sync from the computer without administrator rights.  A PC program (the setup tool, or its
+   "iPod Clock Sync" helper that runs in the background) writes /.rockbox/clocksync.txt =
+       "RBCLOCK1 2026-11-09 18:23:05.123 \n"
+   and flushes it.  The file's data starts a sector, so here, as the sectors come over USB, a sector beginning with
+   "RBCLOCK1 " sets the clock at once (the text was made milliseconds before).  Off with Settings > General Settings >
+   Time & Date > Set Clock From Computer.  (iTunes' own way -- the SCSI WRITE BUFFER command -- still works too.) */
+bool usb_clocksync_enabled = true;
+static int clk_num(const unsigned char *p, int n)
+{
+    int v = 0;
+    while (n--)
+    {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (*p++ - '0');
+    }
+    return v;
+}
+static void clocksync_scan(const unsigned char *d, unsigned int len)
+{
+    unsigned int o;
+    for (o = 0; o + 32 <= len; o += 512)
+    {
+        const unsigned char *p = d + o;
+        struct tm tm;
+        int ms;
+        if (p[0] != 'R' || memcmp(p, "RBCLOCK1 ", 9))
+            continue;
+        p += 9;              /* YYYY-MM-DD HH:MM:SS.mmm */
+        tm.tm_year = clk_num(p, 4) - 1900; tm.tm_mon = clk_num(p + 5, 2) - 1; tm.tm_mday = clk_num(p + 8, 2);
+        tm.tm_hour = clk_num(p + 11, 2); tm.tm_min = clk_num(p + 14, 2); tm.tm_sec = clk_num(p + 17, 2);
+        ms = clk_num(p + 20, 3);
+        if (p[4] != '-' || p[7] != '-' || p[10] != ' ' || p[13] != ':' || p[16] != ':' ||
+            tm.tm_year < 120 || tm.tm_year > 199 || tm.tm_mon < 0 || tm.tm_mon > 11 || tm.tm_mday < 1 ||
+            tm.tm_mday > 31 || tm.tm_hour < 0 || tm.tm_hour > 23 || tm.tm_min < 0 || tm.tm_min > 59 ||
+            tm.tm_sec < 0 || tm.tm_sec > 59)
+            continue;
+        if (ms >= 500 && tm.tm_sec < 59) tm.tm_sec++;        /* to the nearest second (not across a minute) */
+        tm.tm_yday = 0; tm.tm_isdst = 0;
+        set_day_of_week(&tm);
+        set_time(&tm);
+        logf("clock set from the computer");
+        return;
+    }
+}
+#endif
 #if CONFIG_RTC
 static void receive_time(void);
 #endif
@@ -570,6 +616,11 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                         MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
                 int result = USBSTOR_WRITE_SECTORS_FILTER();
+#if CONFIG_RTC && defined(IPOD_VIDEO)
+                if (usb_clocksync_enabled)               /* bcm overlay v74 */
+                    clocksync_scan(cur_cmd.data[cur_cmd.data_select],
+                                   MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
+#endif
 
                 if (result == 0) {
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)

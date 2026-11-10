@@ -418,6 +418,15 @@ sub buildzip {
         open(NOMEDIA, ">$temp_dir/.nomedia")  || die "can't open .nomedia";
         close(NOMEDIA);
     }
+    # bcm overlay v73: the iPod video player's subtitle fonts (Helvetica Bold 21 / 27 / 35 px; LCD and TV sizes)
+    if ($modelname =~ /ipodvideo/ && $bitmap) {
+        glob_mkdir("$temp_dir/fonts");
+        chdir "$temp_dir/fonts";
+        foreach my $f ("21-Adobe-Helvetica-Bold", "27-Adobe-Helvetica-Bold", "35-Adobe-Helvetica-Bold") {
+            system("$ROOT/tools/convbdf -f $ROOT/fonts/$f.bdf >/dev/null 2>&1") if (! -f "$f.fnt");
+        }
+        chdir("../../");
+    }
     # copy wifi firmware
     if ($modelname =~ /sansaconnect/) {
         glob_mkdir("$temp_dir/libertas");

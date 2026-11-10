@@ -897,6 +897,12 @@ void settings_apply(bool read_disk)
     CHART("<set_codepage");
 
     sound_settings_apply();
+#ifdef IPOD_VIDEO
+    {   /* bcm overlay v74: firmware/usbstack/usb_storage.c reads it */
+        extern bool usb_clocksync_enabled;
+        usb_clocksync_enabled = global_settings.bcm_clock_sync;
+    }
+#endif
 
 #ifdef HAVE_DISK_STORAGE
     audio_set_buffer_margin(global_settings.buffer_margin);

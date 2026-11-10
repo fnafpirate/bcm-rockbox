@@ -46,6 +46,12 @@ bool iap_ident_stock(void);
 extern int iap_acc_id_code;
 int iap_acc_id_read(void);
 void iap_video_prefs_restore(void);
+/* v74: docks (apps/iap/iap-lingo0.c) */
+void iap_dock_identified(uint32_t lingoes);
+void iap_dock_accinfo(int type, const unsigned char *s, int len);
+void iap_dock_video_interest(void);
+void iap_dock_pin21(int code, int was);
+void iap_dock_poll(void);
 /* v63: the dock / remotes control the video player (apps/debug_menu.c) while a video plays */
 enum { IAPV_TOGGLE = 1, IAPV_PLAY, IAPV_PAUSE, IAPV_STOP, IAPV_NEXT, IAPV_PREV, IAPV_FF, IAPV_REW, IAPV_FFREW_END,
        IAPV_VOL_UP, IAPV_VOL_DOWN, IAPV_VOL_SET, IAPV_MUTE, IAPV_CH_NEXT, IAPV_CH_PREV, IAPV_OSD };

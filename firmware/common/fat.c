@@ -247,8 +247,8 @@ static struct bpb
 
     /* variables for internal use */
     unsigned long fatsize;
-    unsigned long totalsectors;
-    unsigned long rootdirsector;
+    sector_t      totalsectors;   /* bcm overlay v72: 64-bit -- exFAT volumes beyond 2 TiB */
+    sector_t      rootdirsector;
     unsigned long firstdatasector;
     sector_t startsector;
     unsigned long dataclusters;
@@ -4310,7 +4310,7 @@ static long transfer(struct bpb *fat_bpb, sector_t start, long count,
 
     if (write)
     {
-        unsigned long firstallowed;
+        sector_t firstallowed;
 #ifdef HAVE_FAT16SUPPORT
         if (fat_bpb->is_fat16)
             firstallowed = fat_bpb->rootdirsector;
@@ -4966,8 +4966,9 @@ bool fat_size(IF_MV(int volume,) sector_t *size, sector_t *free)
         dc_unlock_cache();
     }
 
-    if (size) *size = fat_bpb->dataclusters * factor;
-    if (free) *free = fat_bpb->fsinfo.freecount * factor;
+    /* bcm overlay v72: 64-bit products (KiB) -- volumes beyond 4 TiB */
+    if (size) *size = (sector_t)fat_bpb->dataclusters * factor;
+    if (free) *free = (sector_t)fat_bpb->fsinfo.freecount * factor;
 
     return true;
 }

@@ -142,6 +142,11 @@
 #if defined(IPOD_ACCESSORY_PROTOCOL)
 #include "iap.h"
 #endif
+#ifdef IPOD_VIDEO
+#include "rbunicode.h"
+#include "bcm_subs.h"                     /* v73: soft subtitles */
+#include "bcm_dock.h"                     /* v74: docks */
+#endif
 
 #if defined(HIBY_LINUX) && !defined(SIMULATOR)
 #include <sys/sysinfo.h>
@@ -3144,6 +3149,15 @@ static int cfg_m4cache_ref(void);
      drive is told to sleep at once (an SSD wakes from standby in milliseconds) -- one short burst a minute;
    - a seek / FF / REW outside the ring restarts it at the new place with a small read. */
 static int cfg_ra_kb = 4096, cfg_moov_kb = 3072, cfg_ra_sleep = 1;
+/* v74: Settings > Video Buffering picks the ring and the refill point (cfg ra_kb > 0 / ra_mode still override):
+     Low-power    ring = ~3 min of this video (4..24 MB), refilled when 1/8 is left, the SSD sleeps at once after:
+                  the fewest drive wake-ups (one ~every 2.5 min)
+     Balanced     ring = ~1 min of this video (2..8 MB), refilled at 1/4 (the v59 behaviour, now sized by bit rate)
+     Performance  ring = ~2 min (8..24 MB), refilled at 1/2, the drive is left to Rockbox's own timer: the most
+                  data ready for seeks / FF / REW and a busy card */
+static int cfg_ra_mode = -1;          /* -1 = the setting */
+static int ra_mode, ra_refill_div = 4;
+static bool ra_sleep_on = true;
 static int ra_handle = -1;
 static uint8_t *ra_buf;               /* ring: cfg_ra_kb KB */
 static uint32_t ra_size;
@@ -3222,7 +3236,7 @@ static void ra_tick(void)
     keep = keep > ra_lo + 131072 ? keep - 131072 : ra_lo;                     /* keep 128 KB behind it */
     ra_lo = keep;
     ahead = ra_hi - lead;
-    if (!ra_filling && ahead < ra_size / 4) { ra_filling = true; ra_slept = false; ra_bursts++; }
+    if (!ra_filling && ahead < ra_size / ra_refill_div) { ra_filling = true; ra_slept = false; ra_bursts++; }
     if (!ra_filling) return;
     room = ra_size - (ra_hi - ra_lo);
     n = room < 65536 ? room : 65536;
@@ -3231,7 +3245,7 @@ static void ra_tick(void)
     {
         ra_filling = false;
         /* full: an SSD is put to sleep at once (wakes in ms); a hard disk keeps Rockbox's own spin-down timer */
-        if (cfg_ra_sleep && !ra_slept && ata_disk_isssd()) { storage_sleepnow(); ra_slept = true; }
+        if (cfg_ra_sleep && ra_sleep_on && !ra_slept && ata_disk_isssd()) { storage_sleepnow(); ra_slept = true; }
     }
 }
 #define M4C_WIN 4096
@@ -3452,6 +3466,7 @@ static void m4_seek_sample(uint32_t k)
     m4.need_ps = true;
 }
 static uint32_t m4_dur_ms, m4_br;            /* v20: duration (ms) and average bit rate (bit/s) of the whole file */
+static uint32_t m4_moov_s, m4_moov_e;        /* v73: the moov payload (the subtitle track scan) */
 
 static bool ma_trak(uint32_t ps, uint32_t pe);   /* v53: audio track (below) */
 static void ma_rewind(void);
@@ -3468,13 +3483,40 @@ static int mp4_open(const char *path)
     fsz = (uint32_t)sz;
     while (m4_box(&pos, fsz, &t, &ps, &pe)) if (t == FOURCC('m','o','o','v')) { moov_s = ps; moov_e = pe; break; }
     if (!moov_e) { m4_close(); return -3; }
+    m4_moov_s = moov_s; m4_moov_e = moov_e;
     {   /* v59: one buffer: the moov box + the read-ahead ring */
         uint32_t mlen = moov_e - moov_s + 8, want;
         long t0 = current_tick;
         ra_fsize = fsz;
+        uint32_t ring = 0, br = 0;
         if (mlen > (uint32_t)cfg_moov_kb * 1024) mlen = 0;
-        want = mlen + (cfg_ra_kb > 0 ? (uint32_t)cfg_ra_kb * 1024 : 0);
-        if (want && (ra_handle = core_alloc_ex(want, NULL)) > 0)
+        {   /* v74: the ring from the buffering setting and this file's average bit rate (mvhd duration) */
+            static const uint32_t secs[3] = { 180, 60, 120 }, lo_mb[3] = { 4, 2, 8 }, hi_mb[3] = { 24, 8, 24 };
+            static const int div[3] = { 8, 4, 2 };
+            uint32_t a, b, ts, dur;
+            ra_mode = cfg_ra_mode >= 0 ? cfg_ra_mode : global_settings.bcm_video_buffer;
+            if (ra_mode < 0 || ra_mode > 2) ra_mode = 1;
+            if (m4_find(moov_s, moov_e, FOURCC('m','v','h','d'), &a, &b))
+            {
+                bool v1 = m4_u8(a) == 1;
+                ts = m4_u32(a + (v1 ? 20 : 12)); dur = m4_u32(a + (v1 ? 28 : 16));   /* v1: low word of the u64 */
+                if (ts && dur) br = (uint32_t)((uint64_t)fsz * 8ULL * ts / dur);
+            }
+            ring = br ? (uint32_t)((uint64_t)br / 8 * secs[ra_mode]) : 4u << 20;
+            if (ring < lo_mb[ra_mode] << 20) ring = lo_mb[ra_mode] << 20;
+            if (ring > hi_mb[ra_mode] << 20) ring = hi_mb[ra_mode] << 20;
+            if (cfg_ra_kb > 0 && cfg_ra_kb != 4096) ring = (uint32_t)cfg_ra_kb * 1024;     /* an explicit ra_kb wins */
+            if (cfg_ra_kb <= 0) ring = 0;
+            if (ring > fsz + 65536) ring = (fsz + 65536 + 65535) & ~65535u;               /* a short clip: all of it */
+            ra_refill_div = div[ra_mode];
+            ra_sleep_on = ra_mode != 2;
+        }
+        want = mlen + ring;
+        while (want && (ra_handle = core_alloc_ex(want, NULL)) <= 0 && ring > (1u << 20))
+        {   /* not that much free memory: a smaller ring */
+            ring = (ring / 2) & ~65535u; want = mlen + ring;
+        }
+        if (want && ra_handle > 0)
         {
             uint8_t *p;
             core_pin(ra_handle);
@@ -3485,10 +3527,12 @@ static int mp4_open(const char *path)
                 if (lseek(m4.fd, (off_t)mv_s, SEEK_SET) == (off_t)mv_s && read(m4.fd, p, mlen) == (ssize_t)mlen) mv_buf = p;
                 else mlen = 0;
             }
-            if (cfg_ra_kb > 0) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ((uint32_t)cfg_ra_kb * 1024) & ~65535u; }
+            if (ring >= 65536) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ring & ~65535u; }
             ra_lo = ra_hi = 0; ra_pos[0] = ra_pos[1] = 0; ra_filling = false; ra_bursts = ra_misses = ra_read_kb = 0;
-            BLOG("read-ahead: moov %u KB in RAM (%ld ms), ring %u KB%s", mv_buf ? mlen / 1024 : 0,
-                 (current_tick - t0) * 1000 / HZ, ra_size / 1024, ata_disk_isssd() ? " (solid-state drive)" : "");
+            BLOG("read-ahead: moov %u KB in RAM (%ld ms), ring %u KB%s -- %s, %u kbit/s, refill at 1/%d%s", mv_buf ? mlen / 1024 : 0,
+                 (current_tick - t0) * 1000 / HZ, ra_size / 1024, ata_disk_isssd() ? " (solid-state drive)" : "",
+                 ra_mode == 0 ? "low-power" : ra_mode == 2 ? "performance" : "balanced", (unsigned)(br / 1000), ra_refill_div,
+                 ra_sleep_on ? "" : ", no forced sleep");
         }
         else BLOG("read-ahead: no buffer (%u KB wanted) -- the v45 small caches are used", want / 1024);
     }
@@ -3771,6 +3815,9 @@ static int cfg_region_when = 1, cfg_region_mode = 0, cfg_region_w = 320, cfg_reg
 static int cfg_setvol = 1, cfg_vchr47 = 0, cfg_freeze = 0, cfg_flags_legacy = 0;
 static int cfg_dc_seq = 0, cfg_probe_at = 0;
 static int cfg_osd = 1, cfg_osd_layer = 100;                                         /* v44: playback overlay */
+/* v73: subtitles: subs -1 = the setting, 0 off, 1 on; subs_layer 0 = just below the controls; subs_sync = ms between
+   position reads while playing; subs_delay = ms added to the video position (+ = subtitles later) */
+static int cfg_subs = -1, cfg_subs_layer = 0, cfg_subs_sync = 1500, cfg_subs_delay = 0;
 static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
 static int cfg_ff_accel = 1;                                                        /* v47 */
@@ -3873,6 +3920,10 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "play_secs")) cfg_play_secs = v;
         else if (!strcmp(p, "osd"))      cfg_osd = v;
         else if (!strcmp(p, "osd_layer")) cfg_osd_layer = v;
+        else if (!strcmp(p, "subs"))     cfg_subs = v;
+        else if (!strcmp(p, "subs_layer")) cfg_subs_layer = v;
+        else if (!strcmp(p, "subs_sync")) cfg_subs_sync = v < 200 ? 200 : v;
+        else if (!strcmp(p, "subs_delay")) cfg_subs_delay = v;
         else if (!strcmp(p, "scrub_mode")) cfg_scrub_mode = v;
         else if (!strcmp(p, "scrub_tick")) cfg_scrub_tick = v < 100 ? 100 : v;
         else if (!strcmp(p, "step_ms"))  cfg_step_ms = v;
@@ -3903,6 +3954,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "ra_kb"))    cfg_ra_kb = v;
         else if (!strcmp(p, "moov_kb"))  cfg_moov_kb = v;
         else if (!strcmp(p, "ra_sleep")) cfg_ra_sleep = v;
+        else if (!strcmp(p, "ra_mode"))  cfg_ra_mode = v;
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
@@ -4273,7 +4325,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v70 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v75 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4914,6 +4966,569 @@ static void osd_show_for(int ms)
     osd_next = current_tick + HZ;
 }
 
+/* ======================================================================
+   v73: soft subtitles.  apps/bcm_subs.c reads SRT / WebVTT / ASS and draws text; this part finds the tracks, keeps the
+   clock and puts the text over the picture in its own ARGB VideoCore window, one layer below the controls.
+   Sources (best first): sidecar files next to the video (Movie.srt, Movie.en.srt, Movie.English.forced.vtt, Movie.ass),
+   then the MP4's own timed-text tracks (tx3g, as written by HandBrake / ffmpeg -c:s mov_text / iTunes).
+   Hold SELECT (0.6 s) to switch: track 1 -> track 2 -> ... -> off -> track 1; a short notice names the choice.
+   A short SELECT press still shows / hides the controls.  The text moves up while the controls' bottom panel is up and
+   goes to the top for cues marked so ({\an8}, ASS \an7-9, WebVTT line:0%).  On a TV it is drawn on the TV, larger.
+   Drawing: the canvas is rendered on the ARM; only the pixels in the rows' text spans that differ from what the back image
+   holds go over the bus (a 2-line cue on the LCD: ~40 KB), then the two images swap windows in one display update, so a
+   half-written subtitle is never seen. */
+#define ST_TRACKS (SUBS_MAX_TRACKS + 6)
+struct st_tx3g { uint32_t timescale, stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n, bytes; bool co64; };
+static struct subs_track st_trk[ST_TRACKS];
+static struct st_tx3g st_tx[6];
+static int st_n, st_ntx;
+static int st_cur = -1;                  /* the chosen track (-1 = off) */
+static int st_loaded = -1;               /* the track in st_store */
+static int st_store_h = -1;
+static struct subs_store st_store;
+static char st_video[MAX_PATH];
+static int st_ok;                        /* drawing: 0 = not set up yet, 1 = ready, -1 = failed (no subtitles this run) */
+static int st_cv_h = -1;
+static uint32_t *st_cv;                  /* ARGB canvas st_w x st_h */
+static uint8_t *st_wk;                   /* alpha work buffer */
+static int16_t *st_ext;                  /* [2][st_h][2]: per image and row the columns that are not transparent */
+static int st_w, st_h, st_tvmode;
+static uint32_t st_img[2], st_addr[2], st_win;
+static int st_nimg, st_front = -1;
+static int st_font = -1;                 /* font slot loaded for the subtitles (-1 = none: the UI font) */
+static int st_font_h;
+static struct subs_style st_style;
+static const struct subs_cue *st_shown[6];
+static int st_nshown, st_shown_msgv = -1, st_msgv;
+static bool st_shown_any, st_win_top, st_win_raised;
+static char st_msg[64];
+static long st_msg_until, st_fast_until, st_sync_tick;
+static uint32_t st_last_el;
+static bool st_stalled;                  /* the last two position reads were equal while playing (buffering) */
+static bool st_sel_down, st_sel_done;
+static long st_sel_t0;
+
+/* ---- tracks */
+static const char *st_lang_name(const char *c)
+{
+    static const char *const map[][2] = {
+        { "eng", "English" }, { "spa", "Spanish" }, { "fre", "French" }, { "fra", "French" }, { "ger", "German" },
+        { "deu", "German" }, { "ita", "Italian" }, { "por", "Portuguese" }, { "jpn", "Japanese" }, { "chi", "Chinese" },
+        { "zho", "Chinese" }, { "kor", "Korean" }, { "rus", "Russian" }, { "dut", "Dutch" }, { "nld", "Dutch" },
+        { "swe", "Swedish" }, { "nor", "Norwegian" }, { "dan", "Danish" }, { "fin", "Finnish" }, { "pol", "Polish" },
+        { "ara", "Arabic" }, { "heb", "Hebrew" }, { "hin", "Hindi" }, { "tur", "Turkish" }, { "gre", "Greek" },
+        { "ell", "Greek" }, { "cze", "Czech" }, { "ces", "Czech" }, { "hun", "Hungarian" }, { "ukr", "Ukrainian" } };
+    unsigned i;
+    for (i = 0; i < sizeof map / sizeof map[0]; i++) if (!strcmp(c, map[i][0])) return map[i][1];
+    return NULL;
+}
+/* an MP4 timed-text track: handler 'text' / 'sbtl' / 'subt' with a 'tx3g' sample description */
+static bool st_tx3g_trak(uint32_t ps, uint32_t pe, struct st_tx3g *x, char *label, size_t ln)
+{
+    uint32_t ms, me, a, b, mi_s, mi_e, sb_s, sb_e, pos, t, s, e, h, lang, flags = 0;
+    bool have_stsd = false;
+    char code[4];
+    memset(x, 0, sizeof *x);
+    if (!m4_find(ps, pe, FOURCC('m','d','i','a'), &ms, &me)) return false;
+    if (!m4_find(ms, me, FOURCC('h','d','l','r'), &a, &b)) return false;
+    h = m4_u32(a + 8);
+    if (h != FOURCC('t','e','x','t') && h != FOURCC('s','b','t','l') && h != FOURCC('s','u','b','t')) return false;
+    if (!m4_find(ms, me, FOURCC('m','d','h','d'), &a, &b)) return false;
+    x->timescale = m4_u8(a) == 1 ? m4_u32(a + 20) : m4_u32(a + 12);
+    lang = m4_u16(a + (m4_u8(a) == 1 ? 32 : 20));
+    if (!x->timescale) return false;
+    if (!m4_find(ms, me, FOURCC('m','i','n','f'), &mi_s, &mi_e)) return false;
+    if (!m4_find(mi_s, mi_e, FOURCC('s','t','b','l'), &sb_s, &sb_e)) return false;
+    pos = sb_s;
+    while (m4_box(&pos, sb_e, &t, &s, &e))
+    {
+        if (t == FOURCC('s','t','s','d'))
+        {
+            if (m4_u32(s + 8 + 4) != FOURCC('t','x','3','g')) return false;
+            flags = m4_u32(s + 8 + 16);                  /* displayFlags: 0x80000000 all samples forced, 0x40000000 some */
+            have_stsd = true;
+        }
+        else if (t == FOURCC('s','t','t','s')) { x->stts = s + 8; x->stts_n = m4_u32(s + 4); }
+        else if (t == FOURCC('s','t','s','c')) { x->stsc = s + 8; x->stsc_n = m4_u32(s + 4); }
+        else if (t == FOURCC('s','t','s','z')) { x->stsz_fixed = m4_u32(s + 4); x->stsz_n = m4_u32(s + 8); x->stsz = s + 12; }
+        else if (t == FOURCC('s','t','c','o')) { x->stco = s + 8; x->stco_n = m4_u32(s + 4); x->co64 = false; }
+        else if (t == FOURCC('c','o','6','4')) { x->stco = s + 8; x->stco_n = m4_u32(s + 4); x->co64 = true; }
+    }
+    if (!have_stsd || !x->stts_n || !x->stsc_n || !x->stsz_n || !x->stco_n) return false;
+    {   uint32_t i;
+        if (x->stsz_fixed) x->bytes = x->stsz_fixed * x->stsz_n;
+        else for (i = 0; i < x->stsz_n && x->bytes < 8u << 20; i++) x->bytes += m4_u32(x->stsz + 4 * i);
+    }
+    code[0] = (char)(((lang >> 10) & 31) + 0x60); code[1] = (char)(((lang >> 5) & 31) + 0x60); code[2] = (char)((lang & 31) + 0x60); code[3] = 0;
+    {
+        const char *nm = st_lang_name(code);
+        bool known = code[0] >= 'a' && code[0] <= 'z' && strcmp(code, "und");
+        snprintf(label, ln, "%s%s (MP4)", nm ? nm : known ? code : "Text", flags & 0x80000000u ? " forced" : "");
+    }
+    return true;
+}
+static void st_find_tracks(const char *video)
+{
+    uint32_t pos, t, ps, pe;
+    snprintf(st_video, sizeof st_video, "%s", video);
+    st_n = subs_find_sidecars(video, st_trk, SUBS_MAX_TRACKS);
+    st_ntx = 0;
+    if (m4.fd >= 0 && m4_moov_e)
+    {
+        pos = m4_moov_s;
+        while (st_ntx < (int)(sizeof st_tx / sizeof st_tx[0]) && st_n < ST_TRACKS && m4_box(&pos, m4_moov_e, &t, &ps, &pe))
+            if (t == FOURCC('t','r','a','k') && st_tx3g_trak(ps, pe, &st_tx[st_ntx], st_trk[st_n].label, sizeof st_trk[st_n].label))
+            {
+                st_trk[st_n].kind = SUBS_TX3G; st_trk[st_n].index = (uint8_t)st_ntx; st_trk[st_n].path[0] = 0;
+                st_ntx++; st_n++;
+            }
+    }
+    BLOG("subtitles: %d track(s)%s", st_n, st_n ? ":" : " (none next to the video, none inside it)");
+    {   int k;
+        for (k = 0; k < st_n; k++)
+            BLOG("  %d: %s  %s", k + 1, st_trk[k].label, st_trk[k].kind == SUBS_TX3G ? "(MP4 timed text)" : st_trk[k].path);
+    }
+}
+static void st_free_store(void)
+{
+    if (st_store_h > 0) { core_unpin(st_store_h); core_free(st_store_h); }
+    st_store_h = -1; st_loaded = -1;
+    memset(&st_store, 0, sizeof st_store);
+}
+/* the samples of a tx3g track: u16 length + UTF-8 (or UTF-16 with a byte-order mark) text, then optional boxes:
+   'styl' runs (italic kept). */
+static int st_load_tx3g(const struct st_tx3g *x)
+{
+    static uint8_t sb[2048];
+    static char txt[3200];
+    uint32_t k, chunk = 1, s_in_chunk = 0, off_in_chunk = 0, stsc_i = 0, spc, next_first, stts_i = 0, stts_left, delta;
+    uint64_t dts = 0;
+    int fd = open(st_video, O_RDONLY), added = 0;
+    if (fd < 0) return -1;
+    spc = m4_u32(x->stsc + 4); if (!spc) spc = 1;
+    next_first = x->stsc_n > 1 ? m4_u32(x->stsc + 12) : 0xffffffffu;
+    stts_left = m4_u32(x->stts); delta = m4_u32(x->stts + 4);
+    for (k = 0; k < x->stsz_n && chunk <= x->stco_n; k++)
+    {
+        uint32_t size = x->stsz_fixed ? x->stsz_fixed : m4_u32(x->stsz + 4 * k);
+        uint32_t coff = x->co64 ? m4_u32(x->stco + 8 * (chunk - 1) + 4) : m4_u32(x->stco + 4 * (chunk - 1));
+        uint32_t off = coff + off_in_chunk, start = (uint32_t)(dts * 1000ULL / x->timescale);
+        uint32_t end = (uint32_t)((dts + delta) * 1000ULL / x->timescale);
+        /* advance the cursors */
+        off_in_chunk += size;
+        if (++s_in_chunk >= spc)
+        {
+            chunk++; s_in_chunk = 0; off_in_chunk = 0;
+            if (chunk >= next_first && stsc_i + 1 < x->stsc_n)
+            {
+                stsc_i++; spc = m4_u32(x->stsc + 12 * stsc_i + 4); if (!spc) spc = 1;
+                next_first = stsc_i + 1 < x->stsc_n ? m4_u32(x->stsc + 12 * (stsc_i + 1)) : 0xffffffffu;
+            }
+        }
+        dts += delta;
+        if (stts_left && --stts_left == 0 && stts_i + 1 < x->stts_n)
+        {
+            stts_i++; stts_left = m4_u32(x->stts + 8 * stts_i); delta = m4_u32(x->stts + 8 * stts_i + 4);
+        }
+        if ((k & 31) == 31) bcm_host_service();          /* the picture keeps being fed meanwhile */
+        if (size < 3) continue;                           /* an empty sample = nothing shown (a gap) */
+        if (size > sizeof sb) size = sizeof sb;
+        if (lseek(fd, (off_t)off, SEEK_SET) != (off_t)off || read(fd, sb, size) != (ssize_t)size) continue;
+        {
+            uint32_t tl = (uint32_t)sb[0] << 8 | sb[1], i, o = 0, q;
+            uint32_t ist[16], ien[16];                    /* italic runs, in characters */
+            int nit = 0;
+            bool u16 = false;
+            if (tl > size - 2) tl = size - 2;
+            /* modifier boxes after the text */
+            for (q = 2 + tl; q + 8 <= size; )
+            {
+                uint32_t bs = (uint32_t)sb[q] << 24 | (uint32_t)sb[q + 1] << 16 | (uint32_t)sb[q + 2] << 8 | sb[q + 3];
+                if (bs < 8 || q + bs > size) break;
+                if (!memcmp(sb + q + 4, "styl", 4) && bs >= 10)
+                {
+                    uint32_t ne = (uint32_t)sb[q + 8] << 8 | sb[q + 9], r;
+                    for (r = 0; r < ne && 10 + 12 * (r + 1) <= bs && nit < 16; r++)
+                    {
+                        const uint8_t *en = sb + q + 10 + 12 * r;
+                        if (en[6] & 2) { ist[nit] = (uint32_t)en[0] << 8 | en[1]; ien[nit] = (uint32_t)en[2] << 8 | en[3]; nit++; }
+                    }
+                }
+                q += bs;
+            }
+            if (tl >= 2 && sb[2] == 0xFE && sb[3] == 0xFF) u16 = true;
+            /* text: '<' and '&' escaped (subs_add reads HTML-style tags), italic runs as style codes */
+            {
+                uint32_t ch = 0;                          /* character index */
+                bool it = false;
+                const uint8_t *p = sb + 2 + (u16 ? 2 : 0), *pe = sb + 2 + tl;
+                while (p < pe && o + 12 < sizeof txt)
+                {
+                    ucschar_t c;
+                    bool want = false;
+                    int r;
+                    for (r = 0; r < nit; r++) if (ch >= ist[r] && ch < ien[r]) want = true;
+                    if (want != it) { txt[o++] = want ? SUBS_C_ITALIC_ON : SUBS_C_ITALIC_OFF; it = want; }
+                    if (u16)
+                    {
+                        if (p + 1 >= pe) break;
+                        c = (ucschar_t)(p[0] << 8 | p[1]); p += 2;
+                        if (c >= 0xD800 && c < 0xDC00 && p + 1 < pe) { c = 0x10000 + ((c - 0xD800) << 10) + ((p[0] << 8 | p[1]) - 0xDC00); p += 2; }
+                    }
+                    else p = utf8decode(p, &c);
+                    if (c == '<') { memcpy(txt + o, "&lt;", 4); o += 4; }
+                    else if (c == '&') { memcpy(txt + o, "&amp;", 5); o += 5; }
+                    else o = (uint32_t)((char *)utf8encode(c, (unsigned char *)txt + o) - txt);
+                    ch++;
+                }
+                if (it) txt[o++] = SUBS_C_ITALIC_OFF;
+            }
+            i = o;
+            if (!subs_add(&st_store, start, end, txt, i, 0)) break;      /* buffer full: keep what fits */
+            added++;
+        }
+    }
+    close(fd);
+    subs_finish(&st_store);
+    return (int)st_store.n;
+}
+static int st_load(int k)
+{
+    const struct subs_track *t = &st_trk[k];
+    uint32_t want;
+    int n;
+    long t0 = current_tick;
+    st_free_store();
+    if (t->kind == SUBS_TX3G)
+    {
+        const struct st_tx3g *x = &st_tx[t->index];
+        want = x->bytes * 3 + x->stsz_n * 24 + 4096;
+    }
+    else
+    {
+        int fd = open(t->path, O_RDONLY);
+        long fs;
+        if (fd < 0) { BLOG("subtitles: cannot open %s", t->path); return -1; }
+        fs = ffilesize(fd); close(fd);
+        if (fs <= 0 || fs > 8L << 20) { BLOG("subtitles: %s: size %ld -- not loaded", t->path, fs); return -1; }
+        want = subs_buffer_size((uint32_t)fs);
+    }
+    st_store_h = core_alloc_ex(want, NULL);
+    if (st_store_h <= 0) { st_store_h = -1; BLOG("subtitles: no memory (%u KB)", (unsigned)(want / 1024)); return -1; }
+    core_pin(st_store_h);
+    subs_store_init(&st_store, core_get_data(st_store_h), want);
+    n = t->kind == SUBS_TX3G ? st_load_tx3g(&st_tx[t->index]) : subs_load_file(&st_store, t->path, t->kind);
+    BLOG("subtitles: '%s' -> %d cues (%u of %u KB used, %ld ms)", t->label, n, (unsigned)(st_store.used / 1024),
+         (unsigned)(want / 1024), (current_tick - t0) * 1000 / HZ);
+    if (n <= 0) { st_free_store(); return -1; }
+    st_loaded = k;
+    return n;
+}
+static void st_toast(const char *text)
+{   /* v74: any short notice in the subtitle window (it is set up for it if needed) */
+    if (st_ok < 0) return;
+    snprintf(st_msg, sizeof st_msg, "%s", text);
+    st_msg_until = current_tick + 2 * HZ; st_msgv++;
+}
+static void st_notice(const char *label)
+{
+    snprintf(st_msg, sizeof st_msg, "%s: %s", (const char *)str(LANG_SUBTITLES), label);
+    st_msg_until = current_tick + 2 * HZ; st_msgv++;
+}
+static void st_select(int k, bool notice)
+{
+    st_cur = k;
+    if (k >= 0 && st_loaded != k && st_load(k) < 0)
+    {
+        if (notice) { char b[56]; snprintf(b, sizeof b, "%s (?)", st_trk[k].label); st_notice(b); }
+        st_cur = -1;
+        return;
+    }
+    if (notice) st_notice(k >= 0 ? st_trk[k].label : (const char *)str(LANG_OFF));
+}
+static void st_seeked(void) { st_fast_until = current_tick + 3 * HZ; st_stalled = false; st_last_el = 0xffffffffu; st_sync_tick = current_tick - HZ; }
+
+/* ---- font: a sans-serif bold font near the wanted height from FONT_DIR (the overlay's build puts 21/27/35 px
+   Helvetica Bold there); the UI font when there is none */
+static int st_font_score(const char *nm, int want)
+{
+    int h = atoi(nm), d = h > want ? h - want : want - h, pref = 6;
+    size_t l = strlen(nm);
+    if (h <= 0 || l < 5 || strcasecmp(nm + l - 4, ".fnt")) return -1;
+    if (strstr(nm, "Helvetica-Bold")) pref = 0;
+    else if (strstr(nm, "Helvetica")) pref = 1;
+    else if (strstr(nm, "Nimbus")) pref = 2;
+    else if (strstr(nm, "Terminus-Bold")) pref = 3;
+    else if (strstr(nm, "Unifont") || strstr(nm, "WenQ") || strstr(nm, "Sazanami")) pref = 5;   /* big CJK fonts: last */
+    return d * 8 + pref;
+}
+static void st_font_open(int want)
+{
+    char best[MAX_PATH] = "";
+    int bs = 0x7fffffff;
+    DIR *d = opendir(FONT_DIR);
+    struct dirent *de;
+    st_font = -1;
+    if (d)
+    {
+        while ((de = readdir(d)) != NULL)
+        {
+            int sc = st_font_score((const char *)de->d_name, want);
+            if (sc >= 0 && sc < bs) { bs = sc; snprintf(best, sizeof best, FONT_DIR "/%s", de->d_name); }
+        }
+        closedir(d);
+    }
+    if (best[0])
+    {
+        int fd = open(best, O_RDONLY);
+        long fs = fd >= 0 ? ffilesize(fd) : 0;
+        if (fd >= 0) close(fd);
+        /* whole font in RAM when it is small (glyph look-ups without disk reads, missing glyphs can be told) */
+        st_font = fs > 0 && fs < 300 * 1024 ? font_load_ex(best, 0, 30000) : font_load(best);
+        if (st_font < 0) st_font = -1;
+    }
+    st_font_h = font_get(st_font >= 0 ? st_font : FONT_UI)->height;
+    BLOG("subtitles: font %s (%d px, wanted %d)", st_font >= 0 ? best : "= the UI font", st_font_h, want);
+}
+static int st_fw(void *ctx, uint32_t c) { return font_get_width(font_get((int)(intptr_t)ctx), (ucschar_t)c); }
+static const uint8_t *st_fb(void *ctx, uint32_t c) { return font_get_bits(font_get((int)(intptr_t)ctx), (ucschar_t)c); }
+static bool st_has_glyph(struct font *pf, ucschar_t c)
+{
+    if (c < pf->firstchar || c >= pf->firstchar + (unsigned)pf->size) return false;
+    if (pf->fd >= 0 || (int)c == pf->defaultchar) return true;      /* glyph cache: cannot tell cheaply, assume present */
+    return font_get_bits(pf, c) != font_get_bits(pf, (ucschar_t)pf->defaultchar);
+}
+/* the subtitle font, or the UI font when the text has characters only the UI font has (Cyrillic, CJK ...) */
+static int st_pick_font(const struct subs_cue **c, int n, const char *msg)
+{
+    struct font *pf, *ui;
+    int k;
+    if (st_font < 0) return FONT_UI;
+    pf = font_get(st_font); ui = font_get(FONT_UI);
+    if (pf == ui) return st_font;
+    for (k = 0; k < (msg ? 1 : n); k++)
+    {
+        const unsigned char *p = (const unsigned char *)(msg ? msg : subs_text(c[k])), *e = p + (msg ? strlen(msg) : c[k]->len);
+        while (p < e)
+        {
+            ucschar_t ch;
+            if (*p == SUBS_C_COLOR) { p += 4; continue; }
+            if (*p < 0x20) { p++; continue; }
+            p = utf8decode(p, &ch);
+            if (ch > 0x7e && ch != 0xa0 && !st_has_glyph(pf, ch) && st_has_glyph(ui, ch)) return FONT_UI;
+        }
+    }
+    return st_font;
+}
+
+/* ---- the window */
+static void st_end(void)
+{   /* the end of a video: Rockbox memory back (the VideoCore's images go with its reboot) */
+    st_free_store();
+    if (st_cv_h > 0) { core_unpin(st_cv_h); core_free(st_cv_h); }
+    st_cv_h = -1; st_cv = NULL; st_wk = NULL; st_ext = NULL;
+    if (st_font >= 0) font_unload(st_font);
+    st_font = -1;
+    st_ok = 0; st_win = 0; st_front = -1; st_nimg = 0; st_nshown = 0; st_shown_any = false; st_shown_msgv = -1;
+    st_msg_until = 0; st_sel_down = false;
+}
+static void st_write(int im);
+static int st_setup(void)
+{
+    static const int lcd_px[3] = { 15, 21, 27 }, tv_px[3] = { 27, 35, 35 };
+    int sz = global_settings.bcm_sub_size, k, y;
+    size_t need;
+    if (st_ok) return st_ok;
+    st_ok = -1;
+    if (sz < 0 || sz > 2) sz = 1;
+    st_tvmode = bcm_tv;
+    st_w = st_tvmode ? 704 : 320;
+    st_h = st_tvmode ? 176 : 144;
+    st_font_open(st_tvmode ? tv_px[sz] : lcd_px[sz]);
+    if (st_font_h * 2 + 12 > st_h) st_h = (st_font_h * 2 + 12 + 15) & ~15;
+    need = (size_t)st_w * st_h * 5 + (size_t)st_h * 2 * 2 * sizeof(int16_t) + 64;
+    st_cv_h = core_alloc_ex(need, NULL);
+    if (st_cv_h <= 0) { st_cv_h = -1; BLOG("subtitles: no memory for the canvas (%u KB)", (unsigned)(need / 1024)); return -1; }
+    core_pin(st_cv_h);
+    st_cv = core_get_data(st_cv_h);
+    st_wk = (uint8_t *)(st_cv + st_w * st_h);
+    st_ext = (int16_t *)(((uintptr_t)(st_wk + st_w * st_h) + 3) & ~(uintptr_t)3);
+    for (k = 0; k < 2; k++)                               /* a new image's contents are unknown: all of it gets written once */
+        for (y = 0; y < st_h; y++) { st_ext[(k * st_h + y) * 2] = 0; st_ext[(k * st_h + y) * 2 + 1] = (int16_t)(st_w - 1); }
+    st_nimg = 0;
+    for (k = 0; k < 2; k++)
+        if (osd_alloc(15, st_w, st_h, &st_img[k], &st_addr[k]) == 0) st_nimg++;
+        else break;
+    if (!st_nimg) { BLOG("subtitles: the VideoCore refused a %dx%d ARGB image -- no subtitles", st_w, st_h); return -1; }
+    st_style.scale = 1;
+    st_style.box = global_settings.bcm_sub_style == 1;
+    st_style.outline = st_font_h >= 30 ? 3 : st_font_h >= 18 ? 2 : 1;
+    st_style.color = 0xFFFFFF;
+    st_style.margin = st_tvmode ? 28 : 6;
+    st_win = 0; st_front = -1;
+    memset(st_cv, 0, (size_t)st_w * st_h * 4);
+    for (k = 0; k < st_nimg; k++) st_write(k);            /* clear: a new image's contents are unknown (before the picture runs) */
+    st_ok = 1;
+    BLOG("subtitles: %s window %dx%d, %d image(s), layer %d, %s", st_tvmode ? "TV" : "LCD", st_w, st_h, st_nimg,
+         cfg_subs_layer ? cfg_subs_layer : cfg_osd_layer - 1, st_style.box ? "box" : "outline");
+    return 1;
+}
+static void st_rm_win(uint32_t w)
+{
+    uint32_t o[4], w4[4] = { w == 0xffffffffu ? 0 : w, 0, 0, 0 };
+    bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+}
+static void st_hide(void)
+{
+    uint32_t o[4];
+    if (!st_win) return;
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    st_rm_win(st_win);
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    st_win = 0;
+}
+/* the image's top-left corner on the display: text block bottom at 'bottom - 2' inside the image */
+static void st_xy(bool top, bool raised, int *x, int *y)
+{
+    if (st_tvmode)
+    {
+        int th = global_settings.bcm_tv_signal ? 576 : 480;
+        *x = (720 - st_w) / 2;
+        if (top) *y = th / 16 - 2;
+        else
+        {
+            int b = th - th / 16;                         /* clear of the overscan */
+            if (raised) { int tx, ty; osd_tv_xy(&osd_s[2], &tx, &ty); if (ty - 4 < b) b = ty - 4; }
+            *y = b - (st_h - 2);
+        }
+    }
+    else
+    {
+        *x = 0;
+        *y = top ? 0 : (raised ? osd_s[2].y - 2 : LCD_HEIGHT) - st_h;
+    }
+    if (*y < 0) *y = 0;
+}
+static void st_place(int im, bool top, bool raised)
+{
+    uint32_t o[4], pl[8], old = st_win;
+    int x, y;
+    st_xy(top, raised, &x, &y);
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    memset(pl, 0, sizeof pl);
+    pl[0] = st_tvmode ? 2 : 0;
+    pl[1] = (uint32_t)(cfg_subs_layer ? cfg_subs_layer : cfg_osd_layer - 1);
+    pl[3] = st_img[im];
+    ((uint16_t *)pl)[8] = (uint16_t)x; ((uint16_t *)pl)[9] = (uint16_t)y;
+    ((uint16_t *)pl)[12] = (uint16_t)st_w; ((uint16_t *)pl)[13] = (uint16_t)st_h;
+    st_win = bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0 ? (o[0] ? o[0] : 0xffffffffu) : 0;
+    if (old) st_rm_win(old);
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    st_front = im; st_win_top = top; st_win_raised = raised;
+}
+/* write the canvas into image im: per row, the union of the old and the new non-transparent columns */
+static void st_write(int im)
+{
+    int y, x;
+    for (y = 0; y < st_h; y++)
+    {
+        const uint32_t *row = st_cv + y * st_w;
+        int16_t *ex = st_ext + (im * st_h + y) * 2;
+        int n0 = st_w, n1 = -1, x0, x1;
+        for (x = 0; x < st_w; x++) if (row[x] >> 24) { n0 = x; break; }
+        if (n0 < st_w) for (x = st_w - 1; x >= n0; x--) if (row[x] >> 24) { n1 = x; break; }
+        x0 = n0 < ex[0] ? n0 : ex[0];
+        x1 = n1 > ex[1] ? n1 : ex[1];
+        if (x1 >= x0)
+        {
+            bcm_io_lock(); bcm_io_write(st_addr[im] + ((unsigned)y * st_w + x0) * 4, row + x0, (unsigned)(x1 - x0 + 1) * 4); bcm_io_unlock();
+        }
+        ex[0] = (int16_t)(n1 >= 0 ? n0 : st_w); ex[1] = (int16_t)(n1 >= 0 ? n1 : -1);
+        if ((y & 15) == 15) bcm_host_service();
+    }
+}
+static uint32_t st_now(void)
+{
+    int32_t pos = (int32_t)pl_el_ms;
+    if (!pl_paused && !st_stalled && vr_el_tick) pos += (int32_t)(current_tick - vr_el_tick) * (1000 / HZ);
+    pos += cfg_subs_delay;
+    return pos < 0 ? 0 : (uint32_t)pos;
+}
+/* called from the player loop (bcm_osd_tick) */
+static void st_tick(void)
+{
+    const struct subs_cue *c[6];
+    int n = 0;
+    bool msg, top = false, raised;
+    if (st_ok < 0) return;
+    msg = st_msg_until && TIME_BEFORE(current_tick, st_msg_until);
+    if (!msg) st_msg_until = 0;
+    if (!msg && (st_cur < 0 || st_loaded != st_cur || sc_active))
+    {   /* off, or scrubbing (the text would be stale) */
+        if (st_shown_any) { st_hide(); st_shown_any = false; st_nshown = 0; st_shown_msgv = -1; }
+        return;
+    }
+    if (!msg)
+    {
+        long every = TIME_BEFORE(current_tick, st_fast_until) ? HZ * 4 / 10 : (cfg_subs_sync * HZ) / 1000;
+        if (!pl_paused && current_tick - st_sync_tick >= HZ * 4 / 10 && (!vr_el_tick || current_tick - vr_el_tick >= every))
+        {   /* read the position; while it does not move (start-up, buffering after a seek) the clock is not run on */
+            st_sync_tick = current_tick;
+            pl_status();
+            st_stalled = vr_el_tick && pl_el_ms == st_last_el;
+            st_last_el = pl_el_ms;
+        }
+        n = subs_active(&st_store, st_now(), c, 6);
+        if (n)
+        {   int k; top = true;
+            for (k = 0; k < n; k++) if (!(c[k]->flags & SUBS_TOP)) top = false;
+        }
+    }
+    if (!msg && !n)
+    {
+        if (st_shown_any) { st_hide(); st_shown_any = false; st_nshown = 0; st_shown_msgv = -1; }
+        return;
+    }
+    if (st_setup() < 0) return;
+    raised = !top && (st_tvmode ? osd_s[2].tvwin != 0 : (osd_visible && osd_s[2].win[0] != 0));
+    if (!st_shown_any || (msg ? st_shown_msgv != st_msgv : (st_shown_msgv >= 0 || n != st_nshown || memcmp(c, st_shown, n * sizeof c[0]))))
+    {   /* new content: draw, write the back image, swap */
+        struct subs_font f;
+        int y0, y1, im = st_nimg == 2 ? (st_front == 0 ? 1 : 0) : 0, fid = st_pick_font(c, n, msg ? st_msg : NULL);
+        struct font *pf = font_get(fid);
+        unsigned long t0 = USEC_TIMER;
+        f.height = pf->height; f.ascent = pf->ascent; f.depth = pf->depth;
+        f.width = st_fw; f.bits = st_fb; f.ctx = (void *)(intptr_t)fid;
+        subs_render(st_cv, st_wk, st_w, st_h, &f, &st_style, c, n, msg ? st_msg : NULL, 2, st_h - 2, &y0, &y1);
+        st_write(im);
+        if (st_nimg == 2 || !st_win || st_win_top != top || st_win_raised != raised) st_place(im, top, raised);
+        st_shown_any = true; st_nshown = msg ? 0 : n; st_shown_msgv = msg ? st_msgv : -1;
+        if (!msg) memcpy(st_shown, c, (size_t)n * sizeof c[0]);
+        if (st_msgv < 3 || msg) BLOG("  subtitles: %s at %u ms, %d cue(s), rows %d-%d, %lu us", msg ? st_msg : "cue",
+                                     (unsigned)st_now(), n, y0, y1, (unsigned long)(USEC_TIMER - t0));
+    }
+    else if (st_win_top != top || st_win_raised != raised || !st_win)
+        st_place(st_front < 0 ? 0 : st_front, top, raised);   /* the controls came / went: move up / down */
+}
+/* the start of a video: tracks, the first choice (Settings > Subtitles) */
+static void st_begin(const char *video)
+{
+    bool on = cfg_subs >= 0 ? cfg_subs != 0 : global_settings.bcm_subs;
+    st_end();
+    st_cur = -1;
+    st_find_tracks(video);
+    if (on && st_n) st_select(0, false);
+    if (st_cur >= 0) st_setup();                          /* before the picture starts: the images' first full write */
+}
+/* hold SELECT: next track / off */
+static void st_cycle(void)
+{
+    int k = st_cur + 1;
+    if (k >= st_n) k = -1;
+    st_select(k, true);
+    if (st_cur < 0 && k >= 0 && k + 1 < st_n) { /* unreadable: the notice says so; the next hold tries the next one */ st_cur = k; st_loaded = -1; }
+}
+
 /* ---- key frames */
 static uint32_t pl_key_ms(uint32_t k) { return (uint32_t)(m4_dts_of(k) * 1000ULL / m4.timescale); }
 static uint32_t pl_key_after(uint32_t ms)
@@ -5382,7 +5997,7 @@ static void scrub_end(void)
     }
     else if (sc_method == SM_SEEKSTEP && sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
     BLOG("  scrub: released at %u ms after %d ticks (%s)", (unsigned)sc_pos, sc_ticks, sm_name[sc_method]);
-    pl_el_ms = sc_pos;
+    pl_el_ms = sc_pos; vr_el_tick = current_tick; st_seeked();   /* v73 */
     av_prep(sc_pos, false);                            /* v52: sound moved (paused) to the new place, released with the picture */
     mon_start("scrub released");
     osd_show_for(pl_paused ? 0 : 3000);
@@ -5396,13 +6011,14 @@ static void pl_tap(int dir)
     av_hold();
     snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
     pl_cmd(c, true);
-    pl_el_ms = k; pl_target_ms = k;
+    pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; st_seeked();   /* v73 */
     av_prep(k, false);
     mon_start(dir > 0 ? "tap >>|" : "tap |<<");
     osd_show_for(pl_paused ? 0 : 3000);
 }
 static void bcm_osd_tick(void)
 {
+    st_tick();                                         /* v73: subtitles */
     if (sc_btn && !sc_active && current_tick - sc_press >= (HZ * 4) / 10 && (button_status() & sc_btn))
         scrub_begin(sc_btn & (BUTTON_RIGHT | BUTTON_RC_RIGHT) ? 1 : -1);
     if (sc_active && !sc_btn && !sc_remote) scrub_end();
@@ -5462,6 +6078,9 @@ static volatile short vr_qarg[16];
 static volatile unsigned vr_w, vr_r;
 static volatile long vr_status_asked;
 int bcm_video_next_request;              /* read by apps/filetree.c: +1 / -1 = play the next / previous video */
+/* v74: TV series (apps/filetree.c): this video is an episode with autoplay on; "stop after this episode" (hold PLAY);
+   the last video played to its end (not stopped) */
+bool bcm_tvs_episode, bcm_tvs_stop_after, bcm_video_finished;
 bool bcm_video_active(void) { return bcm_video_running; }
 int bcm_video_remote(int cmd, int arg)
 {
@@ -5502,7 +6121,7 @@ static void pl_restart(void)
     av_hold();
     snprintf(c, sizeof c, "mp_seek %u", 0u);
     pl_cmd(c, true);
-    pl_el_ms = 0; pl_target_ms = 0; vr_el_tick = current_tick;
+    pl_el_ms = 0; pl_target_ms = 0; vr_el_tick = current_tick; st_seeked();   /* v73 */
     av_prep(0, false);
     mon_start("dock: restart");
     osd_show_for(pl_paused ? 0 : 3000);
@@ -5621,6 +6240,34 @@ static int bcm_player_input(char *resp, size_t rn)
         av_vol_dirty = true;
         return 0;
     }
+    if (base == BUTTON_SELECT && st_n > 0)
+    {   /* v73: with subtitles available: a short press = the controls (on release), held 0.6 s = next subtitle track / off */
+        if (!(b & (BUTTON_REL | BUTTON_REPEAT))) { st_sel_down = true; st_sel_done = false; st_sel_t0 = current_tick; return 0; }
+        if (!st_sel_down) return 0;
+        if (b & BUTTON_REL)
+        {
+            st_sel_down = false;
+            if (!st_sel_done) { if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000); }
+        }
+        else if (!st_sel_done && current_tick - st_sel_t0 >= HZ * 6 / 10) { st_sel_done = true; st_cycle(); }
+        return 0;
+    }
+    if (base == BUTTON_PLAY && bcm_tvs_episode)
+    {   /* v74: a TV episode with autoplay: a short press = pause (on release), held 0.8 s = stop after this episode on/off */
+        static bool down, done;
+        static long t0;
+        if (!(b & (BUTTON_REL | BUTTON_REPEAT))) { down = true; done = false; t0 = current_tick; return 0; }
+        if (!down) return 0;
+        if (b & BUTTON_REL) { down = false; if (!done) pl_set_paused(!pl_paused, resp, rn); }
+        else if (!done && current_tick - t0 >= HZ * 8 / 10)
+        {
+            done = true;
+            bcm_tvs_stop_after = !bcm_tvs_stop_after;
+            st_toast(str(bcm_tvs_stop_after ? LANG_TVS_STOP_AFTER : LANG_TVS_PLAY_NEXT));
+            BLOG("  TV show: %s", bcm_tvs_stop_after ? "stop after this episode" : "the next episode follows");
+        }
+        return 0;
+    }
     if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
     if (b == BUTTON_MENU) return 1;
     if (b == BUTTON_PLAY)
@@ -5725,6 +6372,7 @@ static void bcm_video_run(int secs)
     mon_start("mp_play (start-up pre-buffer)");
     if (bcm_tv) osd_show_for(3000);                    /* v55: TV: controls + TV symbol on the LCD the whole time; v56: 3 s on the TV */
     vr_r = vr_w; sc_remote = false; vr_el_tick = 0;      /* v63: dock commands from before this video are dropped */
+    st_seeked(); st_fast_until = current_tick + 10 * HZ;  /* v73: subtitles: frequent position reads while the picture starts */
     bcm_video_running = true;
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
@@ -5733,7 +6381,7 @@ static void bcm_video_run(int secs)
             && (!vr_el_tick || current_tick - vr_el_tick > 2 * HZ))
             pl_status();                               /* v63: a dock shows the position: keep it fresh */
         if (bcm_check_dead()) break;
-        if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) break;
+        if (v_eos_tick && current_tick - v_eos_tick > 4 * HZ) { bcm_video_finished = true; break; }   /* v74: it played to the end */
         if (button_hold() != hold_was)
         {   /* v50: show the lock (or its removal) for 3 s */
             hold_was = !hold_was;
@@ -6308,6 +6956,7 @@ static void bcm_playback_probe(void)
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
+            st_begin(video);                            /* v73: subtitles */
             {   /* v45: the overlay shows the file name without folder and extension */
                 const char *bn = strrchr(video, '/'); char *dot;
                 snprintf(pl_title, sizeof pl_title, "%s", bn ? bn + 1 : video);
@@ -6399,6 +7048,7 @@ again:
             BLOG("restart: mp_selectplay again with the video stream only");
             goto again;
         }
+        st_end();                                      /* v73 */
         m4_close();
     }
     else
@@ -6478,15 +7128,20 @@ static bool dbg_bcm_host(void) { return bcm_run(NULL); }
 /* v47: play a video from the file browser and come back to it (the display goes back to Rockbox's own firmware) */
 bool bcm_video_play(const char *path)
 {   /* v55: Settings > General Settings > Video Out: On / Ask / Off (Ask = the stock "TV On / TV Off" choice) */
-    int vo = global_settings.bcm_video_out;
+    int vo = global_settings.bcm_video_out, dock;
     bcm_video_next_request = 0;                        /* v63 */
-    bcm_tv = vo == 0;
+    bcm_video_finished = false;
+    iap_dock_ui();                                     /* v74: a dock that came while nothing looked: its settings first */
+    dock = iap_dock_tv_choice();
+    bcm_tv = vo == 0 || (vo == 3 && dock == 1);        /* v74: Auto = TV on a dock that wants it */
     if (vo == 1)
     {
         MENUITEM_STRINGLIST(tv_menu, ID2P(LANG_VIDEO_OUT), NULL, ID2P(LANG_TV_ON), ID2P(LANG_TV_OFF));
-        int sel = do_menu(&tv_menu, NULL, NULL, false);
+        int start = dock == 0 ? 1 : 0;                 /* v74: this dock's last answer */
+        int sel = do_menu(&tv_menu, &start, NULL, false);
         if (sel != 0 && sel != 1) return false;        /* backed out: no video */
         bcm_tv = sel == 0;
+        iap_dock_remember_tv(bcm_tv);
     }
     return bcm_run(path);
 }
@@ -6494,6 +7149,7 @@ bool bcm_video_play(const char *path)
 bool bcm_video_play_again(const char *path)
 {
     bcm_video_next_request = 0;
+    bcm_video_finished = false;
     return bcm_run(path);
 }
 bool bcm_video_is_video(const char *path)
@@ -6522,7 +7178,10 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v70, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v75, built %s %s", __DATE__, __TIME__);
+    if (bcm_player_mode)
+        BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
+             iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
     bcm_sync_every = 2 * HZ;                             /* v46: flush the log at most every 2 s (was: every line) */
     BLOG("battery: %d mV, %d%%%s%s", battery_voltage(), battery_level(), bcm_player_mode ? "  -- PLAYER MODE: " : "", bcm_player_mode ? play_path : "");
 #ifdef HAVE_BATTERY_SMOOTH_API

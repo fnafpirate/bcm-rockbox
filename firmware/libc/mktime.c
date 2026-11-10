@@ -24,6 +24,7 @@
 
 /* mktime() code taken from lynx-2.8.5 source, written
  by Philippe De Muyter <phdm@macqel.be> */
+/* bcm overlay v74: time_t is unsigned 32-bit: 1970 .. 2106-02-07 (see time.h); the sum below is done in it */
 time_t mktime(struct tm *t)
 {
     short month, year;

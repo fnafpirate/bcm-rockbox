@@ -763,6 +763,13 @@ struct user_settings
     int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
     bool bcm_tv_wide;    /* the TV is 16:9 (stock "Widescreen") */
     int battery_reading; /* 0 smooth (stock-like), 1 exact (Rockbox) */
+    bool bcm_subs;       /* bcm overlay v73: video subtitles shown when the video has some */
+    int bcm_sub_size;    /* 0 small, 1 medium, 2 large */
+    int bcm_sub_style;   /* 0 outline, 1 box */
+    int bcm_video_buffer;  /* v74: 0 low-power, 1 balanced, 2 performance */
+    bool bcm_tv_autoplay;  /* v74: TV show episodes: the next one follows (countdown) */
+    bool bcm_dock_notify;  /* v74: notices for docks / power sources */
+    bool bcm_clock_sync;   /* v74: set the clock from the computer (clocksync.txt over USB) */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

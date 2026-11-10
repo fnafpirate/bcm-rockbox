@@ -25,15 +25,27 @@ Command line (also used for testing on a disk image):
   ipod_exfat_setup.py                       -> window
   ipod_exfat_setup.py --list                -> show detected iPods
   ipod_exfat_setup.py --disk N|--image F --rockbox-zip Z --bootloader B
-                      [--keep-dir D] [--backup F] [--label L] [--cluster-kb 128] --yes
+                      [--keep-dir D] [--backup F] [--label L] [--cluster-kb 128]
+                      [--layout auto|partition|whole|ipod] --yes
+  --layout: auto (default) = a normal exFAT partition up to 2.2 TB, the whole
+            disk as exFAT above that (any size); "ipod" = old iPod-only units
   ipod_exfat_setup.py --new [--model 5.5g|5g] (--disk N|--image F) --rockbox-zip Z --bootloader B
                       [--keep-dir SAVED_ROCKBOX_FOLDER] [--label L] [--cluster-kb 128] --yes
   ipod_exfat_setup.py --restore BACKUP (--disk N|--image F) --yes
   ipod_exfat_setup.py --disks               -> all disks a new layout could go on
+  ipod_exfat_setup.py --migrate (--from N|--from-image F) (--disk M|--image G) [--rockbox-zip Z]
+                      [--model 5.5g|5g --bootloader B] [--label L] [--layout ...] --yes
+                                            -> move everything from an old iPod card to a new (bigger) one:
+                                               firmware partition, Rockbox, music, videos, file dates; the new
+                                               exFAT fills the new card; every file is read back and compared
+  ipod_exfat_setup.py --clock-sync          -> set the clock of a connected Rockbox iPod (no admin needed)
+
+Clock: with "Keep the iPod clock right automatically" the small ipod_clock_sync.pyw helper starts with Windows and
+sets the clock whenever an iPod with Rockbox (bcm overlay v74 or later) is connected in USB mode.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.2'
+VERSION = '1.5'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 CHUNK = 4 << 20
 
@@ -568,13 +580,23 @@ class Ipod:
                                                          min(align_up(im['len'], 4096), 1 << 20))
         # the current data partition
         self.data_fs = None
-        for t, s, n in self.parts[1:]:
-            if t and s:
-                off = s * self.unit
-                if off + 4096 <= disk.size:
-                    b = self._read(off, 4096)
-                    self.data_fs = ('exFAT' if b[3:11] == b'EXFAT   ' else
-                                    'FAT32' if b[82:87] == b'FAT32' else 'type 0x%02x' % t)
+        self.data_unit = None
+        self.data_off = None
+        self.whole = self.mbr_sector[3:11] == b'EXFAT   '
+        if self.whole:
+            self.data_fs, self.data_unit, self.data_off = 'exFAT', 512, 0
+        for t, s, n in ([] if self.whole else self.parts[1:]):
+            if t and s and t != PROTECT_TYPE:
+                for u in (512, 1024, 2048):
+                    off = s * u
+                    if off + 4096 <= disk.size:
+                        b = self._read(off, 4096)
+                        fs = ('exFAT' if b[3:11] == b'EXFAT   ' else 'FAT32' if b[82:87] == b'FAT32' else None)
+                        if fs:
+                            self.data_fs, self.data_unit, self.data_off = fs, u, s * u
+                            break
+                if not self.data_fs:
+                    self.data_fs = 'type 0x%02x (unreadable)' % t
                 break
 
     def _read(self, off, n):
@@ -593,9 +615,11 @@ class Ipod:
 
     def describe(self):
         im = self.images[self.osos]
-        return ('%s, %s, partition table in %d-byte units, firmware partition %s, OS image %s%s, data: %s'
-                % (self.disk.name, human(self.disk.size), self.unit, human(self.fw_size), human(im['len']),
-                   ' (Rockbox bootloader in it)' if self.boot_has_rockbox else '', self.data_fs or 'none'))
+        return ('%s, %s, firmware partition %s (%d-byte units), OS image %s%s, data: %s%s'
+                % (self.disk.name, human(self.disk.size), human(self.fw_size), self.unit, human(im['len']),
+                   ' (Rockbox bootloader in it)' if self.boot_has_rockbox else '', self.data_fs or 'none',
+                   (' (whole disk, PC-readable)' if self.whole else ' (PC-readable)' if self.data_unit == 512
+                    else ' (iPod-only units)') if self.data_unit else ''))
 
 # --------------------------------------------------------------------------
 # a new firmware partition, built from nothing
@@ -615,6 +639,8 @@ class Ipod:
 # No "hibe" (the ROM would try to resume a hibernation image) and no "aupd".
 
 MODELS = {'5.5g': 2048, '5g': 512}
+PROTECT_TYPE = 0xDA          # "non-FS data": shows the firmware partition to PCs, nothing mounts it
+PC_LIMIT = 0xffffffff * 512  # a 512-unit partition table ends at 2.2 TB
 FW_START_UNITS = 63                  # where iTunes puts it
 FW_SIZE = 32 << 20
 OSOS_DEV, OSOS_ROOM = 0x4800, 1 << 20
@@ -622,9 +648,27 @@ OSOS_DEV, OSOS_ROOM = 0x4800, 1 << 20
 def disk_check_new(disk, unit):
     if disk.size < (1 << 30):
         raise SetupError('this disk is too small (%s)' % human(disk.size))
-    if disk.size // unit > 0xffffffff + FW_SIZE // unit:
-        raise SetupError('this disk is too big for the iPod partition table (max %s with %d-byte units)'
-                         % (human(0xffffffff * unit), unit))
+
+def write_fw_partition(disk, unit, fw_size, chunks, log=print):
+    """partition table with only the firmware partition (fw_size bytes from the chunks iterator) at the usual
+    place; setup() then adds the exFAT partition"""
+    fw_start = FW_START_UNITS * unit
+    write_at(disk, 0, bytes(fw_start))            # old partition tables (MBR / GPT) at the front ...
+    tail = min(1 << 20, disk.size - fw_start - fw_size)
+    write_at(disk, disk.size // disk.sector * disk.sector - tail, bytes(tail))   # ... and the backup GPT at the end
+    pos = 0
+    for b in chunks:
+        write_at(disk, fw_start + pos, b)
+        pos += len(b)
+    if pos != fw_size:
+        raise SetupError('firmware partition: %d of %d bytes written' % (pos, fw_size))
+    mbr = bytearray(max(512, disk.sector))
+    mbr[440:444] = os.urandom(4)
+    mbr[0x1be:0x1ce] = struct.pack('<B3sB3sII', 0, b'\x00\x02\x00', 0, b'\xfe\xff\xff',
+                                   FW_START_UNITS, fw_size // unit)
+    mbr[510:512] = b'\x55\xaa'
+    write_at(disk, 0, bytes(mbr[:512]))
+    disk.flush()
 
 def create_blank(disk, unit, boot, log=print):
     """partition table + firmware partition with the bootloader; setup() then
@@ -646,22 +690,10 @@ def create_blank(disk, unit, boot, log=print):
         fw[o:o + len(data)] = data
         d += 40
     log('writing a new partition table and firmware partition (%d-byte units)' % unit)
-    # clear old partition tables (MBR / GPT) at the front and the backup GPT at the end
-    write_at(disk, 0, bytes(fw_start))
-    tail = min(1 << 20, disk.size - fw_start - FW_SIZE)
-    write_at(disk, disk.size // disk.sector * disk.sector - tail, bytes(tail))
-    for pos in range(0, FW_SIZE, CHUNK):
-        write_at(disk, fw_start + pos, fw[pos:pos + CHUNK])
-    mbr = bytearray(max(512, disk.sector))
-    mbr[440:444] = os.urandom(4)
-    mbr[0x1be:0x1ce] = struct.pack('<B3sB3sII', 0, b'\x00\x02\x00', 0, b'\xfe\xff\xff',
-                                   FW_START_UNITS, FW_SIZE // unit)
-    mbr[510:512] = b'\x55\xaa'
-    write_at(disk, 0, bytes(mbr[:512]))
-    disk.flush()
+    write_fw_partition(disk, unit, FW_SIZE, (bytes(fw[pos:pos + CHUNK]) for pos in range(0, FW_SIZE, CHUNK)), log)
 
 def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', cluster=128 * 1024,
-              log=print, progress=lambda f: None):
+              log=print, progress=lambda f: None, layout='auto'):
     boot = load_bootloader(bootloader)
     if len(boot) > OSOS_ROOM:
         raise SetupError('bootloader too big')
@@ -673,7 +705,7 @@ def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', 
         disk.lock_volumes()
     create_blank(disk, unit, boot, log)
     return setup(disk, rockbox_zip, bootloader, None, keep=bool(keep_dir), keep_dir=keep_dir, label=label,
-                 cluster=cluster, log=log, progress=progress)
+                 cluster=cluster, log=log, progress=progress, layout=layout)
 
 def list_disks():
     """[(number, WinDisk-info dict)] of every disk; 'ok' = may be offered for a new layout"""
@@ -742,6 +774,7 @@ class Node:
         self.name = name; self.is_dir = is_dir; self.size = size; self.opener = opener; self.src = src
         self.children = {}          # upper-cased name -> Node
         self.first = 0; self.nclus = 0; self.crc = 0
+        self.stamp = None           # (DOS date/time, exFAT UTC-offset byte) to keep; None = now
 
 class Tree:
     def __init__(self, up):
@@ -751,7 +784,7 @@ class Tree:
     def key(self, name):
         return ''.join(chr(self.up[u]) if u < 65536 else chr(u) for u in [ord(c) for c in name])
 
-    def add(self, path, size=0, opener=None, is_dir=False, src='', replace=True):
+    def add(self, path, size=0, opener=None, is_dir=False, src='', replace=True, stamp=None):
         parts = [p for p in path.replace('\\', '/').split('/') if p]
         node = self.root
         for i, p in enumerate(parts):
@@ -764,7 +797,7 @@ class Tree:
                     if c.is_dir:
                         raise SetupError('%s is both a file and a folder' % path)
                     if replace:
-                        c.size, c.opener, c.src = size, opener, src
+                        c.size, c.opener, c.src, c.stamp = size, opener, src, stamp
                     return
                 if not c.is_dir:
                     raise SetupError('%s is both a file and a folder' % path)
@@ -772,8 +805,22 @@ class Tree:
             else:
                 c = Node(p, is_dir or not last, size if last and not is_dir else 0,
                          opener if last and not is_dir else None, src)
+                if last:
+                    c.stamp = stamp
                 node.children[k] = c
                 node = c
+        if is_dir and parts and stamp is not None:
+            node.stamp = stamp
+
+    def remove(self, path):
+        parts = [p for p in path.replace('\\', '/').split('/') if p]
+        node = self.root
+        for p in parts[:-1]:
+            node = node.children.get(self.key(p))
+            if not node:
+                return
+        if parts:
+            node.children.pop(self.key(parts[-1]), None)
 
     def walk(self, node=None, path=''):
         node = node or self.root
@@ -845,14 +892,18 @@ def dostime(dt):
             (dt.hour << 11) | (dt.minute << 5) | (dt.second // 2))
 
 class ExfatPlan:
-    def __init__(self, part_off, part_len, ss, cs, label, up_raw, up):
+    def __init__(self, part_off, part_len, ss, cs, label, up_raw, up, fatoff_bytes=1 << 20, mbr_tail=None):
+        """mbr_tail: bytes 440..509 of sector 0 (disk signature + partition
+        table) to carry inside the boot sector's boot-code area -- the
+        whole-disk layout, where sector 0 is exFAT boot sector and MBR at once"""
         self.part_off, self.ss, self.cs = part_off, ss, cs
+        self.mbr_tail = mbr_tail
         self.spc = cs // ss
         self.vollen = part_len // ss
         self.label = label[:11]
         self.up_raw, self.up = up_raw, up
         a = ALIGN // ss
-        self.fatoff = (1 << 20) // ss
+        self.fatoff = align_up(fatoff_bytes, 1 << 20) // ss
         nclus = (self.vollen - self.fatoff) // self.spc
         for _ in range(3):
             self.fatlen = align_up((nclus + 2) * 4, ss) // ss
@@ -861,6 +912,8 @@ class ExfatPlan:
         self.nclus = nclus
         self.fatlen = align_up((nclus + 2) * 4, ss) // ss
         assert self.fatoff + self.fatlen <= self.heap and nclus > 16
+        if nclus > 0x1ffffff0:
+            raise SetupError('too many clusters for Rockbox (%d): choose bigger clusters' % nclus)
         self.bm_bytes = (nclus + 7) // 8
         now = datetime.datetime.now()
         self.stamp = dostime(now)
@@ -923,8 +976,9 @@ class ExfatPlan:
             nn = -(-len(units) // 15)
             s = bytearray(32 * (2 + nn))
             s[0] = 0x85; s[1] = 1 + nn
-            struct.pack_into('<HHIII', s, 4, 0x10 if c.is_dir else 0x20, 0, self.stamp, self.stamp, self.stamp)
-            s[22] = s[23] = s[24] = self.utcoff
+            stamp, utc = c.stamp if c.stamp and c.stamp[0] else (self.stamp, self.utcoff)
+            struct.pack_into('<HHIII', s, 4, 0x10 if c.is_dir else 0x20, 0, stamp, stamp, stamp)
+            s[22] = s[23] = s[24] = utc
             length = c.nclus * self.cs if c.is_dir else c.size
             s[32] = 0xc0
             s[33] = 0x01 | (0x02 if c.first else 0)       # AllocationPossible, NoFatChain (contiguous)
@@ -950,6 +1004,8 @@ class ExfatPlan:
                          self.fatlen, self.heap, self.nclus, self.dirs[0].first, serial, 0x0100, 0,
                          ss.bit_length() - 1, self.spc.bit_length() - 1, 1, 0x80, percent)
         bs[120:510] = b'\xf4' * 390
+        if self.mbr_tail is not None:
+            bs[440:510] = self.mbr_tail
         bs[510:512] = b'\x55\xaa'
         region = bytearray(12 * ss)
         region[0:ss] = bs
@@ -962,9 +1018,17 @@ class ExfatPlan:
         ss, cs = self.ss, self.cs
         total = self.fatlen * ss + (self.used_end - 2) * cs
         done = [0]
+        t0 = time.time(); shown = [0]
         def step(n):
             done[0] += n
             progress(done[0] / total)
+            pct = done[0] * 20 // total                    # a line every 5 % of a big job
+            if total > (256 << 20) and pct > shown[0] and pct < 20:
+                shown[0] = pct
+                dt = max(time.time() - t0, 0.001)
+                rate = done[0] / dt
+                log('  %d %%  %s of %s, %.1f MB/s, about %d min left' % (pct * 5, human(done[0]), human(total),
+                    rate / 1e6, max(1, int((total - done[0]) / max(rate, 1) / 60 + 0.5))))
         # FAT: zeroed, then the chains of bitmap, up-case table and root folder
         log('  writing the FAT (%s)' % human(self.fatlen * ss))
         head = bytearray(min(self.fatlen * ss, CHUNK))
@@ -1162,12 +1226,24 @@ def keep_source(disk, log):
     return None
 
 def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, label='IPOD',
-          cluster=128 * 1024, log=print, progress=lambda f: None):
+          cluster=128 * 1024, log=print, progress=lambda f: None, layout='auto', tree=None):
+    """layout
+      'partition': exFAT partition in normal 512-byte units with 512-byte
+                   sectors -- any PC / card reader; max 2.2 TB
+      'whole':     exFAT over the whole disk from sector 0; sector 0 is the
+                   exFAT boot sector AND the MBR the boot ROM reads (its
+                   type-0x00 firmware entry sits in the boot-code bytes, the
+                   firmware partition in exFAT's reserved sectors before the
+                   FAT) -- no size limit; PCs mount it as a "superfloppy"
+                   (card readers, the iPod's USB mode)
+      'ipod':      partition in the ROM's units (old layout, iPod only)
+      'auto':      'partition' up to 2.2 TB, 'whole' above
+    The boot ROM only reads the type-0x00 firmware entry, in its own units."""
     up_raw, up = upcase_table()
     ipod = Ipod(disk)
     log('iPod: ' + ipod.describe())
-    boot = load_bootloader(bootloader)
-    if len(boot) > ipod.osos_room:
+    boot = load_bootloader(bootloader) if bootloader else None      # None: the firmware partition stays as it is
+    if boot and len(boot) > ipod.osos_room:
         raise SetupError('the bootloader does not fit the firmware partition')
     unit = ipod.unit
     # 1. keep the old settings: copy /.rockbox to the PC first
@@ -1182,7 +1258,10 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
                             if keep_skip(os.path.relpath(os.path.join(d, n), src))])
         else:
             log('no open /.rockbox folder on the iPod found -- installing fresh settings')
-    tree, zf = build_tree(up, rockbox_zip, keep_dir if keep else None, log)
+    if tree is None:
+        tree, zf = build_tree(up, rockbox_zip, keep_dir if keep else None, log)
+    else:
+        zf = None
     # 2. backup of the boot area
     if backup_path:
         log('saving a backup of the partition table and firmware partition')
@@ -1192,7 +1271,18 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
     fw_end = ipod.fw_start + ipod.fw_size
     part_off = align_up(fw_end, ALIGN)
     part_len = (disk_end - part_off) // ALIGN * ALIGN
-    if part_len // unit > 0xffffffff:
+    if layout == 'auto':
+        layout = 'partition' if part_off + part_len <= PC_LIMIT else 'whole'
+    if layout not in ('partition', 'whole', 'ipod'):
+        raise SetupError('unknown layout %r' % layout)
+    pc = layout != 'ipod'
+    if layout == 'partition' and part_off + part_len > PC_LIMIT:
+        part_len = (PC_LIMIT - part_off) // ALIGN * ALIGN
+        log('  NOTE: a partition table ends at 2.2 TB; %s of this disk stays unused '
+            '(the whole-disk layout uses all of it)' % human(disk_end - part_off - part_len))
+    if layout == 'whole':
+        part_off, part_len = 0, disk.size // 512 * 512
+    if layout == 'ipod' and part_len // unit > 0xffffffff:
         part_len = 0xffffffff * unit // ALIGN * ALIGN
     # Rockbox looks for the volume at start * 512, * 1024, * 2048 bytes in
     # turn; nothing that looks like a boot sector may sit at the earlier ones
@@ -1200,17 +1290,32 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
     def looks_like_boot(b):
         return b[510:512] == b'\x55\xaa' and (b[3:11] == b'EXFAT   ' or b[82:87] == b'FAT32' or
                                               b[54:59] in (b'FAT12', b'FAT16'))
-    for _ in range(64):
-        clash = [j for j in (1, 2) if j * 512 < unit and
-                 looks_like_boot(ipod._read(part_off // unit * 512 * j, 512))]
+    for _ in range(0 if layout == 'whole' else 64):
+        punit = 512 if pc else unit
+        clash = [j for j in (1, 2) if j * 512 < punit and
+                 looks_like_boot(ipod._read(part_off // punit * 512 * j, 512))]
         if not clash:
             break
         log('  (moving the partition start: a boot sector sits where Rockbox would look first)')
         part_off += ALIGN
         part_len -= ALIGN
-    ss = unit                       # what a PC sees through Rockbox's USB mode
-    plan = ExfatPlan(part_off, part_len, ss, cluster, label, up_raw, up).layout(tree)
-    log('new exFAT partition: %s at %s, %d KB clusters' % (human(part_len), human(part_off), cluster // 1024))
+    # exFAT sector size = what a PC sees: Rockbox's USB mode shows the sector
+    # size of the units the data partition was found in
+    ss = 512 if pc else unit
+    mbr = bytearray(ipod.mbr_sector)
+    for k in (1, 2, 3):
+        mbr[0x1be + 16 * k: 0x1be + 16 * (k + 1)] = bytes(16)
+    if layout == 'whole':
+        plan = ExfatPlan(0, part_len, 512, cluster, label, up_raw, up,
+                         fatoff_bytes=align_up(fw_end, ALIGN), mbr_tail=bytes(mbr[440:510])).layout(tree)
+        log('new exFAT: the WHOLE disk (%s), %d KB clusters, 512-byte sectors (opens on PCs through card '
+            'readers / the iPod\'s USB mode; firmware partition kept inside its reserved area)'
+            % (human(part_len), cluster // 1024))
+    else:
+        plan = ExfatPlan(part_off, part_len, ss, cluster, label, up_raw, up).layout(tree)
+        log('new exFAT partition: %s at %s, %d KB clusters, %d-byte sectors (%s)'
+            % (human(part_len), human(part_off), cluster // 1024, ss,
+               'readable by any PC / card reader' if ss == 512 else 'readable through the iPod only'))
     # 4. write
     disk.prepare_write(log)
     log('taking the iPod offline in Windows' if os.name == 'nt' else 'writing')
@@ -1218,16 +1323,29 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         disk.lock_volumes(log)
     else:
         disk.lock_volumes()
-    plan.write(disk, log, progress)
-    # partition table: keep partition 1 (firmware), one exFAT partition after it
-    mbr = bytearray(ipod.mbr_sector)
-    for k in (1, 2, 3):
-        mbr[0x1be + 16 * k: 0x1be + 16 * (k + 1)] = bytes(16)
-    mbr[0x1ce:0x1de] = struct.pack('<B3sB3sII', 0, b'\xfe\xff\xff', 0x07, b'\xfe\xff\xff',
-                                   part_off // unit, part_len // unit)
-    disk.write(0, bytes(mbr))
+    plan.write(disk, log, progress)     # (whole disk: its boot sector is the new sector 0)
+    if layout != 'whole':
+        pu = 512 if pc else unit
+        mbr[0x1ce:0x1de] = struct.pack('<B3sB3sII', 0, b'\xfe\xff\xff', 0x07, b'\xfe\xff\xff',
+                                       part_off // pu, part_len // pu)
+        if pc:
+            # the same bytes as the firmware partition, in PC units, as a partition
+            # no PC mounts or offers to format (the ROM ignores this type)
+            mbr[0x1de:0x1ee] = struct.pack('<B3sB3sII', 0, b'\xfe\xff\xff', PROTECT_TYPE, b'\xfe\xff\xff',
+                                           ipod.fw_start // 512, ipod.fw_size // 512)
+        disk.write(0, bytes(mbr))
     log('  partition table updated')
     # bootloader: replaces the OS image (Apple OS + old bootloader)
+    if boot is None:
+        disk.flush()
+        log('checking')
+        progress(1.0)
+        if Ipod(disk).data_fs != 'exFAT':
+            raise SetupError('verify: the partition table did not read back correctly')
+        verify_exfat(disk, part_off, tree, up, log)
+        disk.finish()
+        log('DONE.  Eject the drive and put it in the iPod; hold MENU+SELECT to start.')
+        return plan
     im = ipod.images[ipod.osos]
     off = ipod.fwoffset + im['devOffset']
     padded = align_up(len(boot), 2048)
@@ -1257,10 +1375,357 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
     log('  firmware partition and partition table read back correctly')
     verify_exfat(disk, part_off, tree, up, log)
     disk.finish()
-    zf.close()
+    if zf:
+        zf.close()
     log('DONE.  ' + ('Eject the iPod, unplug it and hold MENU+SELECT to restart.' if backup_path else
                     'Eject the drive and put it in the iPod (or unplug the iPod); hold MENU+SELECT to start.'))
     return plan
+
+# --------------------------------------------------------------------------
+# reading the old card (migration): FAT32 / exFAT, read-only, straight from the disk
+
+class _RunReader:
+    """a file on the old card as a read-only file object: its data is a list of (disk offset, length) runs"""
+    def __init__(self, vol, runs, size, valid=None):
+        self.vol, self.runs, self.size = vol, runs, size
+        self.valid = size if valid is None else min(valid, size)
+        self.pos = 0; self.ri = 0; self.rpos = 0
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def close(self): pass
+    def read(self, n=-1):
+        if n < 0: n = self.size - self.pos
+        n = min(n, self.size - self.pos)
+        out = bytearray()
+        while n > 0 and self.ri < len(self.runs):
+            off, ln = self.runs[self.ri]
+            k = min(n, ln - self.rpos)
+            if self.pos >= self.valid:
+                out += bytes(k)                       # past exFAT's ValidDataLength: zeros
+            else:
+                kv = min(k, self.valid - self.pos)
+                out += self.vol.rd(off + self.rpos, kv) + bytes(k - kv)
+            self.pos += k; self.rpos += k; n -= k
+            if self.rpos >= ln:
+                self.ri += 1; self.rpos = 0
+        return bytes(out)
+
+class SrcVolume:
+    """the files of a FAT32 or exFAT volume at byte offset 'off' of 'disk'"""
+    def __init__(self, disk, off):
+        self.disk, self.off = disk, off
+        self.fatcache = {}
+        bs = self.rd(off, 512)
+        if bs[3:11] == b'EXFAT   ':
+            self.fs = 'exFAT'
+            self.ss = 1 << bs[108]; self.cs = self.ss << bs[109]
+            self.fatoff = le32(bs, 80) * self.ss; self.heap = le32(bs, 88) * self.ss
+            self.nclus = le32(bs, 92); self.root = le32(bs, 96)
+            self.eoc = 0xfffffff8
+        elif bs[82:87] == b'FAT32' or (le16(bs, 22) == 0 and le32(bs, 36)):
+            self.fs = 'FAT32'
+            self.ss = le16(bs, 11); spc = bs[13]
+            if self.ss not in (512, 1024, 2048, 4096) or not spc:
+                raise SetupError('the old card\'s FAT32 boot sector is damaged')
+            self.cs = self.ss * spc
+            rsvd, nfats, fatsz = le16(bs, 14), bs[16], le32(bs, 36)
+            self.fatoff = rsvd * self.ss
+            self.heap = (rsvd + nfats * fatsz) * self.ss
+            total = le32(bs, 32) or le16(bs, 19)
+            self.nclus = (total * self.ss - self.heap) // self.cs
+            self.root = le32(bs, 44)
+            self.eoc = 0x0ffffff8
+            self.label = bs[71:82].decode('latin1').strip()
+        else:
+            raise SetupError('the old card\'s music partition is neither FAT32 nor exFAT')
+        self.label = getattr(self, 'label', '')
+        self.files = self.dirs = 0
+        self.used = 0
+
+    def rd(self, off, n):
+        ss = self.disk.sector
+        a = off - off % ss
+        return self.disk.read(a, align_up(off + n - a, ss))[off - a: off - a + n]
+
+    def coff(self, c):
+        return self.off + self.heap + (c - 2) * self.cs
+
+    def fat(self, c):
+        blk = (c * 4) >> 20
+        d = self.fatcache.get(blk)
+        if d is None:
+            if len(self.fatcache) > 64:
+                self.fatcache.clear()
+            d = self.fatcache[blk] = self.rd(self.off + self.fatoff + (blk << 20), 1 << 20)
+        v = le32(d, (c * 4) & 0xfffff)
+        return v & 0x0fffffff if self.fs == 'FAT32' else v
+
+    def runs(self, first, length, contiguous):
+        """[(disk offset, bytes)] of a file / folder's clusters"""
+        if not first or not length:
+            return []
+        if contiguous:
+            return [(self.coff(first), length)]
+        out = []
+        c, left, guard = first, length, 0
+        while left > 0:
+            if not 2 <= c < self.nclus + 2 or guard > self.nclus:
+                raise SetupError('the old card has a broken cluster chain -- run a disk check (chkdsk) on it first')
+            k = min(self.cs, left)
+            o = self.coff(c)
+            if out and out[-1][0] + out[-1][1] == o:
+                out[-1] = (out[-1][0], out[-1][1] + k)
+            else:
+                out.append((o, k))
+            left -= k; guard += 1
+            if left > 0:
+                c = self.fat(c)
+        return out
+
+    def _dir_data(self, first, length, contiguous):
+        if not length:                    # FAT32 folders: follow the chain to its end
+            n, c = 0, first
+            while 2 <= c < self.nclus + 2 and n <= self.nclus:
+                n += 1; c = self.fat(c)
+            length = n * self.cs
+        return b''.join(self.rd(o, k) for o, k in self.runs(first, length, contiguous))
+
+    def entries(self, first, length=0, contiguous=False):
+        """[(name, is_dir, size, first, contiguous, valid, stamp, utc)] of a folder"""
+        data = self._dir_data(first, length, contiguous)
+        out = []
+        if self.fs == 'exFAT':
+            i = 0
+            while i + 32 <= len(data):
+                t = data[i]
+                if t == 0:
+                    break
+                if t == 0x83 and first == self.root:
+                    n = data[i + 1]
+                    self.label = data[i + 2: i + 2 + 2 * n].decode('utf-16-le', 'replace')
+                if t == 0x85:
+                    sec = data[i + 1]
+                    raw = data[i:i + 32 * (sec + 1)]
+                    if len(raw) == 32 * (sec + 1) and raw[32] == 0xc0:
+                        attr = le16(raw, 4)
+                        nlen = raw[35]
+                        units = b''.join(raw[32 * k + 2: 32 * k + 32] for k in range(2, sec + 1))[:2 * nlen]
+                        name = units.decode('utf-16-le', 'replace')
+                        flags = raw[33]
+                        out.append((name, bool(attr & 0x10), le64(raw, 56), le32(raw, 52), bool(flags & 2),
+                                    le64(raw, 40), le32(raw, 12), raw[23]))
+                    i += 32 * (sec + 1)
+                    continue
+                i += 32
+            return out
+        lfn = []
+        for i in range(0, len(data) - 31, 32):
+            e = data[i:i + 32]
+            if e[0] == 0:
+                break
+            if e[0] == 0xe5:
+                lfn = []; continue
+            attr = e[11]
+            if attr == 0x0f:
+                part = e[1:11] + e[14:26] + e[28:32]
+                if e[0] & 0x40:
+                    lfn = []
+                lfn.insert(0, part)
+                continue
+            if attr & 0x08:
+                if first == self.root and not attr & 0x10:
+                    self.label = e[0:11].decode('latin1').strip()
+                lfn = []; continue
+            if lfn:
+                raw = b''.join(lfn)
+                name = raw.decode('utf-16-le', 'replace').split('\x00')[0].rstrip('￿')
+            else:
+                base = e[0:8].decode('latin1').rstrip(); ext = e[8:11].decode('latin1').rstrip()
+                if e[0] == 0x05: base = '\xe5' + base[1:]
+                if e[12] & 0x08: base = base.lower()
+                if e[12] & 0x10: ext = ext.lower()
+                name = base + ('.' + ext if ext else '')
+            lfn = []
+            if name in ('.', '..'):
+                continue
+            c = (le16(e, 20) << 16) | le16(e, 26)
+            stamp = (le16(e, 24) << 16) | le16(e, 22)
+            out.append((name, bool(attr & 0x10), 0 if attr & 0x10 else le32(e, 28), c, False, None, stamp, 0))
+        return out
+
+    SKIP = ('system volume information', '$recycle.bin', 'recycler', '.trashes', '.spotlight-v100', '.fseventsd')
+
+    def walk(self, first=None, length=0, contiguous=False, path='', depth=0):
+        """yield (path, is_dir, size, opener, stamp, utc) for everything on the volume"""
+        if first is None:
+            first = self.root
+        if depth > 40:
+            raise SetupError('folders nested too deep on the old card: %s' % path)
+        for name, is_dir, size, c, contig, valid, stamp, utc in self.entries(first, length, contiguous):
+            p = path + '/' + name
+            if depth == 0 and name.lower() in self.SKIP:
+                continue
+            if is_dir:
+                self.dirs += 1
+                yield p, True, 0, None, stamp, utc
+                for x in self.walk(c, size if self.fs == 'exFAT' else 0, contig, p, depth + 1):
+                    yield x
+            else:
+                self.files += 1; self.used += size
+                runs = self.runs(c, size, contig)
+                yield p, False, size, (lambda r=runs, s=size, v=valid: _RunReader(self, r, s, v)), stamp, utc
+
+def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, cluster=128 * 1024,
+            log=print, progress=lambda f: None, layout='auto'):
+    """storage migration: the old card's firmware partition, Rockbox and every file onto a new (bigger) card in
+    the right iPod layout, exFAT filling all of it; file dates kept; every file read back and compared (CRC-32)
+    with what was read from the old card.  rockbox_zip: also install that Rockbox build (settings kept)."""
+    up_raw, up = upcase_table()
+    ipod = Ipod(src)
+    log('old card: ' + ipod.describe())
+    if ipod.data_off is None or ipod.data_fs not in ('exFAT', 'FAT32'):
+        raise SetupError('the old card\'s music partition cannot be read (%s)' % ipod.data_fs)
+    unit = unit or ipod.unit
+    vol = SrcVolume(src, ipod.data_off)
+    log('reading the folders of the old card (%s)' % vol.fs)
+    t = Tree(up)
+    for p, is_dir, size, opener, stamp, utc in vol.walk():
+        try:
+            t.add(p, size, opener, is_dir=is_dir, src='old', stamp=(stamp, utc))
+        except SetupError as ex:
+            log('  skipped: %s (%s)' % (p, ex))
+    log('  %d folders, %d files, %s' % (vol.dirs, vol.files, human(vol.used)))
+    zf = None
+    if rockbox_zip:
+        zf = zipfile.ZipFile(rockbox_zip)
+        if '.rockbox/rockbox.ipod' not in zf.namelist():
+            raise SetupError('%s is not a Rockbox build' % rockbox_zip)
+        rb = t.root.children.get(t.key('.rockbox'))
+        if rb:
+            for k in list(rb.children):
+                if keep_skip(rb.children[k].name):
+                    del rb.children[k]
+            for path, n in list(t.walk(rb, '/.rockbox')):
+                if not n.is_dir and keep_skip(path[len('/.rockbox/'):]):
+                    t.remove(path)
+        for info in zf.infolist():
+            if info.filename.endswith('/'):
+                t.add('/' + info.filename, is_dir=True)
+            else:
+                t.add('/' + info.filename, info.file_size, (lambda i=info: zf.open(i)), src='zip')
+        log('  Rockbox from %s (your settings, themes and fonts kept)' % os.path.basename(rockbox_zip))
+    copy_fw = ipod.unit == unit
+    if not copy_fw and not bootloader:
+        raise SetupError('the new card is for a different iPod model than the old one: choose the bootloader '
+                         'file, a new firmware partition is made for it')
+    fw_size = ipod.fw_size if copy_fw else FW_SIZE
+    # room: every file rounded up to clusters, the folders, the FAT and some slack
+    need = sum(align_up(n.size, cluster) for _, n in t.walk() if not n.is_dir)
+    need += (vol.dirs + 2) * cluster + 64 * (1 << 20)
+    room = dst.size - FW_START_UNITS * unit - fw_size - (dst.size // cluster) * 4 - 16 * (1 << 20)
+    log('new card: %s, %s -- %s needed' % (dst.name, human(dst.size), human(need)))
+    if need > room:
+        raise SetupError('the old card\'s files (%s) do not fit on the new one (%s free after the layout)'
+                         % (human(need), human(max(room, 0))))
+    disk_check_new(dst, unit)
+    dst.prepare_write(log)
+    if os.name == 'nt':
+        dst.lock_volumes(log)
+    else:
+        dst.lock_volumes()
+    if copy_fw:
+        log('copying the firmware partition (%s: bootloader%s) as it is'
+            % (human(fw_size), ', Apple OS' if not ipod.boot_has_rockbox or len(ipod.images) > 2 else ''))
+        def chunks():
+            pos = 0
+            while pos < fw_size:
+                k = min(CHUNK, fw_size - pos)
+                yield ipod._read(ipod.fw_start + pos, k)
+                pos += k
+        write_fw_partition(dst, unit, fw_size, chunks(), log)
+        after = Ipod(dst)
+        if after.fwoffset is None or after.images[after.osos]['len'] != ipod.images[ipod.osos]['len']:
+            raise SetupError('verify: the copied firmware partition does not read back correctly')
+        log('  firmware partition copied and checked')
+        boot = None
+    else:
+        log('the new card is for a %s: a new firmware partition with the Rockbox bootloader'
+            % ('5.5G' if unit == 2048 else '5G'))
+        create_blank(dst, unit, load_bootloader(bootloader), log)
+        boot = bootloader
+    plan = setup(dst, None, boot, None, keep=False, label=label or vol.label or 'IPOD', cluster=cluster,
+                 log=log, progress=progress, layout=layout, tree=t)
+    if zf:
+        zf.close()
+    log('every file was read back from the new card and matches the old card (CRC-32)')
+    return plan
+
+# --------------------------------------------------------------------------
+# clock: the bcm-rockbox firmware sets its clock when it sees this file's data arrive over USB
+# (firmware/usbstack/usb_storage.c); no administrator rights needed
+
+def clock_sync_drives():
+    """drive roots (or mount points) that hold a Rockbox iPod"""
+    roots = []
+    if os.name == 'nt':
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if mask & (1 << i) and i >= 2:
+                roots.append('%s:\\' % chr(65 + i))
+    else:
+        for base in ('/Volumes', '/media', '/run/media'):
+            if os.path.isdir(base):
+                for d in os.listdir(base):
+                    p = os.path.join(base, d)
+                    roots.append(p)
+                    if os.path.isdir(p) and not os.path.exists(os.path.join(p, '.rockbox')):
+                        try:
+                            roots += [os.path.join(p, x) for x in os.listdir(p)]
+                        except OSError:
+                            pass
+    return [r for r in roots if os.path.isfile(os.path.join(r, '.rockbox', 'rockbox.ipod'))]
+
+def clock_sync(root, log=print):
+    now = datetime.datetime.now()
+    text = 'RBCLOCK1 %s.%03d \n' % (now.strftime('%Y-%m-%d %H:%M:%S'), now.microsecond // 1000)
+    p = os.path.join(root, '.rockbox', 'clocksync.txt')
+    with open(p, 'w', newline='\n') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())                     # straight to the iPod, now
+    log('iPod clock set to %s (%s)' % (now.strftime('%Y-%m-%d %H:%M:%S'), root))
+    return now
+
+HELPER = 'ipod_clock_sync.pyw'
+
+def _startup_link():
+    return os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'Microsoft', 'Windows', 'Start Menu',
+                        'Programs', 'Startup', 'iPod Clock Sync.vbs')
+
+def clock_helper_installed():
+    return os.name == 'nt' and os.path.isfile(_startup_link())
+
+def clock_helper_install():
+    """start ipod_clock_sync.pyw (next to this tool) with Windows, without a window, and start it now"""
+    here = os.path.dirname(os.path.abspath(sys.argv[0]))
+    script = os.path.join(here, HELPER)
+    if not os.path.isfile(script):
+        raise SetupError('%s is missing next to this tool' % HELPER)
+    exe = sys.executable
+    if exe.lower().endswith('python.exe') and os.path.exists(exe[:-10] + 'pythonw.exe'):
+        exe = exe[:-10] + 'pythonw.exe'
+    link = _startup_link()
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    with open(link, 'w') as f:
+        f.write('CreateObject("WScript.Shell").Run """%s"" ""%s""", 0, False\r\n' % (exe, script))
+    import subprocess
+    subprocess.Popen([exe, script], creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0), close_fds=True)
+    return link
+
+def clock_helper_uninstall():
+    if os.path.isfile(_startup_link()):
+        os.remove(_startup_link())
 
 # --------------------------------------------------------------------------
 # window
@@ -1296,6 +1761,8 @@ def gui():
                     variable=mode, value='ipod').pack(anchor='w')
     ttk.Radiobutton(mf, text='New / blank drive (SD card, CF card, iPod hard drive in a USB adapter, or an iPod '
                     'in disk mode): build everything', variable=mode, value='new').pack(anchor='w')
+    ttk.Radiobutton(mf, text='Move to a bigger card / drive: copy firmware, Rockbox, music and videos from the old '
+                    'one, fill the new one, check every file', variable=mode, value='move').pack(anchor='w')
 
     disk_lbl = ttk.Label(frm, text='iPod:'); disk_lbl.grid(row=2, column=0, sticky='w')
     disk_var = tk.StringVar()
@@ -1350,12 +1817,33 @@ def gui():
     ttk.Combobox(opt, textvariable=cl_var, values=['32 KB', '64 KB', '128 KB', '256 KB'], width=8,
                  state='readonly').pack(side='left')
 
-    bar = ttk.Progressbar(frm, maximum=1000); bar.grid(row=10, column=0, columnspan=3, sticky='ew', pady=6)
+    to_lbl = ttk.Label(frm, text='To:')
+    to_var = tk.StringVar()
+    to_box = ttk.Combobox(frm, textvariable=to_var, state='readonly')
+    to_info = ttk.Label(frm, text='', wraplength=720, justify='left', foreground='#555')
+    upd_var = tk.BooleanVar(value=False)
+    upd_chk = ttk.Checkbutton(opt, text='Also install the Rockbox build above (settings kept)', variable=upd_var)
+    st['to'] = []
+
+    LAYOUTS = [('Automatic: normal partition up to 2.2 TB, whole-disk exFAT above', 'auto'),
+               ('Normal exFAT partition (opens on every PC; max 2.2 TB)', 'partition'),
+               ('Whole-disk exFAT (any size; opens via card readers / iPod USB)', 'whole')]
+    ttk.Label(frm, text='Layout:').grid(row=10, column=0, sticky='w')
+    lay_var = tk.StringVar(value=LAYOUTS[0][0])
+    ttk.Combobox(frm, textvariable=lay_var, values=[x for x, _ in LAYOUTS], state='readonly').grid(
+        row=10, column=1, columnspan=2, sticky='ew', padx=6, pady=(0, 4))
+    def layout_choice():
+        return dict(LAYOUTS)[lay_var.get()]
+    bar = ttk.Progressbar(frm, maximum=1000); bar.grid(row=14, column=0, columnspan=3, sticky='ew', pady=6)
     logw = tk.Text(frm, height=13, wrap='word', state='disabled')
-    logw.grid(row=11, column=0, columnspan=3, sticky='nsew'); frm.rowconfigure(11, weight=1)
-    btns = ttk.Frame(frm); btns.grid(row=12, column=0, columnspan=3, sticky='ew', pady=(8, 0))
+    logw.grid(row=15, column=0, columnspan=3, sticky='nsew'); frm.rowconfigure(15, weight=1)
+    btns = ttk.Frame(frm); btns.grid(row=16, column=0, columnspan=3, sticky='ew', pady=(8, 0))
     go = ttk.Button(btns, text='Erase iPod and install Rockbox on exFAT'); go.pack(side='right')
     rs = ttk.Button(btns, text='Restore a backup...'); rs.pack(side='left')
+    ck = ttk.Button(btns, text='Set iPod clock now'); ck.pack(side='left', padx=(8, 0))
+    auto_var = tk.BooleanVar(value=clock_helper_installed())
+    auto_chk = ttk.Checkbutton(btns, text='Keep the iPod clock right automatically', variable=auto_var)
+    auto_chk.pack(side='left', padx=(8, 0))
 
     def log(s):
         to_logfile(s)
@@ -1364,14 +1852,18 @@ def gui():
 
     def refresh(*_):
         try:
-            if mode.get() == 'ipod':
+            if mode.get() in ('ipod', 'move'):
                 st['items'] = [(n, ip) for n, ip in find_ipods()]
                 disk_box['values'] = ['Disk %d: %s, %s' % (n, ip.disk.name, human(ip.disk.size))
                                       for n, ip in st['items']]
                 empty = ('No iPod with Apple\'s firmware partition found.  Connect it in Rockbox USB mode (or '
                          'disk mode) and press Refresh -- or, for an empty / unformatted disk, choose '
                          '"New / blank drive" above.')
-                if not st['items'] and st['first'] and any(i['ok'] for n, i in list_disks()):
+                if mode.get() == 'move':
+                    empty = ('No old iPod card / drive found.  Connect it (a card reader, an adapter, or the iPod in '
+                             'Rockbox USB / disk mode) and press Refresh.')
+                    st['to'] = [(n, i) for n, i in list_disks() if i['ok']]
+                elif not st['items'] and st['first'] and any(i['ok'] for n, i in list_disks()):
                     st['first'] = False
                     mode.set('new')          # nothing to convert: offer the blank-drive mode
                     return
@@ -1393,12 +1885,37 @@ def gui():
             disk_box.current(0); show()
         else:
             disk_var.set(''); info['text'] = empty
+        if mode.get() == 'move':
+            fill_to()
+    def fill_to(*_):
+        i = disk_box.current()
+        src_n = st['items'][i][0] if 0 <= i < len(st['items']) else -1
+        st['to_items'] = [(n, it) for n, it in st['to'] if n != src_n]
+        to_box['values'] = ['Disk %d: %s, %s, %s%s%s' % (n, it['name'], human(it['size']), it['bus'],
+                            (' ' + ' '.join(it['letters'])) if it['letters'] else '', '  -- INTERNAL DISK'
+                            if it['internal'] else '') for n, it in st['to_items']]
+        if st['to_items']:
+            to_box.current(len(st['to_items']) - 1 if len(st['to_items']) > 1 else 0); show_to()
+        else:
+            to_var.set(''); to_info['text'] = 'Connect the new card / drive and press Refresh.'
+    def show_to(*_):
+        j = to_box.current()
+        if 0 <= j < len(st['to_items']):
+            n, it = st['to_items'][j]
+            to_info['text'] = ('%s, %s -- will be ERASED and get everything from the old one, its exFAT filling all '
+                               'of it.%s' % (it['name'], human(it['size']),
+                                             '  WARNING: an INTERNAL disk of this PC.' if it['internal'] else ''))
+    to_box.bind('<<ComboboxSelected>>', show_to)
     def show(*_):
         i = disk_box.current()
         if not (0 <= i < len(st['items'])):
             return
         n, it = st['items'][i]
-        if mode.get() == 'ipod':
+        if mode.get() == 'move':
+            info['text'] = it.describe()
+            model_var.set(model_box['values'][0] if it.unit == 2048 else model_box['values'][1])
+            fill_to()
+        elif mode.get() == 'ipod':
             info['text'] = it.describe()
         else:
             info['text'] = ('%s, %s, %s bus, PC sees %d-byte sectors%s%s.  The whole disk will be erased.%s'
@@ -1410,9 +1927,22 @@ def gui():
 
     def set_mode(*_):
         new = mode.get() == 'new'
-        disk_lbl['text'] = 'Disk:' if new else 'iPod:'
-        go['text'] = 'Erase disk and build iPod layout' if new else 'Erase iPod and install Rockbox on exFAT'
-        if new:
+        move = mode.get() == 'move'
+        disk_lbl['text'] = 'Disk:' if new else 'From:' if move else 'iPod:'
+        go['text'] = ('Erase disk and build iPod layout' if new else 'Copy everything to the new drive' if move
+                      else 'Erase iPod and install Rockbox on exFAT')
+        if move:
+            to_lbl.grid(row=11, column=0, sticky='w'); to_box.grid(row=11, column=1, sticky='ew', padx=6, pady=2)
+            to_info.grid(row=12, column=0, columnspan=3, sticky='w', pady=(2, 6))
+            upd_chk.pack(side='left', before=opt.winfo_children()[1])
+            keep_chk.pack_forget()
+        else:
+            to_lbl.grid_remove(); to_box.grid_remove(); to_info.grid_remove(); upd_chk.pack_forget()
+        if move:
+            bk_lbl.grid_remove(); bk_ent.grid_remove(); bk_btn.grid_remove()
+            model_lbl.grid(row=4, column=0, sticky='w'); model_box.grid(row=4, column=1, sticky='ew', padx=6, pady=2)
+            kd_lbl.grid_remove(); kd_ent.grid_remove(); kd_btn.grid_remove()
+        elif new:
             bk_lbl.grid_remove(); bk_ent.grid_remove(); bk_btn.grid_remove(); keep_chk.pack_forget()
             model_lbl.grid(row=4, column=0, sticky='w'); model_box.grid(row=4, column=1, sticky='ew', padx=6, pady=2)
             kd_lbl.grid(row=8, column=0, sticky='w'); kd_ent.grid(row=8, column=1, sticky='ew', padx=6, pady=2)
@@ -1437,8 +1967,13 @@ def gui():
                     st['busy'] = False
                     for b in (go, rs, rf):
                         b['state'] = 'normal'
-                    if v:
+                    if v == 'clock':
+                        pass
+                    elif v:
                         messagebox.showerror(TITLE, v)
+                    elif mode.get() == 'move':
+                        messagebox.showinfo(TITLE, 'Done -- everything is on the new drive and was checked file by '
+                                            'file.  Eject it and put it in the iPod, then hold MENU+SELECT.')
                     elif mode.get() == 'new':
                         messagebox.showinfo(TITLE, 'Done.  Eject the drive and put it in the iPod (or unplug the '
                                             'iPod), then hold MENU+SELECT to start it.')
@@ -1456,7 +1991,9 @@ def gui():
         def worker():
             err = None
             try:
-                job()
+                if job() == 'clock':
+                    err = 'clock'
+
             except Exception as ex:          # shown to the user
                 err = str(ex) or ex.__class__.__name__
                 log('ERROR: ' + err)
@@ -1483,6 +2020,33 @@ def gui():
         cl = int(cl_var.get().split()[0]) * 1024
         label = label_var.get() or 'IPOD'
         n, it = st['items'][i]
+        if mode.get() == 'move':
+            j = to_box.current()
+            if not (0 <= j < len(st.get('to_items', []))):
+                messagebox.showwarning(TITLE, 'Choose the new card / drive (To:).'); return
+            m, dt = st['to_items'][j]
+            unit = MODELS['5g' if model_var.get().startswith('iPod 5G') else '5.5g']
+            zp = zip_var.get() if upd_var.get() else None
+            if zp and not os.path.isfile(zp):
+                messagebox.showwarning(TITLE, 'Choose the Rockbox build (rockbox.zip).'); return
+            bl = boot_var.get() if unit != it.unit else None
+            if bl and not os.path.isfile(bl):
+                messagebox.showwarning(TITLE, 'The new drive is for another iPod model: choose the bootloader.'); return
+            if dt['internal'] and not messagebox.askyesno(TITLE, 'Disk %d (%s, %s) is connected INSIDE this PC.  '
+                                                          'Really use it?' % (m, dt['name'], human(dt['size'])),
+                                                          icon='warning'):
+                return
+            if not confirm('%s, %s (the NEW drive)%s\n\nThe old one is only read.' % (
+                    dt['name'], human(dt['size']), (' (drives ' + ' '.join(dt['letters']) + ')') if dt['letters'] else '')):
+                return
+            def job():
+                s_ = WinDisk(n, writable=False); d_ = WinDisk(m)
+                try:
+                    migrate(s_, d_, unit=unit, rockbox_zip=zp, bootloader=bl, label=label_var.get() or None,
+                            cluster=cl, log=log, progress=prog, layout=layout_choice())
+                finally:
+                    s_.close(); d_.close()
+            return run(job)
         if mode.get() == 'new':
             unit = MODELS['5g' if model_var.get().startswith('iPod 5G') else '5.5g']
             kd = kd_var.get().strip() or None
@@ -1503,7 +2067,7 @@ def gui():
                 d = WinDisk(n)
                 try:
                     new_drive(d, unit, zip_var.get(), boot_var.get(), keep_dir=kd, label=label, cluster=cl,
-                              log=log, progress=prog)
+                              log=log, progress=prog, layout=layout_choice())
                 finally:
                     d.close()
             return run(job)
@@ -1531,7 +2095,7 @@ def gui():
             d = WinDisk(n)
             try:
                 setup(d, zip_var.get(), boot_var.get(), bk_var.get(), keep=keep_var.get(), keep_dir=keep_dir,
-                      label=label, cluster=cl, log=log, progress=prog)
+                      label=label, cluster=cl, log=log, progress=prog, layout=layout_choice())
             finally:
                 d.close()
         run(job)
@@ -1558,7 +2122,29 @@ def gui():
                 d.close()
         run(job)
 
-    go['command'] = do_go; rs['command'] = do_restore; rf['command'] = refresh
+    def do_clock():
+        roots = clock_sync_drives()
+        if not roots:
+            messagebox.showwarning(TITLE, 'No iPod with Rockbox found.  Connect it in Rockbox USB mode (Windows '
+                                   'shows it as a drive) and try again.'); return
+        def job():
+            for r in roots:
+                clock_sync(r, log)
+            return 'clock'
+        run(job)
+    def do_auto(*_):
+        try:
+            if auto_var.get():
+                where = clock_helper_install()
+                log('the clock helper now starts with Windows (%s); it sets the iPod clock whenever an iPod with '
+                    'Rockbox is connected' % where)
+            else:
+                clock_helper_uninstall()
+                log('the clock helper no longer starts with Windows')
+        except Exception as ex:
+            messagebox.showerror(TITLE, 'Could not change the clock helper: %s' % ex)
+    auto_var.trace_add('write', do_auto)
+    go['command'] = do_go; rs['command'] = do_restore; rf['command'] = refresh; ck['command'] = do_clock
     root.after(100, pump)
     root.after(200, refresh)
     root.mainloop()
@@ -1606,7 +2192,7 @@ def main2():
                 w.destroy()
             return
         return gui()
-    if os.name == 'nt' and ('--list' in a or '--disks' in a) and not is_admin():
+    if os.name == 'nt' and ('--list' in a or '--disks' in a or '--migrate' in a) and not is_admin():
         sys.exit('run this from a command prompt opened with "Run as administrator"')
     if '--list' in a:
         for n, ip in find_ipods():
@@ -1617,6 +2203,31 @@ def main2():
             print('disk %d: %s, %s, %s, %s%s%s%s' % (n, i['name'], human(i['size']), i['bus'], ' '.join(i['letters']),
                   '  (empty)' if i['blank'] else '', '  INTERNAL' if i['internal'] else '',
                   '' if i['ok'] else '  (never used: Windows runs from it)'))
+        return
+    if '--clock-sync' in a:
+        roots = clock_sync_drives()
+        if not roots:
+            sys.exit('no iPod with Rockbox found (connect it in Rockbox USB mode)')
+        for r in roots:
+            clock_sync(r)
+        return
+    if '--migrate' in a:
+        if '--yes' not in a:
+            sys.exit('add --yes to really erase the new drive')
+        if '--from-image' in a:
+            src = ImageDisk(opt('--from-image'), int(opt('--sector', '512')), writable=False)
+        else:
+            src = WinDisk(int(opt('--from')), writable=False)
+        dst = ImageDisk(opt('--image'), int(opt('--sector', '512'))) if '--image' in a else WinDisk(int(opt('--disk')))
+        try:
+            model = opt('--model')
+            migrate(src, dst, unit=MODELS[model.lower()] if model else None, rockbox_zip=opt('--rockbox-zip'),
+                    bootloader=opt('--bootloader'), label=opt('--label'), cluster=int(opt('--cluster-kb', '128')) * 1024,
+                    layout=opt('--layout', 'auto'))
+        except SetupError as ex:
+            sys.exit('ERROR: %s' % ex)
+        finally:
+            src.close(); dst.close()
         return
     if '--image' in a:
         disk = ImageDisk(opt('--image'), int(opt('--sector', '512')))
@@ -1641,7 +2252,8 @@ def main2():
             if model not in MODELS:
                 sys.exit('--model must be 5.5g or 5g')
             new_drive(disk, MODELS[model], opt('--rockbox-zip'), opt('--bootloader'), keep_dir=opt('--keep-dir'),
-                      label=opt('--label', 'IPOD'), cluster=int(opt('--cluster-kb', '128')) * 1024)
+                      label=opt('--label', 'IPOD'), cluster=int(opt('--cluster-kb', '128')) * 1024,
+                      layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'))
             return
         if '--yes' not in a:
             sys.exit('add --yes to really erase the iPod')
@@ -1649,7 +2261,7 @@ def main2():
               opt('--backup', 'ipod_backup_%s.bin' % time.strftime('%Y%m%d_%H%M%S')),
               keep='--no-keep' not in a, keep_dir=opt('--keep-dir'), label=opt('--label', 'IPOD'),
               cluster=int(opt('--cluster-kb', '128')) * 1024,
-              progress=(lambda f: None))
+              progress=(lambda f: None), layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'))
     except SetupError as ex:
         sys.exit('ERROR: %s' % ex)
     finally:

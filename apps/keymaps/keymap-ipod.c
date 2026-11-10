@@ -322,6 +322,8 @@ static const struct button_mapping remote_button_context_standard[]  = {
     { ACTION_STD_MENU,          BUTTON_RC_MENU|BUTTON_REL,             BUTTON_RC_MENU },
     { ACTION_STD_QUICKSCREEN,   BUTTON_RC_MENU|BUTTON_REPEAT,          BUTTON_RC_MENU },
     { ACTION_STD_CONTEXT,       BUTTON_RC_SELECT|BUTTON_REPEAT,        BUTTON_RC_SELECT },
+    /* bcm overlay v74: a dock / IR remote's SELECT opens the item, like the iPod's own (it did nothing in menus) */
+    { ACTION_STD_OK,            BUTTON_RC_SELECT|BUTTON_REL,           BUTTON_RC_SELECT },
 
     LAST_ITEM_IN_LIST
 }; /* remote_button_context_standard */

@@ -304,6 +304,7 @@ static void acc_id_poll(void)
             {
                 int was = iap_acc_id_code;
                 iap_acc_id_code = c;
+                iap_dock_pin21(c, was);      /* v74: first, while its settings are still in effect */
                 /* an accessory that identified itself by resistor was unplugged: undo its temporary video settings */
                 if (c == 15 && was >= 0 && was < 15)
                     iap_video_prefs_restore();
@@ -901,6 +902,7 @@ void iap_periodic(void)
 
 #ifdef IPOD_VIDEO
     acc_id_poll();
+    iap_dock_poll();                     /* v74 */
 #endif
 
     /* Handle pending authentication tasks */
@@ -1318,7 +1320,7 @@ void iap_periodic(void)
         {
             IAP_TX_INIT(0x03, 0x09);
             IAP_TX_PUT(0x09);
-            IAP_TX_PUT_U16(tm->tm_year);
+            IAP_TX_PUT_U16(tm->tm_year + 1900);   /* bcm overlay v74: the full year (2026), as iAP wants -- it sent 126 */
 
             /* Month */
             IAP_TX_PUT(tm->tm_mon+1);

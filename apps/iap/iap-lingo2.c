@@ -24,6 +24,7 @@
  */
 
 #include "iap-core.h"
+#include "misc.h"
 #include "iap-lingo.h"
 #include "system.h"
 #include "button.h"
@@ -110,6 +111,22 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
              * 11/12 next/previous chapter, 18 power off. */
             unsigned char vbuf[6];
             static uint32_t vprev;
+            /* v74: the remote's volume works everywhere (menus, browser, Now Playing), not only where the keymap has
+               it: a press = one step, held = a step every 0.1 s after 0.4 s */
+            static long vnext;
+            static int vdir;
+            if (!IAP_VIDEO_ACTIVE() && len >= 3 && (buf[2] & 6))
+            {
+                int d = (buf[2] & 2) ? 1 : -1;
+                if (d != vdir || TIME_AFTER(current_tick, vnext))
+                {
+                    adjust_volume(d);
+                    vnext = current_tick + (d != vdir ? HZ * 4 / 10 : HZ / 10);
+                    vdir = d;
+                }
+            }
+            else
+                vdir = 0;
             if (IAP_VIDEO_ACTIVE())
             {
                 uint32_t bits = 0, pressed;
@@ -154,10 +171,15 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
                     }
 #endif
                 }
+#ifdef IPOD_VIDEO
+                if(IAP_VIDEO_ACTIVE())          /* v74: else handled above */
+#endif
+                {
                 if(buf[2] & 2)
                     btn |= BUTTON_RC_VOL_UP;
                 if(buf[2] & 4)
                     btn |= BUTTON_RC_VOL_DOWN;
+                }
                 if(buf[2] & 8)
                     btn |= BUTTON_RC_RIGHT;
                 if(buf[2] & 16)
@@ -343,6 +365,7 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
         case 0x03:
         {
 #ifdef IPOD_VIDEO
+            iap_dock_video_interest();          /* v74: sends video buttons: a video dock */
             /* v63: video docks / AV remotes.  Bits: 0 play/pause, 1 next video, 2 previous video, 3 stop, 4 play,
              * 5 pause, 6 begin FF, 7 begin REW (released = end), 8 next chapter, 9 previous chapter,
              * 10/11 next/previous frame (not supported: ignored).  The 5G/5.5G took these without authentication. */

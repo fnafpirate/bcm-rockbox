@@ -1320,13 +1320,25 @@ const struct settings_list settings[] = {
 #endif
 #ifdef IPOD_VIDEO
     /* the video player's TV output (BCM2722 composite / S-video: dock connector and the headphone jack's 4th contact) */
-    CHOICE_SETTING(0, bcm_video_out, LANG_VIDEO_OUT, 2, "video out", "on,ask,off", NULL, 3,
-                   ID2P(LANG_ON), ID2P(LANG_ASK), ID2P(LANG_OFF)),
+    CHOICE_SETTING(0, bcm_video_out, LANG_VIDEO_OUT, 2, "video out", "on,ask,off,auto", NULL, 4,
+                   ID2P(LANG_ON), ID2P(LANG_ASK), ID2P(LANG_OFF), ID2P(LANG_VIDEO_OUT_AUTO)),
     CHOICE_SETTING(0, bcm_tv_signal, LANG_TV_SIGNAL, 0, "tv signal", "ntsc,pal", NULL, 2,
                    ID2P(LANG_TV_NTSC), ID2P(LANG_TV_PAL)),
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
                    ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
     OFFON_SETTING(0, bcm_tv_wide, LANG_TV_WIDESCREEN, false, "tv widescreen", NULL),
+    /* bcm overlay v73: soft subtitles (SRT / WebVTT / ASS next to the video, MP4 timed text) */
+    OFFON_SETTING(0, bcm_subs, LANG_SUBTITLES, true, "subtitles", NULL),
+    CHOICE_SETTING(0, bcm_sub_size, LANG_SUBTITLE_SIZE, 1, "subtitle size", "small,medium,large", NULL, 3,
+                   ID2P(LANG_SUBTITLE_SMALL), ID2P(LANG_SUBTITLE_MEDIUM), ID2P(LANG_SUBTITLE_LARGE)),
+    CHOICE_SETTING(0, bcm_sub_style, LANG_SUBTITLE_STYLE, 0, "subtitle style", "outline,box", NULL, 2,
+                   ID2P(LANG_SUBTITLE_OUTLINE), ID2P(LANG_SUBTITLE_BOX)),
+    /* bcm overlay v74 */
+    CHOICE_SETTING(0, bcm_video_buffer, LANG_VIDEO_BUFFERING, 1, "video buffering", "low-power,balanced,performance",
+                   NULL, 3, ID2P(LANG_BUFFER_LOW_POWER), ID2P(LANG_BUFFER_BALANCED), ID2P(LANG_BUFFER_PERFORMANCE)),
+    OFFON_SETTING(0, bcm_tv_autoplay, LANG_TVS_AUTOPLAY, true, "autoplay next episode", NULL),
+    OFFON_SETTING(0, bcm_dock_notify, LANG_DOCK_NOTICES, true, "dock notifications", NULL),
+    OFFON_SETTING(0, bcm_clock_sync, LANG_CLOCK_FROM_PC, true, "clock from computer", NULL),
 #ifdef HAVE_BATTERY_SMOOTH_API
     CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "smooth,exact", battery_reading_cb, 2,
                    ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),

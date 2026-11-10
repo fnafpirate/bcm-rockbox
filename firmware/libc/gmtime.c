@@ -97,7 +97,7 @@ struct tm * gmtime_r(const time_t *timep, struct tm *tm)
 {
     time_t t = *timep;
 
-    int d = t / 86400;             /* day number (-24856..24855) */
+    int d = t / 86400;             /* day number (0..49710: time_t is unsigned 32-bit since bcm overlay v74) */
     int s = t - (time_t)d * 86400; /* second # of day (0..86399) */
 
     if (s < 0) {

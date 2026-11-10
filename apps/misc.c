@@ -25,6 +25,7 @@
 #include "string-extra.h"
 #include "config.h"
 #include "misc.h"
+#include "bcm_dock.h"
 #include "system.h"
 #include "lcd.h"
 #include "language.h" /* is_lang_rtl() */
@@ -708,6 +709,11 @@ long default_event_handler_ex(long event, void (*callback)(void *), void *parame
         case SYS_CAR_ADAPTER_RESUME:
             unpause_action(true);
             return SYS_CAR_ADAPTER_RESUME;
+#endif
+#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
+        case SYS_IAP_DOCK:                       /* bcm overlay v74: dock connected / gone, power source */
+            iap_dock_ui();
+            return SYS_IAP_DOCK;
 #endif
 #ifdef HAVE_HOTSWAP_STORAGE_AS_MAIN
         case SYS_FS_CHANGED:

@@ -9,6 +9,10 @@ abrepeat.c
 bookmark.c
 core_keymap.c
 debug_menu.c
+#ifdef IPOD_VIDEO
+bcm_subs.c
+bcm_tvshow.c
+#endif
 filetypes.c
 fileop.c
 #ifdef HAVE_TOUCHSCREEN

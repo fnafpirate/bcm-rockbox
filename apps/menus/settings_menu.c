@@ -863,6 +863,18 @@ MENUITEM_SETTING(bcm_tv_picture_item, &global_settings.bcm_tv_picture, NULL);
 MENUITEM_SETTING(bcm_tv_wide_item, &global_settings.bcm_tv_wide, NULL);
 MAKE_MENU(video_out_menu, ID2P(LANG_VIDEO_OUT), 0, Icon_Display_menu,
           &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_wide_item, &bcm_tv_picture_item);
+/* bcm overlay v73: video subtitles */
+MENUITEM_SETTING(bcm_subs_item, &global_settings.bcm_subs, NULL);
+MENUITEM_SETTING(bcm_sub_size_item, &global_settings.bcm_sub_size, NULL);
+MENUITEM_SETTING(bcm_sub_style_item, &global_settings.bcm_sub_style, NULL);
+MAKE_MENU(subtitles_menu, ID2P(LANG_SUBTITLES), 0, Icon_Display_menu,
+          &bcm_subs_item, &bcm_sub_size_item, &bcm_sub_style_item);
+/* bcm overlay v74: Settings > General Settings > Video */
+MENUITEM_SETTING(bcm_video_buffer_item, &global_settings.bcm_video_buffer, NULL);
+MENUITEM_SETTING(bcm_tv_autoplay_item, &global_settings.bcm_tv_autoplay, NULL);
+MENUITEM_SETTING(bcm_dock_notify_item, &global_settings.bcm_dock_notify, NULL);
+MAKE_MENU(bcm_video_menu, ID2P(LANG_VIDEO_SETTINGS), 0, Icon_Display_menu,
+          &video_out_menu, &subtitles_menu, &bcm_video_buffer_item, &bcm_tv_autoplay_item, &bcm_dock_notify_item);
 #endif
 
 MAKE_MENU(settings_menu_item, ID2P(LANG_GENERAL_SETTINGS), 0,
@@ -874,7 +886,7 @@ MAKE_MENU(settings_menu_item, ID2P(LANG_GENERAL_SETTINGS), 0,
 #endif
           &display_menu,
 #ifdef IPOD_VIDEO
-          &video_out_menu,
+          &bcm_video_menu,
 #endif
           &system_menu,
           &startup_shutdown_menu,
