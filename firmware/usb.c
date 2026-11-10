@@ -206,6 +206,27 @@ static inline void usb_handle_hotswap(long id)
 }
 #endif /* HAVE_HOTSWAP */
 
+#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && defined(USB_ENABLE_HID)
+/* bcm overlay v81: the PP502x USB controller has two endpoint pairs besides control (USB_NUM_ENDPOINTS 3), and both
+   directions of a pair must use the same transfer type.  Mass storage takes a pair (bulk in + out), the USB DAC a pair
+   (isochronous data out + feedback in), iAP 1.5 pairs (isochronous in + interrupt in), HID half a pair (interrupt in).
+   They do not all fit, and usb_core drops whatever does not, silently, in driver order -- storage, HID, DAC, iAP: so
+   v77's "Mass Storage + USB DAC" never had a DAC, and car mode's iAP lost to HID.  The functions asked for now get the
+   endpoints; HID (the iPod as a keyboard / remote for the computer) gives way. */
+static void usb_fit_endpoints(bool audio)
+{
+    if (audio)
+    {
+        usb_core_enable_driver(USB_DRIVER_HID, false);
+#ifdef USB_ENABLE_IAP
+        usb_core_enable_driver(USB_DRIVER_IAP, false);
+#endif
+    }
+    else if (usb_iap_only)
+        usb_core_enable_driver(USB_DRIVER_HID, false);
+}
+#endif
+
 static inline void usb_configure_drivers(int for_state)
 {
 #ifdef USB_ENABLE_AUDIO
@@ -241,6 +262,9 @@ static inline void usb_configure_drivers(int for_state)
 #ifdef USB_ENABLE_CHARGING_ONLY
         usb_core_enable_driver(USB_DRIVER_CHARGING_ONLY, true);
 #endif
+#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && defined(USB_ENABLE_HID)
+        usb_fit_endpoints((usb_audio == 1) || (usb_audio == 2));
+#endif
 
         usb_attach();
         break;
@@ -275,6 +299,9 @@ static inline void usb_configure_drivers(int for_state)
 #endif
 #ifdef USB_ENABLE_CHARGING_ONLY
         usb_core_enable_driver(USB_DRIVER_CHARGING_ONLY, false);
+#endif
+#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && defined(USB_ENABLE_HID)
+        usb_fit_endpoints(!usb_iap_only && ((usb_audio == 1) || (usb_audio == 3)));
 #endif
 
         usb_attach();

@@ -170,7 +170,11 @@ static void usb_stats_draw(const struct viewport *logo)
     lh = font_get(FONT_SYSFIXED)->height + 2;
     vp.x = 2; vp.width = LCD_WIDTH - 4;
     vp.y = logo->y + logo->height + 2;
-    vp.height = 9 * lh + 22;
+#ifdef USB_ENABLE_HID
+    if (global_settings.usb_hid)
+        vp.y += font_get(FONT_UI)->height * 2;     /* below the keypad-mode line (title viewport) */
+#endif
+    vp.height = 10 * lh + 22;
     if (vp.y + vp.height > LCD_HEIGHT) vp.y = LCD_HEIGHT - vp.height;
     if (vp.y < 0) { vp.y = 0; vp.height = LCD_HEIGHT; }
     vp.font = FONT_SYSFIXED;
@@ -221,6 +225,24 @@ static void usb_stats_draw(const struct viewport *logo)
         d->putsxyf(4, y, "Drive  temperature not reported");
     y += lh;
     d->putsxyf(4, y, "CPU / battery temperature: no sensor");
+    y += lh;
+    d->putsxyf(4, y, "USB    %s%s%s%s", usb_core_driver_enabled(USB_DRIVER_MASS_STORAGE) ? "storage " : "",
+#ifdef USB_ENABLE_AUDIO
+               usb_core_driver_enabled(USB_DRIVER_AUDIO) ? "DAC " : "",
+#else
+               "",
+#endif
+#ifdef USB_ENABLE_HID
+               usb_core_driver_enabled(USB_DRIVER_HID) ? "HID " : "",
+#else
+               "",
+#endif
+#ifdef USB_ENABLE_IAP
+               usb_core_driver_enabled(USB_DRIVER_IAP) ? "iAP" : ""
+#else
+               ""
+#endif
+               );
 #ifdef USB_ENABLE_AUDIO
     y += lh;
     if (usb_audio_get_active())                     /* v77: Mass Storage + USB DAC */
@@ -250,6 +272,11 @@ static void handle_usb_events(struct viewport *title)
 #else
         if (global_settings.usb_hid)
         {
+#ifdef USB_STATS
+            /* v81: with USB HID on (Rockbox's default) this branch runs, and v76-v80 drew the statistics only in the
+               other one: they never appeared */
+            usb_stats_draw(usb_stats_logo);
+#endif
             button = get_hid_usb_action();
             if (button == ACTION_USB_HID_MODE_SWITCH_NEXT ||
                 button == ACTION_USB_HID_MODE_SWITCH_PREV)
@@ -532,6 +559,15 @@ int bcm_usb_dac_status(void)
             d->putsxyf(4, y, "Buffer   %d   underruns %d  overruns %d  dropped %d", usb_audio_get_prebuffering(),
                        under, over, usb_audio_get_frames_dropped()); y += lh;
         }
+        d->putsxyf(4, y, "USB      %s%s%s%s", usb_core_driver_enabled(USB_DRIVER_MASS_STORAGE) ? "storage " : "",
+                   usb_core_driver_enabled(USB_DRIVER_AUDIO) ? "DAC " : "(no DAC) ",
+                   usb_core_driver_enabled(USB_DRIVER_HID) ? "HID " : "",
+#ifdef USB_ENABLE_IAP
+                   usb_core_driver_enabled(USB_DRIVER_IAP) ? "iAP" : ""
+#else
+                   ""
+#endif
+                   ); y += lh;
         d->putsxyf(4, y, "Output   %s", sk == PCM_SINK_BUILTIN ? "headphones / dock line-out" :
 #ifdef HAVE_PIEZO_SPEAKER
                                          sk == PCM_SINK_PIEZO ? "click speaker" :
