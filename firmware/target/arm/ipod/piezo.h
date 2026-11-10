@@ -36,4 +36,5 @@ void piezo_play_tune(const unsigned short *notes);   /* {hz, ms} ..., {0, 0}; hz
 void piezo_play_samples(const unsigned char *u8, unsigned n, unsigned rate);   /* 8-bit unsigned at `rate` Hz */
 void piezo_settings(int method, int carrier, int boost, int speaker, int quality, int loudness);
 extern volatile bool piezo_docked;
+void piezo_set_clarity(int c);                  /* v86: 0 off, 1 +4 dB, 2 +10 dB at ~3 kHz */
 void piezo_set_max(int mode);                   /* v80: 0 custom, 1 Maximum Loudness, 2 Highest Quality */

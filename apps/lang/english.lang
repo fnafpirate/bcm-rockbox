@@ -18795,3 +18795,71 @@
     ipodvideo: "Full Speed (12 Mbit/s)"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_PIEZO_SD
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Sigma-delta (loudest sound)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Sigma-delta (loudest sound)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Sigma-delta (loudest sound)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_Q_VHIGH
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Very High (45 kHz)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Very High (45 kHz)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Very High (45 kHz)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_CLARITY
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Clarity (voice boost)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Clarity (voice boost)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Clarity (voice boost)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_STRONG
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Strong"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Strong"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Strong"
+  </voice>
+</phrase>

@@ -2486,6 +2486,38 @@ static int update_fat_entry_ex(struct bpb *fat_bpb, unsigned long entry,
     return 0;
 }
 
+#ifndef BOOTLOADER
+/* bcm overlay v86: the first free cluster, from big direct reads of the bitmap (16 KB at a time, 32 bits per test).
+   Only a starting hint: the search below checks every bit through the cache (which may hold newer sectors), so a stale
+   disk copy cannot make it hand out a used cluster.  Without this, the first file written after mounting a well-filled
+   exFAT volume (a setting, a playlist, a log) went through the bitmap one 512-byte cached sector at a time from the
+   start -- up to ~4000 single-sector reads on a full 2 TB volume with 128 KB clusters. */
+static unsigned long exfat_first_free_hint(struct bpb *fat_bpb)
+{
+    const unsigned long total = fat_bpb->dataclusters;
+    const unsigned long per = sizeof(exfat_bitmap_buf) / LOG_SECTOR_SIZE(fat_bpb);
+    const unsigned long nsec = (total + LOG_SECTOR_SIZE(fat_bpb) * 8 - 1) / (LOG_SECTOR_SIZE(fat_bpb) * 8);
+    unsigned long bit0 = 0;
+    for (unsigned long s = 0; s < nsec; s += per, bit0 += per * LOG_SECTOR_SIZE(fat_bpb) * 8)
+    {
+        unsigned long n = MIN(per, nsec - s);
+        if (storage_read_sectors(IF_MD(fat_bpb->drive,) fat_bpb->startsector + fat_bpb->ex_bitmap_sector + s,
+                                 n, exfat_bitmap_buf) < 0)
+            return 0;
+        const uint32_t *w = (const uint32_t *)exfat_bitmap_buf;
+        for (unsigned long i = 0; i < n * LOG_SECTOR_SIZE(fat_bpb) / 4; i++)
+            if (w[i] != 0xffffffffu)
+            {
+                unsigned long b = bit0 + i * 32;
+                uint32_t v = w[i];
+                while (v & 1) { v >>= 1; b++; }
+                return b < total ? b + 2 : 0;
+            }
+    }
+    return 0;
+}
+#endif
+
 static long find_free_cluster_ex(struct bpb *fat_bpb, long startcluster)
 {
     const unsigned long total = fat_bpb->dataclusters;
@@ -2493,6 +2525,14 @@ static long find_free_cluster_ex(struct bpb *fat_bpb, long startcluster)
     unsigned long idx = (startcluster >= 2 && (unsigned long)startcluster <= total + 1) ?
                         (unsigned long)startcluster - 2 : 0;
     unsigned long checked = 0;
+#ifndef BOOTLOADER
+    if (idx == 0 && fat_bpb->fsinfo.nextfree == 0xffffffff)
+    {
+        unsigned long h = exfat_first_free_hint(fat_bpb);
+        if (h >= 2)
+            idx = h - 2;
+    }
+#endif
 
     while (checked < total + 8)
     {
@@ -2509,6 +2549,14 @@ static long find_free_cluster_ex(struct bpb *fat_bpb, long startcluster)
         while (idx < end)
         {
             unsigned long b = idx % bps;
+#ifndef BOOTLOADER
+            if (!(b & 31) && idx + 32 <= end && *(const uint32_t *)(buf + b / 8) == 0xffffffffu)
+            {   /* v86: 32 used clusters at a time */
+                idx += 32;
+                checked += 32;
+                continue;
+            }
+#endif
             if (!(b & 7) && idx + 8 <= end && buf[b / 8] == 0xff)
             {
                 idx += 8;

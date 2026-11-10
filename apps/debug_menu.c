@@ -2916,6 +2916,10 @@ extern unsigned bcm_get_boot_info(unsigned snap[4]);
 #include "wmcodec.h"
 #include "wm8758.h"
 #include "backlight-target.h"   /* v56: _backlight_hw_enable() -- dark before the panel is switched off */
+#ifndef SIMULATOR
+#include "piezo.h"         /* v86: the click speaker plays video sound through Rockbox */
+#include "pcm_sink.h"
+#endif
 #define BCM_TESTFILE_PATH BCM_VC_ROOT "/../../testfile.txt"   /* -> /.rockbox/testfile.txt: first line = video path */
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
@@ -3621,7 +3625,15 @@ static int m4_next(uint32_t *ts_ms, bool *key)
 
     *key = false;
     ra_stream = 0;
-    if (size == 0 || size > M4_RAW_MAX || !m4_rdd(off, m4_raw, size)) return -1;
+    if (size > M4_RAW_MAX)
+    {   /* v86: say why (the VideoCore's frame buffer -- PDS buffer A -- holds 64 KB; bigger frames are dropped) */
+        static int warned;
+        if (warned++ < 3)
+            BLOG("  frame %u is %u KB: over the 60 KB a frame may have -- dropped.  Re-encode with a VBV limit, e.g. "
+                 "ffmpeg ... -maxrate 2000k -bufsize 480k", (unsigned)m4.idx, (unsigned)(size / 1024));
+        return -1;
+    }
+    if (size == 0 || !m4_rdd(off, m4_raw, size)) return -1;
     for (p = 0; p + m4.nal_len <= size; )                               /* pass 1: is there an IDR? */
     {
         n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | m4_raw[p + k];
@@ -4366,7 +4378,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v85 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v86 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -7120,6 +7132,16 @@ static void bcm_playback_probe(void)
                  (unsigned)m4.timescale, (unsigned)m4.stsz_n, (unsigned)m4.ps_len);
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
+            {   /* v86: the stock firmware stops at 320x240 / 768 kbit/s; the decoder itself is meant for VGA (640x480) at
+                   up to 30 fps.  Above that: a warning (it is still tried). */
+                uint32_t fps10 = m4_dur_ms ? (uint32_t)((uint64_t)m4.stsz_n * 10000ULL / m4_dur_ms) : 0;
+                BLOG("video: %ux%u, %u.%u fps, %u kbit/s average%s", (unsigned)m4.width, (unsigned)m4.height,
+                     (unsigned)(fps10 / 10), (unsigned)(fps10 % 10), (unsigned)(m4_br / 1000),
+                     m4.width > 320 || m4.height > 240 ? " -- above the stock 320x240 limit (the hardware is meant to "
+                                                         "do 640x480 at 30 fps)" : "");
+                if (m4.width * m4.height > 640 * 480 || fps10 > 305 || m4.level > 30)
+                    BLOG("WARNING: over 640x480 / 30 fps / level 3.0 -- the VideoCore may refuse it or drop frames");
+            }
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
             if (pre == -100) st_begin(video);           /* v73: subtitles (v78: done by the helper when it ran) */
             {   /* v45: the overlay shows the file name without folder and extension */
@@ -7135,6 +7157,15 @@ static void bcm_playback_probe(void)
             bcm_pds_map_stream(0, cfg_map);                 /* type 1 (video) -> buffer A (cap 0x10000, stock); audio would be B */
             v_sound = cfg_sound; v_fallback = false;
             if (v_sound == 2 && !ma.ok) { BLOG("no AAC track found -- no VC sound"); v_sound = cfg_sound ? 1 : 0; }
+#ifndef SIMULATOR
+            if (v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO)
+            {   /* v86: the VideoCore's sound goes straight to the headphone codec, past Rockbox's mixer, so the click
+                   speaker never got it (v77-v85: silent videos).  Rockbox decodes the AAC track instead (the v51 route,
+                   kept in step with the picture), and the mixer sends it to the click speaker. */
+                BLOG("audio: the click speaker plays the sound -> Rockbox decodes the AAC track (sound=1)");
+                v_sound = 1;
+            }
+#endif
             if (v_sound == 2)
             {
                 bcm_pds_map_stream(1, 1);                   /* v53: stream 1 (AAC) -> buffer B (cap 0x4000), like stock */
@@ -7345,7 +7376,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v85, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v86, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");

@@ -243,11 +243,12 @@ MENUITEM_SETTING(bcm_piezo_shutdown_item, &global_settings.bcm_piezo_shutdown, N
 MENUITEM_FUNCTION(bcm_piezo_test_item, 0, ID2P(LANG_PIEZO_TEST), bcm_piezo_test, NULL, Icon_NOICON);
 MENUITEM_SETTING(bcm_piezo_quality_item, &global_settings.bcm_piezo_quality, NULL);       /* v78 */
 MENUITEM_SETTING(bcm_piezo_loudness_item, &global_settings.bcm_piezo_loudness, NULL);     /* v78 */
+MENUITEM_SETTING(bcm_piezo_clarity_item, &global_settings.bcm_piezo_clarity, NULL);       /* v86 */
 MENUITEM_SETTING(bcm_piezo_max_item, &global_settings.bcm_piezo_max, NULL);               /* v80 */
 MENUITEM_FUNCTION(bcm_piezo_music_item, 0, ID2P(LANG_PIEZO_TEST_MUSIC), bcm_piezo_test_music, NULL, Icon_NOICON);
 MAKE_MENU(bcm_piezo_menu, ID2P(LANG_PIEZO_MENU), NULL, Icon_Audio,
           &bcm_piezo_speaker_item, &bcm_piezo_max_item, &bcm_piezo_method_item, &bcm_piezo_carrier_item, &bcm_piezo_quality_item,
-          &bcm_piezo_boost_item, &bcm_piezo_loudness_item, &bcm_piezo_boot_item, &bcm_piezo_shutdown_item,
+          &bcm_piezo_boost_item, &bcm_piezo_loudness_item, &bcm_piezo_clarity_item, &bcm_piezo_boot_item, &bcm_piezo_shutdown_item,
           &bcm_piezo_test_item, &bcm_piezo_music_item);
 #endif
 

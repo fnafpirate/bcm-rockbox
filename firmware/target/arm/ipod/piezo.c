@@ -96,12 +96,6 @@ static inline void pz_out(unsigned level)
     else pz_quiet = 0;
     if (pz_quiet >= pz_quiet_max)
         v = 0;
-    else if (piezo_max == 1)
-    {   /* v80: full square wave (duty 50 %) whenever there is sound; a little shading in the quietest part */
-        unsigned a = d < 0 ? -d : d;
-        a = a >= 16 ? 128 : a * 8;
-        v = 0x80000000 | (a << 16) | pz_per;
-    }
     else if (piezo_method == 1)
     {   /* resonant: the carrier's strength follows the sound's size (|d|, 0..127 -> duty 0..50 %) */
         unsigned a = d < 0 ? -d : d;
@@ -117,7 +111,7 @@ static inline void pz_out(unsigned level)
 }
 static void pz_set_carrier(void)
 {
-    pz_per = piezo_carrier > 0 ? (unsigned)piezo_carrier : (piezo_method == 1 || piezo_max == 1) ? 26 : 4;
+    pz_per = piezo_carrier > 0 ? (unsigned)piezo_carrier : piezo_method == 1 ? 26 : 4;
 }
 
 /* ---- v78: shaping the sound for the element.  A piezo disc has almost no bass and a strong resonance (a few kHz);
@@ -132,10 +126,45 @@ static int32_t dsp_x1, dsp_y1, dsp_env = 256, dsp_err, dsp_err2;
 static int dsp_hp_a = 26900;      /* q15 */
 static int dsp_agc = 256;         /* q8 */
 static unsigned dsp_n;
+/* v86: presence EQ -- a peak around 3 kHz, where the element is most efficient and where speech is understood.  Maximum
+   Loudness +10 dB at 3.2 kHz (with the bass cut at 500 Hz), Highest Quality +4 dB at 3 kHz, Custom: "Clarity" setting.
+   A biquad (RBJ peaking EQ), q14 coefficients, computed on the PC for each tick rate and gain (no floating point
+   here). */
+static int dsp_eq_on;
+static int32_t eq_b0, eq_b1, eq_b2, eq_a1, eq_a2, eq_x1, eq_x2, eq_y1, eq_y2;
+int piezo_clarity;                /* 0 off, 1 +4 dB, 2 +10 dB at ~3 kHz */
+static void dsp_eq_init(void)
+{
+    /* {b0, b1, b2, a1, a2} q14; rows: [11111 Hz, 22222 Hz] x [+4 dB 3 kHz Q 0.9, +10 dB 3.2 kHz Q 0.8] */
+    static const int32_t c[2][2][5] = {
+        { { 19302, 2857, 3488, 2857, 6406 }, { 25402, 5777, -976, 5777, 8043 } },          /* 11111 Hz */
+        { { 18767, -16280, 5851, -16280, 8235 }, { 24055, -15862, 1619, -15862, 9289 } },  /* 22222 Hz */
+    };
+    int k = piezo_max == 1 ? 2 : piezo_max == 2 ? 1 : piezo_clarity;
+    eq_x1 = eq_x2 = eq_y1 = eq_y2 = 0;
+    dsp_eq_on = k;
+    if (k)
+    {
+        const int32_t *q = c[pz_tick_us <= 50][k - 1];
+        eq_b0 = q[0]; eq_b1 = q[1]; eq_b2 = q[2]; eq_a1 = q[3]; eq_a2 = q[4];
+    }
+}
+static inline int32_t dsp_eq(int32_t x)
+{
+    int32_t y = (int32_t)(((int64_t)eq_b0 * x + (int64_t)eq_b1 * eq_x1 + (int64_t)eq_b2 * eq_x2
+                           - (int64_t)eq_a1 * eq_y1 - (int64_t)eq_a2 * eq_y2) >> 14);
+    if (y > 98304) y = 98304; else if (y < -98304) y = -98304;   /* keeps the feedback bounded */
+    eq_x2 = eq_x1; eq_x1 = x; eq_y2 = eq_y1; eq_y1 = y;
+    return y;
+}
 static void dsp_reset(void)
 {
     dsp_x1 = dsp_y1 = dsp_err = dsp_err2 = 0; dsp_env = 256; dsp_agc = 256; dsp_n = 0;
-    dsp_hp_a = pz_tick_us <= 50 ? 29700 : 26900;  /* exp(-2 pi 350 / fs) */
+    if (piezo_max == 1)
+        dsp_hp_a = pz_tick_us <= 50 ? 28448 : 24698;  /* v86 Maximum Loudness: bass cut at 500 Hz */
+    else
+        dsp_hp_a = pz_tick_us <= 50 ? 29700 : 26900;  /* exp(-2 pi 350 / fs) */
+    dsp_eq_init();
     pz_quiet_max = (int)PZ_RATE / 20;
 }
 static inline unsigned dsp_run(int32_t x, int gain_q12, int boost)
@@ -143,6 +172,7 @@ static inline unsigned dsp_run(int32_t x, int gain_q12, int boost)
     int32_t y, a, v, q;
     y = (dsp_hp_a * (dsp_y1 + x - dsp_x1)) >> 15;
     dsp_x1 = x; dsp_y1 = y;
+    if (dsp_eq_on) y = dsp_eq(y);                 /* v86 */
     if (y > 32767) y = 32767; else if (y < -32767) y = -32767;
     if (piezo_max == 1)
     {   /* v80: everything up: x16 gain on quiet parts, no volume, hard limit */
@@ -165,7 +195,7 @@ static inline unsigned dsp_run(int32_t x, int gain_q12, int boost)
     {
         a = y < 0 ? -y : y;
         if (a > dsp_env) dsp_env += (a - dsp_env) >> 2;                  /* attack ~0.4 ms */
-        else dsp_env -= dsp_env >> (pz_tick_us <= 50 ? 12 : 11);       /* release ~0.2 s */
+        else dsp_env -= dsp_env >> (pz_tick_us <= 50 ? 12 : 11);   /* release ~0.2 s */
         if (dsp_env < 64) dsp_env = 64;
         if (!(++dsp_n & 31))
         {   /* aim the envelope at ~1/3 of full scale; between x1 and x8 */
@@ -527,6 +557,15 @@ static void piezo_thread(void)
 #ifdef HAVE_PIEZO_SPEAKER_CODE
                 sk_route();
                 pz_timer_check();
+                {   /* v86: the CPU at full speed while music / video sound plays on the click speaker (its interrupt runs
+                       up to 45000 times a second; at the 30 MHz Rockbox idles at, that is too much) */
+                    static bool boosted;
+                    if (sk_run != boosted)
+                    {
+                        boosted = sk_run;
+                        cpu_boost(boosted);
+                    }
+                }
 #endif
                 break;
         }
@@ -572,6 +611,11 @@ void piezo_play_samples(const unsigned char *u8, unsigned n, unsigned rate)
     sk_calc_step();
     queue_post(&piezo_queue, Q_PIEZO_SAMPLES, 0);
 }
+void piezo_set_clarity(int c)              /* v86 */
+{
+    piezo_clarity = c;
+    dsp_eq_init();
+}
 void piezo_set_max(int mode)
 {
     piezo_max = mode;
@@ -587,6 +631,7 @@ void piezo_settings(int method, int carrier, int boost, int speaker, int quality
     piezo_speaker_mode = speaker;
     piezo_loudness = loudness;
     pz_set_carrier();
+    dsp_eq_init();
     if (us != pz_tick_us)
     {
         pz_tick_us = us;
