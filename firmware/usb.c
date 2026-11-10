@@ -128,6 +128,7 @@ static int usb_audio = 0;
    iPod stays usable while it plays to the car; and the identity used for it (usb_core.c) */
 bool usb_iap_only;
 int usb_iap_ident;
+bool usb_force_full_speed;      /* v82: read by usb-drv-arc.c usb_drv_init() */
 extern void usb_core_set_ident(int ident);
 #endif
 static bool usb_host_present = false;
@@ -858,6 +859,14 @@ bool usb_inserted(void)
 }
 
 #if defined(USB_FULL_INIT)
+#ifdef IPOD_VIDEO
+/* bcm overlay v82: storage is (being made) exclusive: the other threads stop / are stopped for USB */
+bool usb_exclusive_storage_pending(void)
+{
+    return exclusive_storage_requested;
+}
+#endif
+
 bool usb_exclusive_storage(void)
 {
     /* Storage isn't actually exclusive until slave mode has been entered */

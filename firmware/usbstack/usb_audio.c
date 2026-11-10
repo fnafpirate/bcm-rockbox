@@ -515,9 +515,19 @@ static void usb_audio_init(void)
     }
 }
 
+#ifdef IPOD_VIDEO
+extern bool usb_exclusive_storage_pending(void);
+#endif
 int usb_audio_request_buf(void)
 {
     // stop playback first thing
+#ifdef IPOD_VIDEO
+    /* bcm overlay v82: not while storage is exclusive.  audio_stop() waits for the audio thread, which is stopped for
+       USB then (it stopped playback itself on SYS_USB_CONNECTED): with Mass Storage + USB DAC a second SET_CONFIGURATION
+       or a bus reset from the computer hung the USB thread here -- the drive vanished and Windows said "USB device not
+       recognized" while the iPod stayed on its USB screen. */
+    if (!usb_exclusive_storage_pending())
+#endif
     audio_stop();
 
     // attempt to allocate the receive buffers

@@ -914,6 +914,10 @@ void bcm_usb_apply(int preset)
     usb_set_mode(global_settings.usb_mode);
     usb_set_audio(global_settings.usb_audio);
     usb_iap_only = preset == 4;
+    {   /* v82: DAC presets at full speed unless USB DAC Speed = High */
+        extern bool usb_force_full_speed;
+        usb_force_full_speed = preset >= 1 && preset <= 3 && !global_settings.bcm_usb_dac_hs;
+    }
     usb_iap_ident = global_settings.bcm_usb_ident;
     usb_charge_suspend_set(preset == 3);
     if (menu && usb_inserted())

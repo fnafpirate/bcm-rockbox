@@ -275,9 +275,11 @@ static void handle_usb_events(struct viewport *title)
 #ifdef USB_STATS
             /* v81: with USB HID on (Rockbox's default) this branch runs, and v76-v80 drew the statistics only in the
                other one: they never appeared */
-            usb_stats_draw(usb_stats_logo);
 #endif
             button = get_hid_usb_action();
+#ifdef USB_STATS
+            usb_stats_draw(usb_stats_logo);
+#endif
             if (button == ACTION_USB_HID_MODE_SWITCH_NEXT ||
                 button == ACTION_USB_HID_MODE_SWITCH_PREV)
                 draw_usb_keypad_mode(title);
@@ -288,7 +290,7 @@ static void handle_usb_events(struct viewport *title)
             /* hid emits the event in get_action */
             send_event(GUI_EVENT_ACTIONUPDATE, NULL);
 #ifdef USB_STATS
-            usb_stats_draw(usb_stats_logo);
+            usb_stats_draw(usb_stats_logo);         /* after the event: anything it redrew is covered again */
             button = button_get_w_tmo(HZ/4);
 #else
             button = button_get_w_tmo(HZ/2);
@@ -332,7 +334,13 @@ static void usb_screen_fix_viewports(struct screen *screen,
         logo_height = BMPHEIGHT_usblogo;
     }
 
+#ifdef USB_STATS
+    /* v82: no theme on the main screen while the statistics are up: the theme's status bar / USB graphics were drawn
+       over (and under) the panel at every refresh.  The theme comes back when the USB screen ends. */
+    viewportmanager_theme_enable(screen->screen_type, screen->screen_type != SCREEN_MAIN, parent);
+#else
     viewportmanager_theme_enable(screen->screen_type, true, parent);
+#endif
 
     if (logo_width  > parent->width)
         logo_width  = parent->width;
@@ -472,12 +480,19 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
         font_disable_all();
     }
     usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
+#ifdef USB_STATS
+    fb_data *saved_backdrop = lcd_get_backdrop();
+    lcd_set_backdrop(NULL);                           /* v82: a plain background (the theme's picture comes back after) */
+#endif
     usb_screens_draw(usb_screen_vps_ar);
 #ifdef USB_STATS
     usb_stats_logo = &usb_screen_vps_ar[SCREEN_MAIN].logo;
     usb_stats_start();
 #endif
     handle_usb_events(title);
+#ifdef USB_STATS
+    lcd_set_backdrop(saved_backdrop);
+#endif
 
 #if defined(USB_ENABLE_HID)
     if (global_settings.usb_hid)

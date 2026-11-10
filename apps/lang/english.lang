@@ -18744,3 +18744,54 @@
     ipodvideo: "Highest Quality"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_USB_DAC_SPEED
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB DAC Speed"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB DAC Speed"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB DAC Speed"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_DAC_SPEED_HS
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "High Speed (480 Mbit/s)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "High Speed (480 Mbit/s)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "High Speed (480 Mbit/s)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_DAC_SPEED_FS
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Full Speed (12 Mbit/s)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Full Speed (12 Mbit/s)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Full Speed (12 Mbit/s)"
+  </voice>
+</phrase>

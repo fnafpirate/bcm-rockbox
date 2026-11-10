@@ -500,6 +500,16 @@ void usb_drv_init(void)
     /* Force device to full speed */
     /* See 32.9.5.9.2 */
     REG_PORTSC1 |= PORTSCX_PORT_FORCE_FULL_SPEED;
+#elif defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    /* bcm overlay v82: USB DAC presets connect at full speed (12 Mbit/s): USB Audio Class 1 is a full-speed design and
+       the isochronous OUT path of this controller is unproven at high speed (Settings: USB DAC Speed) */
+    {
+        extern bool usb_force_full_speed;
+        if (usb_force_full_speed)
+            REG_PORTSC1 |= PORTSCX_PORT_FORCE_FULL_SPEED;
+        else
+            REG_PORTSC1 &= ~PORTSCX_PORT_FORCE_FULL_SPEED;
+    }
 #endif
 
     init_control_queue_heads();

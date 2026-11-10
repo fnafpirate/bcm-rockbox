@@ -1075,6 +1075,15 @@ static void hp_lo_select_apply(int arg)
 #endif /* __PCTOOL__ */
 
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+static void bcm_usb_dac_hs_cb(bool v)
+{
+    (void)v;
+    bcm_usb_apply(-1);
+}
+#else
+#define bcm_usb_dac_hs_cb NULL
+#endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
 /* bcm overlay v77: the click speaker settings take effect at once */
 #include "bcm_piezo.h"
 static void bcm_piezo_setting_cb(int v)
@@ -1378,6 +1387,8 @@ const struct settings_list settings[] = {
                    ID2P(LANG_USB_CONN_MANUAL)),
     CHOICE_SETTING(0, bcm_usb_ident, LANG_USB_IDENT, 1, "car mode identity", "rockbox,ipod,iphone", NULL, 3,
                    ID2P(LANG_USB_IDENT_ROCKBOX), ID2P(LANG_USB_IDENT_IPOD), ID2P(LANG_USB_IDENT_IPHONE)),
+    BOOL_SETTING(0, bcm_usb_dac_hs, LANG_USB_DAC_SPEED, false, "usb dac speed", "full,high",
+                 LANG_USB_DAC_SPEED_HS, LANG_USB_DAC_SPEED_FS, bcm_usb_dac_hs_cb),
 #endif
     /* bcm overlay v77: the click speaker (apps/bcm_piezo.c) */
     CHOICE_SETTING(0, bcm_piezo_speaker, LANG_PIEZO_SPEAKER, 0, "click speaker", "off,no headphones,always",
