@@ -478,6 +478,18 @@ static void init_endpoint(int ep, int type, int mps) {
             mps = usb_drv_port_speed() ? 512 : 64;
         }
     }
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    {   /* bcm overlay v83: the receive (OUT) side of an isochronous endpoint: Mult 1 (as before) or 0 -- what Linux's
+           ChipIdea driver uses for isochronous OUT (only its IN side gets a Mult).  Chosen in USB DAC Status (SELECT),
+           used from the next connection.  Only the USB DAC has an isochronous OUT endpoint. */
+        extern int usb_iso_rx_mult;
+        if(type == USB_ENDPOINT_XFER_ISOC && ep_dir == DIR_OUT) {
+            qh->max_pkt_length = mps << QH_MAX_PKT_LEN_POS | QH_ZLT_SEL | (unsigned)usb_iso_rx_mult << QH_MULT_POS;
+            qh->dtd.next_td_ptr = QH_NEXT_TERMINATE;
+            return;
+        }
+    }
+#endif
     if(type == USB_ENDPOINT_XFER_ISOC)
         /* FIXME: we can adjust the number of packets per frame, currently use one */
         qh->max_pkt_length = mps << QH_MAX_PKT_LEN_POS | QH_ZLT_SEL | 1 << QH_MULT_POS;

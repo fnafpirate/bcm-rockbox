@@ -129,6 +129,7 @@ static int usb_audio = 0;
 bool usb_iap_only;
 int usb_iap_ident;
 bool usb_force_full_speed;      /* v82: read by usb-drv-arc.c usb_drv_init() */
+int usb_iso_rx_mult = 1;        /* v83: usb-drv-arc.c, isochronous OUT queue head Mult (1 or 0) */
 extern void usb_core_set_ident(int ident);
 #endif
 static bool usb_host_present = false;

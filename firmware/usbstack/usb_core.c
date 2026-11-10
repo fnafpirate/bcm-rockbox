@@ -191,6 +191,8 @@ static const struct usb_string_descriptor *usb_ident_string(int index)
 #endif
 
 static int usb_address = 0;
+unsigned usb_core_diag_resets, usb_core_diag_configs;   /* bcm overlay v83: USB DAC Status */
+int usb_core_diag_state(void);
 static int usb_config = 0;
 static bool initialized = false;
 static volatile bool bus_reset_pending = false;
@@ -934,6 +936,7 @@ static int usb_core_do_set_config(uint8_t new_config)
 
     usb_config = new_config;
     usb_state = usb_config == 0 ? ADDRESS : CONFIGURED;
+    usb_core_diag_configs++;                    /* bcm overlay v83 */
 
     bool require_exclusive = false;
     bool require_cpu_boost = false;
@@ -1216,6 +1219,7 @@ void usb_core_bus_reset(void)
         do_bus_reset();
     } else {
         /* need to disconnect class drivers, defer it to usb thread */
+        usb_core_diag_resets++;                 /* bcm overlay v83 */
         usb_signal_notify(USB_NOTIFY_BUS_RESET, 0);
     }
 }
@@ -1486,3 +1490,9 @@ int usb_charging_maxcurrent(void)
     return 100;
 }
 #endif
+
+/* bcm overlay v83: 0 default, 1 address, 2 configured (USB DAC Status) */
+int usb_core_diag_state(void)
+{
+    return usb_state == CONFIGURED ? 2 : usb_state == ADDRESS ? 1 : 0;
+}

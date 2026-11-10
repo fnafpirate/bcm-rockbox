@@ -37,6 +37,8 @@
 #include "led.h"
 #include "appevents.h"
 #include "usb_screen.h"
+#include "splash.h"
+#include "file.h"
 #include "viewport.h"
 #include "skin_engine/skin_engine.h"
 #include "playlist.h"
@@ -89,6 +91,9 @@ static void draw_usb_keypad_mode(struct viewport *title)
 
 #ifdef USB_ENABLE_AUDIO
 /* firmware/usbstack/usb_audio.c */
+struct usb_audio_diag { unsigned init_ok, init_fail, disconnects, set_alt0, set_alt1, packets, short_pkts, err_pkts,
+                        fb_sent, mixer_starts, set_freq; unsigned long last_freq; };   /* v83: same as usb_audio.c */
+extern struct usb_audio_diag usb_audio_diag;
 extern bool usb_audio_get_playing(void);
 extern unsigned long usb_audio_get_playback_sampling_frequency(void);
 extern int usb_audio_get_cur_volume(void);
@@ -245,9 +250,12 @@ static void usb_stats_draw(const struct viewport *logo)
                );
 #ifdef USB_ENABLE_AUDIO
     y += lh;
-    if (usb_audio_get_active())                     /* v77: Mass Storage + USB DAC */
-        d->putsxyf(4, y, "USB DAC %s  %lu Hz", usb_audio_get_playing() ? "playing" : "ready",
-                   usb_audio_get_playback_sampling_frequency());
+    if (usb_core_driver_enabled(USB_DRIVER_AUDIO))  /* v77: Mass Storage + USB DAC; v83: what the computer did */
+    {
+        d->putsxyf(4, y, "DAC %s %luHz open %u pkts %u err %u snd %u", !usb_audio_get_active() ? "off" :
+                   usb_audio_get_playing() ? "play" : "idle", usb_audio_get_playback_sampling_frequency(),
+                   usb_audio_diag.set_alt1, usb_audio_diag.packets, usb_audio_diag.err_pkts, usb_audio_diag.mixer_starts);
+    }
 #endif
     d->update_viewport();
     d->set_viewport(NULL);
@@ -540,67 +548,100 @@ int bcm_usb_dac_status(void)
 {
     static const char *const preset[] = { "Mass storage", "Mass storage + USB DAC", "USB DAC (charging)",
                                           "USB DAC (no charging)", "Car / accessory", "Charge only", "Manual" };
+    static const char *const st[] = { "not set up", "addressed", "configured" };
+    /* v83: everything the DAC driver saw, on screen and (when the disk is Rockbox's: not in mass storage) once a second
+       in /.rockbox/usb_dac_log.txt -- send that file */
+    extern unsigned usb_core_diag_resets, usb_core_diag_configs;
+    extern int usb_core_diag_state(void);
+    extern bool usb_exclusive_storage_pending(void);
+    extern int usb_iso_rx_mult;
     struct screen *d = &screens[SCREEN_MAIN];
     struct viewport vp;
-    int lh = font_get(FONT_SYSFIXED)->height + 2, under = 0, over = 0;
+    int lh = font_get(FONT_SYSFIXED)->height + 1, under = 0, over = 0, fd = -1;
+    long t0 = current_tick, next_log = current_tick;
     viewport_set_defaults(&vp, SCREEN_MAIN);
     vp.font = FONT_SYSFIXED;
     while (1)
     {
-        int y = 2, a, nd = sound_numdecimals(SOUND_VOLUME);
+        int y = 2, a, nd = sound_numdecimals(SOUND_VOLUME), vol = sound_current(SOUND_VOLUME);
         enum pcm_sink_ids sk = pcm_current_sink();
         bool on = usb_audio_get_active();
+        const char *out = sk == PCM_SINK_BUILTIN ? "headphones/dock" :
+#ifdef HAVE_PIEZO_SPEAKER
+                          sk == PCM_SINK_PIEZO ? "click speaker" :
+#endif
+                          "USB accessory";
         if (on && usb_audio_get_underflow()) under++;
         if (on && usb_audio_get_overflow()) over++;
         d->set_viewport(&vp);
         d->clear_viewport();
-        d->putsxyf(4, y, "USB DAC status"); y += lh + 4;
-        d->putsxyf(4, y, "Preset   %s", preset[global_settings.bcm_usb_connect % 7]); y += lh;
-        d->putsxyf(4, y, "Cable    %s", usb_inserted() ? (usb_drv_port_speed() ? "computer, USB 2.0 High Speed" :
-                                                          "computer, USB Full Speed") :
-                                       charger_inserted() ? "power only / not in use" : "not connected"); y += lh;
-        if (!on)
-            d->putsxyf(4, y, "DAC      %s", usb_audio_get_alloc_failed() ? "no buffer (stop playback, reconnect)" :
-                                            "off -- choose a USB DAC preset, reconnect");
-        else
-            d->putsxyf(4, y, "DAC      %s  %lu Hz", usb_audio_get_playing() ? "playing" : "ready, nothing playing",
-                       usb_audio_get_playback_sampling_frequency());
-        y += lh;
-        if (on)
-        {
-            a = usb_audio_get_cur_volume();
-            d->putsxyf(4, y, "Volume   computer %d dB, iPod %d dB", nd ? a / 10 : a,
-                       nd ? sound_current(SOUND_VOLUME) / 10 : sound_current(SOUND_VOLUME)); y += lh;
-            d->putsxyf(4, y, "Buffer   %d   underruns %d  overruns %d  dropped %d", usb_audio_get_prebuffering(),
-                       under, over, usb_audio_get_frames_dropped()); y += lh;
-        }
-        d->putsxyf(4, y, "USB      %s%s%s%s", usb_core_driver_enabled(USB_DRIVER_MASS_STORAGE) ? "storage " : "",
+        d->putsxyf(4, y, "USB DAC status  (MENU: back, SELECT: rx mode)"); y += lh + 3;
+        d->putsxyf(4, y, "Preset  %s", preset[global_settings.bcm_usb_connect % 7]); y += lh;
+        d->putsxyf(4, y, "USB     %s, %s, %s", usb_inserted() ? "computer" : charger_inserted() ? "power only" : "unplugged",
+                   usb_drv_port_speed() ? "high speed" : "full speed", st[usb_core_diag_state()]); y += lh;
+        d->putsxyf(4, y, "        resets %u  configs %u  functions %s%s%s", usb_core_diag_resets, usb_core_diag_configs,
+                   usb_core_driver_enabled(USB_DRIVER_MASS_STORAGE) ? "storage " : "",
                    usb_core_driver_enabled(USB_DRIVER_AUDIO) ? "DAC " : "(no DAC) ",
-                   usb_core_driver_enabled(USB_DRIVER_HID) ? "HID " : "",
-#ifdef USB_ENABLE_IAP
-                   usb_core_driver_enabled(USB_DRIVER_IAP) ? "iAP" : ""
-#else
-                   ""
-#endif
-                   ); y += lh;
-        d->putsxyf(4, y, "Output   %s", sk == PCM_SINK_BUILTIN ? "headphones / dock line-out" :
-#ifdef HAVE_PIEZO_SPEAKER
-                                         sk == PCM_SINK_PIEZO ? "click speaker" :
-#endif
-                                         "accessory (USB)"); y += lh;
-        d->putsxyf(4, y, "Power    %s%s", usb_charge_suspend ? "not drawn from USB" : charging_state() ? "charging" :
-                                          "not charging", usb_charge_suspend && battery_level() < 10 ?
-                                          " (battery low: charging anyway)" : ""); y += lh;
-        d->putsxyf(4, y, "Battery  %d %%  %d mV", battery_level(), battery_voltage()); y += lh + 4;
-        d->putsxyf(4, y, "MENU / SELECT: back");
+                   usb_core_driver_enabled(USB_DRIVER_HID) ? "HID" : ""); y += lh;
+        d->putsxyf(4, y, "DAC     %s  buffer %s  set up %u/%u", on ? "active" : "inactive",
+                   usb_audio_get_alloc_failed() ? "FAILED" : "ok", usb_audio_diag.init_ok, usb_audio_diag.init_fail); y += lh;
+        d->putsxyf(4, y, "Stream  %s  (opened %u closed %u)  %lu Hz", usb_audio_get_playing() ? "playing" : "closed",
+                   usb_audio_diag.set_alt1, usb_audio_diag.set_alt0, usb_audio_diag.last_freq); y += lh;
+        d->putsxyf(4, y, "Packets %u  (short %u, errors %u)  feedback %u", usb_audio_diag.packets, usb_audio_diag.short_pkts,
+                   usb_audio_diag.err_pkts, usb_audio_diag.fb_sent); y += lh;
+        d->putsxyf(4, y, "Buffer  %d  sound started %u  under %d over %d drop %d", usb_audio_get_prebuffering(),
+                   usb_audio_diag.mixer_starts, under, over, usb_audio_get_frames_dropped()); y += lh;
+        a = on ? usb_audio_get_cur_volume() : 0;
+        d->putsxyf(4, y, "Volume  computer %d dB, iPod %d dB", nd ? a / 10 : a, nd ? vol / 10 : vol); y += lh;
+        d->putsxyf(4, y, "Output  %s   rx mode %s", out, usb_iso_rx_mult ? "A (Mult 1)" : "B (Mult 0)"); y += lh;
+        d->putsxyf(4, y, "Power   %s, battery %d %%", usb_charge_suspend ? "not from USB" :
+                   charging_state() ? "charging" : "not charging", battery_level()); y += lh + 3;
+        d->putsxyf(4, y, fd >= 0 ? "logging to /.rockbox/usb_dac_log.txt" :
+                         usb_exclusive_storage_pending() ? "(no log: the drive belongs to the computer)" : "");
         d->update_viewport();
         d->set_viewport(NULL);
+        if (!TIME_BEFORE(current_tick, next_log) && !usb_exclusive_storage_pending())
+        {
+            next_log = current_tick + HZ;
+            if (fd < 0)
+            {
+                fd = open(ROCKBOX_DIR "/usb_dac_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+                if (fd >= 0) fdprintf(fd, "---- USB DAC status, preset %s, DAC speed setting %s\n",
+                                      preset[global_settings.bcm_usb_connect % 7],
+                                      global_settings.bcm_usb_dac_hs ? "high" : "full");
+            }
+            if (fd >= 0)
+            {
+                fdprintf(fd, "%4ld s: usb=%d speed=%s state=%s resets=%u configs=%u storage=%d dac=%d hid=%d | active=%d "
+                         "alloc_fail=%d init=%u/%u alt1=%u alt0=%u playing=%d freq=%lu | pkts=%u short=%u err=%u fb=%u | "
+                         "buf=%d started=%u under=%d over=%d drop=%d | vol pc=%d ipod=%d | out=%s rx=%d\n",
+                         (current_tick - t0) / HZ, usb_inserted(), usb_drv_port_speed() ? "high" : "full",
+                         st[usb_core_diag_state()], usb_core_diag_resets, usb_core_diag_configs,
+                         usb_core_driver_enabled(USB_DRIVER_MASS_STORAGE), usb_core_driver_enabled(USB_DRIVER_AUDIO),
+                         usb_core_driver_enabled(USB_DRIVER_HID), on, usb_audio_get_alloc_failed(),
+                         usb_audio_diag.init_ok, usb_audio_diag.init_fail, usb_audio_diag.set_alt1, usb_audio_diag.set_alt0,
+                         usb_audio_get_playing(), usb_audio_diag.last_freq, usb_audio_diag.packets,
+                         usb_audio_diag.short_pkts, usb_audio_diag.err_pkts, usb_audio_diag.fb_sent,
+                         usb_audio_get_prebuffering(), usb_audio_diag.mixer_starts, under, over,
+                         usb_audio_get_frames_dropped(), a, vol, out, usb_iso_rx_mult);
+            }
+        }
         a = get_action(CONTEXT_STD, HZ / 4);
-        if (a == ACTION_STD_CANCEL || a == ACTION_STD_OK || a == ACTION_STD_MENU)
+        if (a == ACTION_STD_CANCEL || a == ACTION_STD_MENU)
             break;
+        if (a == ACTION_STD_OK)
+        {   /* v83: the other receive mode; it is used from the next connection */
+            usb_iso_rx_mult = !usb_iso_rx_mult;
+            splash(HZ * 2, "Receive mode changed: unplug and plug in again");
+            if (fd >= 0) fdprintf(fd, "rx mode -> %s\n", usb_iso_rx_mult ? "A (Mult 1)" : "B (Mult 0)");
+        }
         if (default_event_handler(a) == SYS_USB_CONNECTED)
+        {
+            if (fd >= 0) close(fd);
             return 1;
+        }
     }
+    if (fd >= 0) close(fd);
     return 0;
 }
 #endif

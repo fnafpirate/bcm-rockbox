@@ -390,6 +390,10 @@ bool send_fb = false;
 
 /* debug screen sample count display variables */
 static unsigned long samples_received;
+/* bcm overlay v83: what the computer did with the DAC (USB DAC Status writes these to /.rockbox/usb_dac_log.txt) */
+struct usb_audio_diag { unsigned init_ok, init_fail, disconnects, set_alt0, set_alt1, packets, short_pkts, err_pkts,
+                        fb_sent, mixer_starts, set_freq; unsigned long last_freq; };
+struct usb_audio_diag usb_audio_diag;
 static unsigned long samples_received_last;
 int32_t samples_received_report;
 int buffers_filled_min;
@@ -475,6 +479,7 @@ static void encodeFBfixedpt(uint8_t arr[4], int32_t value, bool portspeed)
 
 static void set_playback_sampling_frequency(unsigned long f)
 {
+    usb_audio_diag.set_freq++; usb_audio_diag.last_freq = f;
     // only values 44.1k and higher (array is in descending order)
     for(int i = 0; i <= HW_FREQ_44; i++)
     {
@@ -778,6 +783,7 @@ static int usb_audio_set_interface(int intf, int alt)
             return -1;
         }
         usb_as_playback_intf_alt = alt;
+        if (alt) usb_audio_diag.set_alt1++; else usb_audio_diag.set_alt0++;
 
         if(usb_as_playback_intf_alt == 1)
             usb_audio_start_playback();
@@ -1182,7 +1188,11 @@ static int usb_audio_init_connection(void)
 
     // make sure we can get the buffers first...
     if (usb_audio_request_buf())
+    {
+        usb_audio_diag.init_fail++;
         return -1;
+    }
+    usb_audio_diag.init_ok++;
 
     usbaudio_active = true;
     dsp = dsp_get_config(CODEC_IDX_AUDIO);
@@ -1213,6 +1223,7 @@ static void usb_audio_disconnect(void)
 
     if(!usbaudio_active)
         return;
+    usb_audio_diag.disconnects++;
 
     usb_audio_stop_playback();
     usb_audio_free_buf();
@@ -1327,8 +1338,11 @@ static bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int le
         // we will get replies to the feedback here, don't want that to be interpreted as data.
         if (length <= 4)
         {
+            usb_audio_diag.short_pkts++;
             return true;
         }
+        usb_audio_diag.packets++;
+        if (status != 0) usb_audio_diag.err_pkts++;
 
         logf("usbaudio: frame: %d bytes: %d", usb_drv_get_frame_number(), length);
         if(status != 0)
@@ -1379,6 +1393,7 @@ static bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int le
                 .get_more = playback_audio_get_more,
             };
             mixer_channel_play_data(PCM_MIXER_CHAN_USBAUDIO, &cbs, NULL, 0);
+            usb_audio_diag.mixer_starts++;
         }
         restore_irq(oldlevel);
         retval =  true;
@@ -1425,6 +1440,7 @@ static bool usb_audio_fast_transfer_complete(int ep, int dir, int status, int le
             encodeFBfixedpt(sendFf, samples_fb, usb_drv_port_speed());
             logf("usbaudio: frame %d fbval 0x%02X%02X%02X%02X", usb_drv_get_frame_number(), sendFf[3], sendFf[2], sendFf[1], sendFf[0]);
             usb_drv_send_nonblocking(EP_ISO_FEEDBACK_IN, sendFf, usb_drv_port_speed()?4:3);
+            usb_audio_diag.fb_sent++;
 
             // debug screen counters
             //
