@@ -772,7 +772,6 @@ struct user_settings
     int bcm_video_buffer;  /* v74: 0 low-power, 1 balanced, 2 performance */
     bool bcm_tv_autoplay;  /* v74: TV show episodes: the next one follows (countdown) */
     bool bcm_dock_notify;  /* v74: notices for docks / power sources */
-    bool bcm_clock_sync;   /* v74: set the clock from the computer (clocksync.txt over USB) */
     int bcm_tv_countdown;  /* v76: TV shows: seconds before the next episode (5..10) */
     bool bcm_dock_profile; /* v76: separate sound settings while docked (line-out) */
     int bcm_piezo_speaker; /* v77: click speaker for music / video: 0 off, 1 no headphones, 2 always */

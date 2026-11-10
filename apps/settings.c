@@ -916,10 +916,6 @@ void settings_apply(bool read_disk)
 
     sound_settings_apply();
 #ifdef IPOD_VIDEO
-    {   /* bcm overlay v74: firmware/usbstack/usb_storage.c reads it */
-        extern bool usb_clocksync_enabled;
-        usb_clocksync_enabled = global_settings.bcm_clock_sync;
-    }
 #ifndef SIMULATOR
     bcm_usb_apply(-1);
     bcm_piezo_apply();           /* v77 */

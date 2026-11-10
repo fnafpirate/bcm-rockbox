@@ -38,7 +38,6 @@ Command line (also used for testing on a disk image):
                                             -> move everything from an old iPod card to a new (bigger) one:
                                                firmware partition, Rockbox, music, videos, file dates; the new
                                                exFAT fills the new card; every file is read back and compared
-  ipod_exfat_setup.py --clock-sync          -> set the clock of a connected Rockbox iPod (no admin needed)
   --ipsw FILE (with any of the above)       -> also put Apple's video files from the iPod firmware package
                                                (iPod_25.1.3.ipsw / Firmware-25.6.3) where Rockbox uses them:
                                                /.rockbox/VideoCore/ (vmcs.bin, RenderServer.bin, *.vll) and
@@ -46,12 +45,12 @@ Command line (also used for testing on a disk image):
   ipod_exfat_setup.py --install-ipsw FILE [--to DRIVE]
                                             -> copy just those onto a connected Rockbox iPod (no reformat)
 
-Clock: with "Keep the iPod clock right automatically" the small ipod_clock_sync.pyw helper starts with Windows and
-sets the clock whenever an iPod with Rockbox (bcm overlay v74 or later) is connected in USB mode.
+Clock sync (1.5-1.6) is gone: bcm overlay v85 uses Rockbox's own USB code.  1.7 removes the old helper from Windows
+start-up if it was installed.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.6'
+VERSION = '1.7'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 CHUNK = 4 << 20
 
@@ -2050,10 +2049,16 @@ def gui():
     extra = ttk.Frame(frm); extra.grid(row=17, column=0, columnspan=3, sticky='ew', pady=(6, 0))
     ttk.Label(extra, text='Connected Rockbox iPod (no reformat):').pack(side='left')
     vb = ttk.Button(extra, text='Copy video files from .ipsw'); vb.pack(side='left', padx=(8, 0))
-    ck = ttk.Button(extra, text='Set clock now'); ck.pack(side='left', padx=(8, 0))
-    auto_var = tk.BooleanVar(value=clock_helper_installed())
+    # 1.7: no clock sync (bcm overlay v85 uses Rockbox's own USB code again, which does not watch for it)
+    ck = ttk.Button(extra, text='Set clock now')
+    auto_var = tk.BooleanVar(value=False)
     auto_chk = ttk.Checkbutton(extra, text='Keep the clock right automatically', variable=auto_var)
-    auto_chk.pack(side='left', padx=(8, 0))
+    if clock_helper_installed():
+        try:
+            clock_helper_uninstall()
+            to_logfile('the clock helper was removed from Windows start-up (not used by bcm overlay v85 and later)')
+        except Exception as ex:
+            to_logfile('could not remove the clock helper: %s' % ex)
 
     def log(s):
         to_logfile(s)
@@ -2451,12 +2456,8 @@ def main2():
             sys.exit('ERROR: %s' % ex)
         return
     if '--clock-sync' in a:
-        roots = clock_sync_drives()
-        if not roots:
-            sys.exit('no iPod with Rockbox found (connect it in Rockbox USB mode)')
-        for r in roots:
-            clock_sync(r)
-        return
+        sys.exit('--clock-sync is gone: bcm overlay v85 and later use Rockbox\'s own USB code, which does not set the '
+                 'clock from the computer.  Set it on the iPod: Settings > General Settings > Time & Date.')
     if '--migrate' in a:
         if '--yes' not in a:
             sys.exit('add --yes to really erase the new drive')

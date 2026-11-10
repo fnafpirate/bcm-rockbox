@@ -72,14 +72,6 @@
 /* We don't use sizeof() here, because we *need* a multiple of 32 */
 #define MAX_CBW_SIZE 512
 
-/* bcm overlay v60 (iPod Video): Apple's disk mode writes in 32 KB halves of a double buffer (rt 0x1295c0: chunk =
- * min(buffer/2, 32 KB)); Rockbox used 24 KB.  Flash (iFlash / SD / CF) gains most from larger writes, so a solid-state
- * drive gets 64 KB chunks (the most one ARC transfer of 4 x 16 KB descriptors can carry), a hard disk Apple's 32 KB. */
-#if defined(IPOD_VIDEO) && !defined(USB_WRITE_BUFFER_SIZE) && !defined(BOOTLOADER)
-#define USB_WRITE_BUFFER_SIZE (1024*64)
-#define USB_STORAGE_RUNTIME_WRITE_CHUNK
-#endif
-
 #ifdef USB_WRITE_BUFFER_SIZE
 #define WRITE_BUFFER_SIZE USB_WRITE_BUFFER_SIZE
 #else
@@ -96,13 +88,6 @@
 #endif /* USB_WRITE_BUFFER_SIZE */
 
 #define ALLOCATE_BUFFER_SIZE (2*MAX(READ_BUFFER_SIZE,WRITE_BUFFER_SIZE))
-
-#ifdef USB_STORAGE_RUNTIME_WRITE_CHUNK
-static unsigned int write_chunk = 1024*32;
-#define WRITE_CHUNK write_chunk
-#else
-#define WRITE_CHUNK WRITE_BUFFER_SIZE
-#endif
 
 /* bulk-only class specific requests */
 #define USB_BULK_RESET_REQUEST   0xff
@@ -338,63 +323,6 @@ static void send_command_result(void *data,int size);
 static void send_command_failed_result(void);
 static void send_block_data(void *data,int size);
 static void receive_block_data(void *data,int size);
-#if CONFIG_RTC && defined(IPOD_VIDEO)
-#define USB_STAT_READ()  (usb_stat_read_bytes += \
-    (unsigned long long)MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count) * cur_cmd.block_size)
-#define USB_STAT_WRITE() (usb_stat_write_bytes += \
-    (unsigned long long)MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count) * cur_cmd.block_size)
-#else
-#define USB_STAT_READ()  do { } while (0)
-#define USB_STAT_WRITE() do { } while (0)
-#endif
-#if CONFIG_RTC && defined(IPOD_VIDEO)
-/* bcm overlay v74: clock sync from the computer without administrator rights.  A PC program (the setup tool, or its
-   "iPod Clock Sync" helper that runs in the background) writes /.rockbox/clocksync.txt =
-       "RBCLOCK1 2026-11-09 18:23:05.123 \n"
-   and flushes it.  The file's data starts a sector, so here, as the sectors come over USB, a sector beginning with
-   "RBCLOCK1 " sets the clock at once (the text was made milliseconds before).  Off with Settings > General Settings >
-   Time & Date > Set Clock From Computer.  (iTunes' own way -- the SCSI WRITE BUFFER command -- still works too.) */
-bool usb_clocksync_enabled = true;
-/* bcm overlay v76: bytes moved over USB since boot, and the time of the last transfer (the USB screen's live MB/s) */
-volatile unsigned long long usb_stat_read_bytes, usb_stat_write_bytes;
-static int clk_num(const unsigned char *p, int n)
-{
-    int v = 0;
-    while (n--)
-    {
-        if (*p < '0' || *p > '9') return -1;
-        v = v * 10 + (*p++ - '0');
-    }
-    return v;
-}
-static void clocksync_scan(const unsigned char *d, unsigned int len)
-{
-    unsigned int o;
-    for (o = 0; o + 32 <= len; o += 512)
-    {
-        const unsigned char *p = d + o;
-        struct tm tm;
-        int ms;
-        if (p[0] != 'R' || memcmp(p, "RBCLOCK1 ", 9))
-            continue;
-        p += 9;              /* YYYY-MM-DD HH:MM:SS.mmm */
-        tm.tm_year = clk_num(p, 4) - 1900; tm.tm_mon = clk_num(p + 5, 2) - 1; tm.tm_mday = clk_num(p + 8, 2);
-        tm.tm_hour = clk_num(p + 11, 2); tm.tm_min = clk_num(p + 14, 2); tm.tm_sec = clk_num(p + 17, 2);
-        ms = clk_num(p + 20, 3);
-        if (p[4] != '-' || p[7] != '-' || p[10] != ' ' || p[13] != ':' || p[16] != ':' ||
-            tm.tm_year < 120 || tm.tm_year > 199 || tm.tm_mon < 0 || tm.tm_mon > 11 || tm.tm_mday < 1 ||
-            tm.tm_mday > 31 || tm.tm_hour < 0 || tm.tm_hour > 23 || tm.tm_min < 0 || tm.tm_min > 59 ||
-            tm.tm_sec < 0 || tm.tm_sec > 59)
-            continue;
-        if (ms >= 500 && tm.tm_sec < 59) tm.tm_sec++;        /* to the nearest second (not across a minute) */
-        tm.tm_yday = 0; tm.tm_isdst = 0;
-        set_day_of_week(&tm);
-        set_time(&tm);
-        logf("clock set from the computer");
-        return;
-    }
-}
-#endif
 #if CONFIG_RTC
 static void receive_time(void);
 #endif
@@ -523,9 +451,6 @@ static int usb_handle = 0;
 static int usb_storage_init_connection(void)
 {
     logf("ums: set config");
-#ifdef USB_STORAGE_RUNTIME_WRITE_CHUNK
-    write_chunk = ata_disk_isssd() ? 1024*64 : 1024*32;     /* bcm overlay v60 */
-#endif
     /* prime rx endpoint. We only need room for commands */
     state = WAITING_FOR_COMMAND;
 
@@ -602,21 +527,21 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
             logf("scsi write %llu %d", cur_cmd.sector, cur_cmd.count);
             if(status==0) {
                 if((unsigned int)length!=(cur_cmd.block_size* cur_cmd.count)
-                  && (unsigned int)length!=WRITE_CHUNK) {
+                  && (unsigned int)length!=WRITE_BUFFER_SIZE) {
                     logf("unexpected length :%d",length);
                     break;
                 }
 
                 sector_t next_sector = cur_cmd.sector +
-                             (WRITE_CHUNK/cur_cmd.block_size);
+                             (WRITE_BUFFER_SIZE/cur_cmd.block_size);
                 unsigned int next_count = cur_cmd.count -
-                             MIN(cur_cmd.count,WRITE_CHUNK/cur_cmd.block_size);
+                             MIN(cur_cmd.count,WRITE_BUFFER_SIZE/cur_cmd.block_size);
                 int next_select = !cur_cmd.data_select;
 
                 if(next_count!=0) {
                     /* Ask the host to send more, to the other buffer */
                     receive_block_data(cur_cmd.data[next_select],
-                                       MIN(WRITE_CHUNK,next_count*cur_cmd.block_size));
+                                       MIN(WRITE_BUFFER_SIZE,next_count*cur_cmd.block_size));
                 }
 
                 /* Now write the data that just came in, while the host is
@@ -624,21 +549,15 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
 #ifdef USB_USE_RAMDISK
                 memcpy(ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
                         cur_cmd.data[cur_cmd.data_select],
-                        MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
+                        MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
                 int result = USBSTOR_WRITE_SECTORS_FILTER();
-#if CONFIG_RTC && defined(IPOD_VIDEO)
-                if (usb_clocksync_enabled)               /* bcm overlay v74 */
-                    clocksync_scan(cur_cmd.data[cur_cmd.data_select],
-                                   MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
-#endif
 
                 if (result == 0) {
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
-                        MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count),
+                        MIN(WRITE_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
-                    USB_STAT_WRITE();
                 }
 
                 if(result != 0) {
@@ -859,7 +778,6 @@ static void send_and_read_next(void)
                 cur_cmd.sector,
                 MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                 cur_cmd.data[cur_cmd.data_select]);
-        USB_STAT_READ();
         if(cur_cmd.last_result == 0)
             cur_cmd.last_result = result;
 
@@ -1288,7 +1206,6 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
-                USB_STAT_READ();
 #endif
                 send_and_read_next();
             }
@@ -1340,7 +1257,6 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
-                USB_STAT_READ();
 #endif
                 send_and_read_next();
             }
@@ -1384,7 +1300,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
             }
             else {
                 receive_block_data(cur_cmd.data[0],
-                        MIN(WRITE_CHUNK, cur_cmd.count*cur_cmd.block_size));
+                        MIN(WRITE_BUFFER_SIZE, cur_cmd.count*cur_cmd.block_size));
             }
             break;
 #ifdef STORAGE_64BIT_SECTOR
@@ -1432,7 +1348,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
             }
             else {
                 receive_block_data(cur_cmd.data[0],
-                        MIN(WRITE_CHUNK, cur_cmd.count*cur_cmd.block_size));
+                        MIN(WRITE_BUFFER_SIZE, cur_cmd.count*cur_cmd.block_size));
             }
             break;
 #endif

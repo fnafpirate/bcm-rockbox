@@ -1365,7 +1365,6 @@ const struct settings_list settings[] = {
                    NULL, 3, ID2P(LANG_BUFFER_LOW_POWER), ID2P(LANG_BUFFER_BALANCED), ID2P(LANG_BUFFER_PERFORMANCE)),
     OFFON_SETTING(0, bcm_tv_autoplay, LANG_TVS_AUTOPLAY, true, "autoplay next episode", NULL),
     OFFON_SETTING(0, bcm_dock_notify, LANG_DOCK_NOTICES, true, "dock notifications", NULL),
-    OFFON_SETTING(0, bcm_clock_sync, LANG_CLOCK_FROM_PC, true, "clock from computer", NULL),
     INT_SETTING_NOWRAP(0, bcm_tv_countdown, LANG_TVS_COUNTDOWN, 5, "next episode countdown", UNIT_SEC, 5, 10, 1,
                        NULL, NULL, NULL),
     OFFON_SETTING(0, bcm_dock_profile, LANG_DOCK_PROFILE, true, "dock line-out profile", NULL),
