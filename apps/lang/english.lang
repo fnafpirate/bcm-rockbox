@@ -18676,3 +18676,71 @@
     ipodvideo: "Test Music"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_PIEZO_MAX
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Maximum Loudness"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Maximum Loudness"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Maximum Loudness"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_MODE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Sound Mode"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Sound Mode"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Sound Mode"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_MODE_CUSTOM
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Custom (items below)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Custom (items below)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Custom (items below)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_BEST
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Highest Quality"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Highest Quality"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Highest Quality"
+  </voice>
+</phrase>

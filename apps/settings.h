@@ -785,6 +785,7 @@ struct user_settings
     bool bcm_piezo_shutdown; /* v77 */
     int bcm_piezo_quality; /* v78: 0 11 kHz, 1 22 kHz */
     bool bcm_piezo_loudness; /* v78: compressor */
+    int bcm_piezo_max;       /* v80: Sound Mode: 0 custom, 1 Maximum Loudness, 2 Highest Quality */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

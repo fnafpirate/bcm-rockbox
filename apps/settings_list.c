@@ -1396,6 +1396,8 @@ const struct settings_list settings[] = {
     CHOICE_SETTING(0, bcm_piezo_quality, LANG_PIEZO_QUALITY, 1, "click speaker quality", "normal,high",
                    bcm_piezo_setting_cb, 2, ID2P(LANG_PIEZO_Q_NORMAL), ID2P(LANG_PIEZO_Q_HIGH)),
     OFFON_SETTING(0, bcm_piezo_loudness, LANG_PIEZO_LOUDNESS, true, "click speaker loudness", bcm_piezo_bool_cb),
+    CHOICE_SETTING(0, bcm_piezo_max, LANG_PIEZO_MODE, 0, "click speaker mode", "custom,loudest,best quality",
+                   bcm_piezo_setting_cb, 3, ID2P(LANG_PIEZO_MODE_CUSTOM), ID2P(LANG_PIEZO_MAX), ID2P(LANG_PIEZO_BEST)),
 #ifdef HAVE_BATTERY_SMOOTH_API
     CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "smooth,exact", battery_reading_cb, 2,
                    ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),

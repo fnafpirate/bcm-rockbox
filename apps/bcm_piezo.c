@@ -146,9 +146,25 @@ fail:
 
 void bcm_piezo_apply(void)
 {
-    piezo_settings(global_settings.bcm_piezo_method, global_settings.bcm_piezo_carrier,
-                   global_settings.bcm_piezo_boost, global_settings.bcm_piezo_speaker,
-                   global_settings.bcm_piezo_quality, global_settings.bcm_piezo_loudness);
+    /* v80 Sound Mode: Custom = the items below; the two presets override them (the items keep their values):
+         Maximum Loudness: resonant carrier near the element's own pitch, driven full almost all the time, x16
+                           automatic gain, the volume setting ignored, 22 kHz
+         Highest Quality:  PWM DAC (cleanest), 22 kHz, Boost x2, Automatic Loudness, second-order noise shaping */
+    switch (global_settings.bcm_piezo_max)
+    {
+    case 1:
+        piezo_settings(1, 0, 3, global_settings.bcm_piezo_speaker, 1, 1);
+        break;
+    case 2:
+        piezo_settings(0, 0, 1, global_settings.bcm_piezo_speaker, 1, 1);
+        break;
+    default:
+        piezo_settings(global_settings.bcm_piezo_method, global_settings.bcm_piezo_carrier,
+                       global_settings.bcm_piezo_boost, global_settings.bcm_piezo_speaker,
+                       global_settings.bcm_piezo_quality, global_settings.bcm_piezo_loudness);
+        break;
+    }
+    piezo_set_max(global_settings.bcm_piezo_max);
 }
 
 static void play_boot(int what)

@@ -78,6 +78,10 @@ int piezo_carrier;                /* the carrier period, 0 = automatic (4 for th
 int piezo_boost = 2;              /* x1, x2, x4, x8 */
 int piezo_speaker_mode;           /* 0 off, 1 when no headphones are in, 2 always */
 int piezo_loudness = 1;           /* v78: automatic level (a compressor): quiet passages brought up */
+/* v80: Maximum Loudness -- as loud as the element goes, sound quality second: the resonant carrier (a square wave near
+   the element's own pitch, like the click), full drive almost all the time (the level of the sound decides little more
+   than on / off), the volume setting ignored, x16 automatic gain, hard clipping. */
+int piezo_max;                    /* v80: 0 custom, 1 Maximum Loudness, 2 Highest Quality */
 volatile bool piezo_docked;       /* set by the dock code (apps/iap/iap-lingo0.c): the sound goes to the dock */
 
 static unsigned pz_last;
@@ -92,6 +96,12 @@ static inline void pz_out(unsigned level)
     else pz_quiet = 0;
     if (pz_quiet >= pz_quiet_max)
         v = 0;
+    else if (piezo_max == 1)
+    {   /* v80: full square wave (duty 50 %) whenever there is sound; a little shading in the quietest part */
+        unsigned a = d < 0 ? -d : d;
+        a = a >= 16 ? 128 : a * 8;
+        v = 0x80000000 | (a << 16) | pz_per;
+    }
     else if (piezo_method == 1)
     {   /* resonant: the carrier's strength follows the sound's size (|d|, 0..127 -> duty 0..50 %) */
         unsigned a = d < 0 ? -d : d;
@@ -107,7 +117,7 @@ static inline void pz_out(unsigned level)
 }
 static void pz_set_carrier(void)
 {
-    pz_per = piezo_carrier > 0 ? (unsigned)piezo_carrier : piezo_method == 1 ? 26 : 4;
+    pz_per = piezo_carrier > 0 ? (unsigned)piezo_carrier : (piezo_method == 1 || piezo_max == 1) ? 26 : 4;
 }
 
 /* ---- v78: shaping the sound for the element.  A piezo disc has almost no bass and a strong resonance (a few kHz);
@@ -118,13 +128,13 @@ static void pz_set_carrier(void)
      3. volume (the volume setting), Boost
      4. soft clip: peaks above 3/4 of full scale are squeezed instead of cut flat
      5. 8 bits with error feedback (the rounding error goes into the next sample: less hiss in the audible band) */
-static int32_t dsp_x1, dsp_y1, dsp_env = 256, dsp_err;
+static int32_t dsp_x1, dsp_y1, dsp_env = 256, dsp_err, dsp_err2;
 static int dsp_hp_a = 26900;      /* q15 */
 static int dsp_agc = 256;         /* q8 */
 static unsigned dsp_n;
 static void dsp_reset(void)
 {
-    dsp_x1 = dsp_y1 = dsp_err = 0; dsp_env = 256; dsp_agc = 256; dsp_n = 0;
+    dsp_x1 = dsp_y1 = dsp_err = dsp_err2 = 0; dsp_env = 256; dsp_agc = 256; dsp_n = 0;
     dsp_hp_a = pz_tick_us <= 50 ? 29700 : 26900;  /* exp(-2 pi 350 / fs) */
     pz_quiet_max = (int)PZ_RATE / 20;
 }
@@ -134,6 +144,23 @@ static inline unsigned dsp_run(int32_t x, int gain_q12, int boost)
     y = (dsp_hp_a * (dsp_y1 + x - dsp_x1)) >> 15;
     dsp_x1 = x; dsp_y1 = y;
     if (y > 32767) y = 32767; else if (y < -32767) y = -32767;
+    if (piezo_max == 1)
+    {   /* v80: everything up: x16 gain on quiet parts, no volume, hard limit */
+        a = y < 0 ? -y : y;
+        if (a > dsp_env) dsp_env += (a - dsp_env) >> 2;
+        else dsp_env -= dsp_env >> (pz_tick_us <= 50 ? 12 : 11);
+        if (dsp_env < 64) dsp_env = 64;
+        if (!(++dsp_n & 31))
+        {
+            int g = dsp_env < 120 ? 256 : (int)((24000L << 8) / dsp_env);
+            dsp_agc = g < 256 ? 256 : g > 4096 ? 4096 : g;
+        }
+        y = (y * dsp_agc) >> 8;
+        if (y > 32767) y = 32767; else if (y < -32767) y = -32767;
+        (void)gain_q12; (void)boost;
+        v = y + dsp_err; q = v >> 8; dsp_err = v - (q << 8); q += 128;
+        return q < 0 ? 0 : q > 255 ? 255 : (unsigned)q;
+    }
     if (piezo_loudness)
     {
         a = y < 0 ? -y : y;
@@ -155,9 +182,21 @@ static inline unsigned dsp_run(int32_t x, int gain_q12, int boost)
         if (a > 32767) a = 32767;
         y = y < 0 ? -a : a;
     }
-    v = y + dsp_err;
-    q = v >> 8;
-    dsp_err = v - (q << 8);
+    if (piezo_max == 2)
+    {   /* v80 Highest Quality: second-order error feedback -- the 8-bit rounding noise is pushed up towards the top of
+           the band (8-11 kHz at 22 kHz) where the element and the ear are least sensitive */
+        v = y + 2 * dsp_err - dsp_err2;
+        q = v >> 8;
+        dsp_err2 = dsp_err;
+        dsp_err = v - (q << 8);
+        if (dsp_err > 4096) dsp_err = 4096; else if (dsp_err < -4096) dsp_err = -4096;
+    }
+    else
+    {
+        v = y + dsp_err;
+        q = v >> 8;
+        dsp_err = v - (q << 8);
+    }
     q += 128;
     return q < 0 ? 0 : q > 255 ? 255 : (unsigned)q;
 }
@@ -532,6 +571,12 @@ void piezo_play_samples(const unsigned char *u8, unsigned n, unsigned rate)
     smp_rate = rate;
     sk_calc_step();
     queue_post(&piezo_queue, Q_PIEZO_SAMPLES, 0);
+}
+void piezo_set_max(int mode)
+{
+    piezo_max = mode;
+    pz_set_carrier();
+    dsp_reset();
 }
 void piezo_settings(int method, int carrier, int boost, int speaker, int quality, int loudness)
 {
