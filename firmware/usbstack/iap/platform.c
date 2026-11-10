@@ -84,6 +84,30 @@ IAPBool iap_platform_get_ipod_serial_num(struct IAPContext* iap_ctx, struct IAPS
     return iap_span_append(serial, serial_num, strlen(serial_num) + 1);
 }
 
+/* rockbox bcm overlay v77: Apple device preferences, answered by the iPod's own settings (apps/iap/iap-lingo0.c) */
+#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
+extern int iap_usb_pref_get(int cls);
+extern int iap_usb_pref_set(int cls, int v, bool restore);
+#endif
+int iap_platform_get_ipod_pref(struct IAPContext* iap_ctx, uint8_t class_id) {
+    (void)iap_ctx;
+#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
+    return iap_usb_pref_get(class_id);
+#else
+    return class_id == 0x03 ? 1 : -1; /* line out used */
+#endif
+}
+
+int iap_platform_set_ipod_pref(struct IAPContext* iap_ctx, uint8_t class_id, uint8_t setting_id, uint8_t restore_on_exit) {
+    (void)iap_ctx;
+#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
+    return iap_usb_pref_set(class_id, setting_id, restore_on_exit != 0);
+#else
+    (void)class_id; (void)setting_id; (void)restore_on_exit;
+    return 0;
+#endif
+}
+
 IAPBool iap_platform_get_play_status(struct IAPContext* iap_ctx, struct IAPPlatformPlayStatus* status) {
     struct Platform* plt = iap_ctx->platform;
 

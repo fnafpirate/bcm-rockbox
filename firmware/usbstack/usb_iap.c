@@ -446,10 +446,23 @@ static void usb_iap_init(void) {
     LOG("init");
 }
 
+#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
+extern void iap_usb_gone(void); /* bcm overlay v77: video preferences "restore on exit" */
+#endif
+#ifdef IPOD_VIDEO
+#include "piezo.h"
+#endif
 static void usb_iap_disconnect(void) {
     iap_initialized = false;
     audio_pause();
+#ifdef IPOD_VIDEO
+    mixer_switch_sink(piezo_speaker_home_sink()); /* bcm overlay v77: the built-in output or the click speaker */
+#else
     mixer_switch_sink(PCM_SINK_BUILTIN);
+#endif
+#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
+    iap_usb_gone();
+#endif
     timeout_cancel(&tick_tmo);
     if(platform.aa_slot >= 0) {
         playback_release_aa_slot(platform.aa_slot);

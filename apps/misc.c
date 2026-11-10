@@ -49,6 +49,7 @@
 #include "talk.h"
 #include "audio.h"
 #include "settings.h"
+#include "bcm_piezo.h"
 #include "storage.h"
 #include "ata_idle_notify.h"
 #include "kernel.h"
@@ -433,6 +434,9 @@ static bool clean_shutdown(enum shutdown_type sd_type,
 
             /* audio_stop_recording == audio_stop for HWCODEC */
             audio_stop();
+#ifdef IPOD_VIDEO
+            bcm_piezo_shutdown();        /* bcm overlay v77 */
+#endif
 
             if (callback != NULL)
                 callback(parameter);

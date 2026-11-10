@@ -231,6 +231,25 @@ static int timestretch_callback(int action,
 #ifdef AUDIOHW_HAVE_EQ
 #endif /* AUDIOHW_HAVE_EQ */
 
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v77: the click speaker (apps/bcm_piezo.c) */
+#include "bcm_piezo.h"
+MENUITEM_SETTING(bcm_piezo_speaker_item, &global_settings.bcm_piezo_speaker, NULL);
+MENUITEM_SETTING(bcm_piezo_method_item, &global_settings.bcm_piezo_method, NULL);
+MENUITEM_SETTING(bcm_piezo_carrier_item, &global_settings.bcm_piezo_carrier, NULL);
+MENUITEM_SETTING(bcm_piezo_boost_item, &global_settings.bcm_piezo_boost, NULL);
+MENUITEM_SETTING(bcm_piezo_boot_item, &global_settings.bcm_piezo_boot, NULL);
+MENUITEM_SETTING(bcm_piezo_shutdown_item, &global_settings.bcm_piezo_shutdown, NULL);
+MENUITEM_FUNCTION(bcm_piezo_test_item, 0, ID2P(LANG_PIEZO_TEST), bcm_piezo_test, NULL, Icon_NOICON);
+MENUITEM_SETTING(bcm_piezo_quality_item, &global_settings.bcm_piezo_quality, NULL);       /* v78 */
+MENUITEM_SETTING(bcm_piezo_loudness_item, &global_settings.bcm_piezo_loudness, NULL);     /* v78 */
+MENUITEM_FUNCTION(bcm_piezo_music_item, 0, ID2P(LANG_PIEZO_TEST_MUSIC), bcm_piezo_test_music, NULL, Icon_NOICON);
+MAKE_MENU(bcm_piezo_menu, ID2P(LANG_PIEZO_MENU), NULL, Icon_Audio,
+          &bcm_piezo_speaker_item, &bcm_piezo_method_item, &bcm_piezo_carrier_item, &bcm_piezo_quality_item,
+          &bcm_piezo_boost_item, &bcm_piezo_loudness_item, &bcm_piezo_boot_item, &bcm_piezo_shutdown_item,
+          &bcm_piezo_test_item, &bcm_piezo_music_item);
+#endif
+
 MAKE_MENU(sound_settings, ID2P(LANG_SOUND_SETTINGS), NULL, Icon_Audio,
           &volume
           ,&volume_limit
@@ -270,5 +289,8 @@ MAKE_MENU(sound_settings, ID2P(LANG_SOUND_SETTINGS), NULL, Icon_Audio,
           ,&compressor_menu
 #ifdef HAVE_SPEAKER
          ,&speaker_mode
+#endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+         ,&bcm_piezo_menu
 #endif
          );

@@ -46,6 +46,7 @@
 #endif
 #include "audio.h"
 #include "settings.h"
+#include "bcm_piezo.h"
 #include "backlight.h"
 #include "status.h"
 #include "debug_menu.h"
@@ -243,6 +244,9 @@ int main(void)
     validate_start_directory_init();
     /* no calls INIT_ATTR functions after this point anymore!
      * see definition of INIT_ATTR in config.h */
+#ifdef IPOD_VIDEO
+    bcm_piezo_startup();         /* bcm overlay v77: start-up chime / "Rockbox Plus" on the click speaker */
+#endif
     CHART(">root_menu");
     root_menu();
 }

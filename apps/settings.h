@@ -290,6 +290,9 @@ void sound_settings_apply(void);
 void settings_apply_skins(void);
 
 void settings_apply(bool read_disk);
+#ifdef IPOD_VIDEO
+void bcm_usb_apply(int preset);   /* v77 */
+#endif
 void settings_apply_pm_range(void);
 #ifdef HAVE_COMPOSITE_VIDEO_OUT
 void settings_apply_videoout(int mode);
@@ -772,6 +775,16 @@ struct user_settings
     bool bcm_clock_sync;   /* v74: set the clock from the computer (clocksync.txt over USB) */
     int bcm_tv_countdown;  /* v76: TV shows: seconds before the next episode (5..10) */
     bool bcm_dock_profile; /* v76: separate sound settings while docked (line-out) */
+    int bcm_usb_connect;   /* v77: USB connection preset (settings.c bcm_usb_apply) */
+    int bcm_usb_ident;     /* v77: car mode: 0 Rockbox, 1 iPod, 2 iPhone */
+    int bcm_piezo_speaker; /* v77: click speaker for music / video: 0 off, 1 no headphones, 2 always */
+    int bcm_piezo_method;  /* v77: 0 PWM DAC, 1 resonant */
+    int bcm_piezo_carrier; /* v77: PWM period, 0 = automatic */
+    int bcm_piezo_boost;   /* v77: 0..3 = x1..x8 */
+    int bcm_piezo_boot;    /* v77: 0 off, 1 chime, 2 voice, 3 both */
+    bool bcm_piezo_shutdown; /* v77 */
+    int bcm_piezo_quality; /* v78: 0 11 kHz, 1 22 kHz */
+    bool bcm_piezo_loudness; /* v78: compressor */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

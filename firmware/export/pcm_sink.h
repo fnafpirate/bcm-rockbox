@@ -57,10 +57,19 @@ struct pcm_sink {
     unsigned long configured_freq;
 };
 
+/* bcm overlay v77: the iPod 5G/5.5G click speaker (piezo) as a (very small) loudspeaker:
+   firmware/target/arm/ipod/piezo.c */
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER) && !defined(SIMULATOR)
+#define HAVE_PIEZO_SPEAKER
+#endif
+
 enum pcm_sink_ids {
     PCM_SINK_BUILTIN = 0,
 #ifdef USB_ENABLE_IAP
     PCM_SINK_IAP,
+#endif
+#ifdef HAVE_PIEZO_SPEAKER
+    PCM_SINK_PIEZO,
 #endif
     PCM_SINK_NUM
 };

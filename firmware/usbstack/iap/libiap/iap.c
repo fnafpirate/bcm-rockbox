@@ -280,15 +280,23 @@ static int32_t handle_command(struct IAPContext* ctx, uint8_t lingo, uint16_t co
         } break;
         case IAPGeneralCommandID_GetIPodPreferences: {
             read_request(IAPGetIPodPreferencesPayload);
+            /* rockbox bcm overlay v77: the real values */
+            const int pref = iap_platform_get_ipod_pref(ctx, request->class_id);
+            if(pref < 0) {
+                return ipod_ack(command, IAPAckStatus_EBadParameter, response_span, IAPGeneralCommandID_IPodAck);
+            }
             alloc_response(IAPRetIPodPreferencesPayload);
             response->class_id   = request->class_id;
-            response->setting_id = 0; /* TODO: return actual value */
+            response->setting_id = pref;
             return IAPGeneralCommandID_RetIPodPreferences;
         } break;
         case IAPGeneralCommandID_SetIPodPreferences: {
             read_request(IAPSetIPodPreferencesPayload);
-            /* TODO: handle preferences */
-            return ipod_ack(command, IAPAckStatus_Success, response_span, IAPGeneralCommandID_IPodAck);
+            /* rockbox bcm overlay v77: handled */
+            return ipod_ack(command,
+                            (enum IAPAckStatus)iap_platform_set_ipod_pref(ctx, request->class_id, request->setting_id,
+                                                                          request->restore_on_exit),
+                            response_span, IAPGeneralCommandID_IPodAck);
         } break;
         case IAPGeneralCommandID_SetUIMode: {
             read_request(IAPSetUIModePayload);

@@ -37,6 +37,7 @@
 #include "led.h"
 #include "appevents.h"
 #include "usb_screen.h"
+#include "viewport.h"
 #include "skin_engine/skin_engine.h"
 #include "playlist.h"
 #include "misc.h"
@@ -86,6 +87,18 @@ static void draw_usb_keypad_mode(struct viewport *title)
 #endif /* USB_ENABLE_HID */
 
 
+#ifdef USB_ENABLE_AUDIO
+/* firmware/usbstack/usb_audio.c */
+extern bool usb_audio_get_playing(void);
+extern unsigned long usb_audio_get_playback_sampling_frequency(void);
+extern int usb_audio_get_cur_volume(void);
+extern int usb_audio_get_prebuffering(void);
+extern bool usb_audio_get_underflow(void);
+extern bool usb_audio_get_overflow(void);
+extern int usb_audio_get_frames_dropped(void);
+extern bool usb_audio_get_alloc_failed(void);
+#endif
+
 #ifdef USB_STATS
 /* bcm overlay v76: what the link is doing, refreshed 4 times a second (Windows' copy dialog averages over seconds):
    the speed the computer negotiated, the real read / write rate over the last second, totals and peaks of this
@@ -132,7 +145,7 @@ static void usb_stats_draw(const struct viewport *logo)
     struct screen *d = &screens[SCREEN_MAIN];
     struct viewport vp;
     unsigned long long r = usb_stat_read_bytes, w = usb_stat_write_bytes;
-    int i = us.k % 5, o, lh, y;
+    int i = us.k % 5, o, lh, y, bw;
     unsigned rr = 0, wr = 0;
     char a[24], b[24];
     us.r[i] = r; us.w[i] = w; us.t[i] = current_tick; us.k++;
@@ -151,15 +164,26 @@ static void usb_stats_draw(const struct viewport *logo)
         us.temp = usb_drive_temp();
         us.smart_next = current_tick + 20 * HZ;
     }
-    vp = *logo;
-    vp.x = 0; vp.width = LCD_WIDTH;
-    vp.y = logo->y + logo->height + 4; vp.height = LCD_HEIGHT - vp.y;
+    /* v78: its own opaque panel over whatever the theme draws there (v76 used the theme's viewport: its backdrop and
+       colours showed through, and some themes covered the numbers) */
+    viewport_set_fullscreen(&vp, SCREEN_MAIN);
+    lh = font_get(FONT_SYSFIXED)->height + 2;
+    vp.x = 2; vp.width = LCD_WIDTH - 4;
+    vp.y = logo->y + logo->height + 2;
+    vp.height = 9 * lh + 22;
+    if (vp.y + vp.height > LCD_HEIGHT) vp.y = LCD_HEIGHT - vp.height;
+    if (vp.y < 0) { vp.y = 0; vp.height = LCD_HEIGHT; }
     vp.font = FONT_SYSFIXED;
     vp.flags &= ~VP_FLAG_ALIGN_CENTER;
     d->set_viewport(&vp);
-    d->clear_viewport();
-    lh = font_get(FONT_SYSFIXED)->height + 2;
-    y = 0;
+    d->set_drawmode(DRMODE_SOLID);
+    d->set_foreground(LCD_RGBPACK(16, 20, 28));
+    d->fillrect(0, 0, vp.width, vp.height);          /* solid: no backdrop through it */
+    d->set_foreground(LCD_RGBPACK(90, 110, 140));
+    d->drawrect(0, 0, vp.width, vp.height);
+    d->set_foreground(LCD_RGBPACK(255, 255, 255));
+    d->set_background(LCD_RGBPACK(16, 20, 28));
+    y = 3;
     d->putsxyf(4, y, "Link    %s", !usb_inserted() ? "USB power only (no computer)" :
                usb_drv_port_speed() ? "USB 2.0 High Speed (480 Mbit/s)" : "USB Full Speed (12 Mbit/s)");
     y += lh;
@@ -172,10 +196,15 @@ static void usb_stats_draw(const struct viewport *logo)
     y += lh;
     /* a bar for the current rate: full = 30 MB/s */
     {
-        int bw = LCD_WIDTH - 8, fr = (int)((long)bw * (rr > 30720 ? 30720 : rr) / 30720),
-            fw = (int)((long)bw * (wr > 30720 ? 30720 : wr) / 30720);
-        d->drawrect(4, y, bw, 5); d->fillrect(4, y, fr, 5);
-        d->drawrect(4, y + 7, bw, 5); d->fillrect(4, y + 7, fw, 5);
+        int fr, fw;
+        bw = vp.width - 8;
+        fr = (int)((long)bw * (rr > 30720 ? 30720 : rr) / 30720);
+        fw = (int)((long)bw * (wr > 30720 ? 30720 : wr) / 30720);
+        d->set_foreground(LCD_RGBPACK(90, 110, 140));
+        d->drawrect(4, y, bw, 5); d->drawrect(4, y + 7, bw, 5);
+        d->set_foreground(LCD_RGBPACK(80, 200, 120)); d->fillrect(4, y, fr, 5);      /* read: green */
+        d->set_foreground(LCD_RGBPACK(240, 160, 60)); d->fillrect(4, y + 7, fw, 5);  /* write: orange */
+        d->set_foreground(LCD_RGBPACK(255, 255, 255));
         y += 16;
     }
     d->putsxyf(4, y, "CPU    %ld MHz", cpu_frequency / 1000000);
@@ -192,6 +221,12 @@ static void usb_stats_draw(const struct viewport *logo)
         d->putsxyf(4, y, "Drive  temperature not reported");
     y += lh;
     d->putsxyf(4, y, "CPU / battery temperature: no sensor");
+#ifdef USB_ENABLE_AUDIO
+    y += lh;
+    if (usb_audio_get_active())                     /* v77: Mass Storage + USB DAC */
+        d->putsxyf(4, y, "USB DAC %s  %lu Hz", usb_audio_get_playing() ? "playing" : "ready",
+                   usb_audio_get_playback_sampling_frequency());
+#endif
     d->update_viewport();
     d->set_viewport(NULL);
 }
@@ -451,3 +486,70 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     in_usb_screen = false;
 #endif
 }
+
+#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && !defined(SIMULATOR)
+/* bcm overlay v77: Settings > General Settings > System > USB > USB DAC Status -- what the USB DAC is doing (in a
+   charge-only USB DAC preset the iPod keeps its normal screens, so this is where to look) */
+#include "pcm.h"
+#include "pcm_sink.h"
+#include "sound.h"
+extern bool usb_charge_suspend;
+int bcm_usb_dac_status(void)
+{
+    static const char *const preset[] = { "Mass storage", "Mass storage + USB DAC", "USB DAC (charging)",
+                                          "USB DAC (no charging)", "Car / accessory", "Charge only", "Manual" };
+    struct screen *d = &screens[SCREEN_MAIN];
+    struct viewport vp;
+    int lh = font_get(FONT_SYSFIXED)->height + 2, under = 0, over = 0;
+    viewport_set_defaults(&vp, SCREEN_MAIN);
+    vp.font = FONT_SYSFIXED;
+    while (1)
+    {
+        int y = 2, a, nd = sound_numdecimals(SOUND_VOLUME);
+        enum pcm_sink_ids sk = pcm_current_sink();
+        bool on = usb_audio_get_active();
+        if (on && usb_audio_get_underflow()) under++;
+        if (on && usb_audio_get_overflow()) over++;
+        d->set_viewport(&vp);
+        d->clear_viewport();
+        d->putsxyf(4, y, "USB DAC status"); y += lh + 4;
+        d->putsxyf(4, y, "Preset   %s", preset[global_settings.bcm_usb_connect % 7]); y += lh;
+        d->putsxyf(4, y, "Cable    %s", usb_inserted() ? (usb_drv_port_speed() ? "computer, USB 2.0 High Speed" :
+                                                          "computer, USB Full Speed") :
+                                       charger_inserted() ? "power only / not in use" : "not connected"); y += lh;
+        if (!on)
+            d->putsxyf(4, y, "DAC      %s", usb_audio_get_alloc_failed() ? "no buffer (stop playback, reconnect)" :
+                                            "off -- choose a USB DAC preset, reconnect");
+        else
+            d->putsxyf(4, y, "DAC      %s  %lu Hz", usb_audio_get_playing() ? "playing" : "ready, nothing playing",
+                       usb_audio_get_playback_sampling_frequency());
+        y += lh;
+        if (on)
+        {
+            a = usb_audio_get_cur_volume();
+            d->putsxyf(4, y, "Volume   computer %d dB, iPod %d dB", nd ? a / 10 : a,
+                       nd ? sound_current(SOUND_VOLUME) / 10 : sound_current(SOUND_VOLUME)); y += lh;
+            d->putsxyf(4, y, "Buffer   %d   underruns %d  overruns %d  dropped %d", usb_audio_get_prebuffering(),
+                       under, over, usb_audio_get_frames_dropped()); y += lh;
+        }
+        d->putsxyf(4, y, "Output   %s", sk == PCM_SINK_BUILTIN ? "headphones / dock line-out" :
+#ifdef HAVE_PIEZO_SPEAKER
+                                         sk == PCM_SINK_PIEZO ? "click speaker" :
+#endif
+                                         "accessory (USB)"); y += lh;
+        d->putsxyf(4, y, "Power    %s%s", usb_charge_suspend ? "not drawn from USB" : charging_state() ? "charging" :
+                                          "not charging", usb_charge_suspend && battery_level() < 10 ?
+                                          " (battery low: charging anyway)" : ""); y += lh;
+        d->putsxyf(4, y, "Battery  %d %%  %d mV", battery_level(), battery_voltage()); y += lh + 4;
+        d->putsxyf(4, y, "MENU / SELECT: back");
+        d->update_viewport();
+        d->set_viewport(NULL);
+        a = get_action(CONTEXT_STD, HZ / 4);
+        if (a == ACTION_STD_CANCEL || a == ACTION_STD_OK || a == ACTION_STD_MENU)
+            break;
+        if (default_event_handler(a) == SYS_USB_CONNECTED)
+            return 1;
+    }
+    return 0;
+}
+#endif

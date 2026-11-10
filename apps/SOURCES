@@ -12,6 +12,7 @@ debug_menu.c
 #ifdef IPOD_VIDEO
 bcm_subs.c
 bcm_tvshow.c
+bcm_piezo.c
 #endif
 filetypes.c
 fileop.c

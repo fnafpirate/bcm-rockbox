@@ -83,11 +83,17 @@ static volatile bool pcm_is_ready[PCM_SINK_NUM] SHAREDBSS_ATTR = { false };
 #ifdef USB_ENABLE_IAP
 extern struct pcm_sink iap_pcm_sink;
 #endif
+#ifdef HAVE_PIEZO_SPEAKER
+extern struct pcm_sink piezo_pcm_sink;   /* bcm overlay v77 */
+#endif
 
 static struct pcm_sink* sinks[PCM_SINK_NUM] = {
     [PCM_SINK_BUILTIN] = &builtin_pcm_sink,
 #ifdef USB_ENABLE_IAP
     [PCM_SINK_IAP] = &iap_pcm_sink,
+#endif
+#ifdef HAVE_PIEZO_SPEAKER
+    [PCM_SINK_PIEZO] = &piezo_pcm_sink,
 #endif
 };
 static enum pcm_sink_ids cur_sink SHAREDBSS_ATTR = PCM_SINK_BUILTIN;

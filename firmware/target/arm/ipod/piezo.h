@@ -29,3 +29,10 @@ void piezo_clear(void);
 bool piezo_busy(void);
 unsigned int piezo_hz(unsigned int hz);
 void piezo_button_beep(bool beep, bool force);
+/* bcm overlay v77 (piezo.c) */
+bool piezo_speaker_active(void);
+int piezo_speaker_home_sink(void);              /* enum pcm_sink_ids: PCM_SINK_PIEZO or PCM_SINK_BUILTIN */
+void piezo_play_tune(const unsigned short *notes);   /* {hz, ms} ..., {0, 0}; hz 0 = rest */
+void piezo_play_samples(const unsigned char *u8, unsigned n, unsigned rate);   /* 8-bit unsigned at `rate` Hz */
+void piezo_settings(int method, int carrier, int boost, int speaker, int quality, int loudness);
+extern volatile bool piezo_docked;

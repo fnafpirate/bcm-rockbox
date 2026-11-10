@@ -888,6 +888,39 @@ void settings_apply_videoout(int mode)
 }
 #endif
 
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v77: Settings > General Settings > System > USB > USB Connection.  A preset sets USB Mode (mass storage
+   or charge-only) and USB DAC together, plus two things of its own: no power drawn from USB ("USB DAC (no charging)":
+   for a phone or tablet as the host, or less noise) and car mode (iAP over USB and its digital audio to the car, but
+   no mass storage: the iPod stays usable).  "Manual" leaves USB Mode / USB DAC as set in the same menu.
+   preset -1 = the saved one (settings_apply); a change made while connected takes effect when the cable goes back in. */
+#include "usb.h"
+#include "bcm_piezo.h"
+void bcm_usb_apply(int preset)
+{
+    static const signed char mode[6] = { USB_MODE_MASS_STORAGE, USB_MODE_MASS_STORAGE, USB_MODE_CHARGE,
+                                         USB_MODE_CHARGE, USB_MODE_MASS_STORAGE, USB_MODE_CHARGE };
+    static const signed char dac[6] = { 0, 3, 2, 2, 0, 0 };
+    extern bool usb_iap_only;
+    extern int usb_iap_ident;
+    extern void usb_charge_suspend_set(bool on);
+    bool menu = preset >= 0;
+    if (preset < 0) preset = global_settings.bcm_usb_connect;
+    if (preset < 6)
+    {
+        global_settings.usb_mode = mode[preset];
+        global_settings.usb_audio = dac[preset];
+    }
+    usb_set_mode(global_settings.usb_mode);
+    usb_set_audio(global_settings.usb_audio);
+    usb_iap_only = preset == 4;
+    usb_iap_ident = global_settings.bcm_usb_ident;
+    usb_charge_suspend_set(preset == 3);
+    if (menu && usb_inserted())
+        splash(HZ * 2, ID2P(LANG_USB_RECONNECT));
+}
+#endif
+
 void settings_apply(bool read_disk)
 {
     logf("%s", __func__);
@@ -902,6 +935,10 @@ void settings_apply(bool read_disk)
         extern bool usb_clocksync_enabled;
         usb_clocksync_enabled = global_settings.bcm_clock_sync;
     }
+#ifndef SIMULATOR
+    bcm_usb_apply(-1);
+    bcm_piezo_apply();           /* v77 */
+#endif
 #endif
 
 #ifdef HAVE_DISK_STORAGE

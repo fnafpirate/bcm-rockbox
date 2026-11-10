@@ -1074,6 +1074,33 @@ static void hp_lo_select_apply(int arg)
 
 #endif /* __PCTOOL__ */
 
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v77: the click speaker settings take effect at once */
+#include "bcm_piezo.h"
+static void bcm_piezo_setting_cb(int v)
+{
+    (void)v;
+    bcm_piezo_apply();
+}
+static void bcm_piezo_bool_cb(bool v)
+{
+    (void)v;
+    bcm_piezo_apply();
+}
+static const char *bcm_piezo_carrier_fmt(char *buf, size_t sz, int val, const char *unit)
+{
+    (void)unit;
+    if (val == 0)
+        return str(LANG_AUTO);
+    snprintf(buf, sz, "%d (%d Hz)", val, 91225 / val);
+    return buf;
+}
+#else
+#define bcm_piezo_setting_cb NULL
+#define bcm_piezo_bool_cb NULL
+#define bcm_piezo_carrier_fmt NULL
+#endif
+
 const struct settings_list settings[] = {
 /* system_status settings .resume.cfg */
     SYSTEM_STATUS_SOUND(F_NO_WRAP, volume, LANG_VOLUME, "volume", SOUND_VOLUME),
@@ -1342,6 +1369,33 @@ const struct settings_list settings[] = {
     INT_SETTING_NOWRAP(0, bcm_tv_countdown, LANG_TVS_COUNTDOWN, 5, "next episode countdown", UNIT_SEC, 5, 10, 1,
                        NULL, NULL, NULL),
     OFFON_SETTING(0, bcm_dock_profile, LANG_DOCK_PROFILE, true, "dock line-out profile", NULL),
+#if !defined(SIMULATOR)
+    /* bcm overlay v77: USB connection presets (usb_mode + usb_audio + charging + car mode) */
+    CHOICE_SETTING(0, bcm_usb_connect, LANG_USB_CONNECTION, 6, "usb connection",
+                   "mass storage,mass storage + dac,dac,dac no charging,car,charge only,manual", bcm_usb_apply, 7,
+                   ID2P(LANG_USB_CONN_MS), ID2P(LANG_USB_CONN_MS_DAC), ID2P(LANG_USB_CONN_DAC),
+                   ID2P(LANG_USB_CONN_DAC_NOCHARGE), ID2P(LANG_USB_CONN_CAR), ID2P(LANG_USB_CONN_CHARGE),
+                   ID2P(LANG_USB_CONN_MANUAL)),
+    CHOICE_SETTING(0, bcm_usb_ident, LANG_USB_IDENT, 1, "car mode identity", "rockbox,ipod,iphone", NULL, 3,
+                   ID2P(LANG_USB_IDENT_ROCKBOX), ID2P(LANG_USB_IDENT_IPOD), ID2P(LANG_USB_IDENT_IPHONE)),
+#endif
+    /* bcm overlay v77: the click speaker (apps/bcm_piezo.c) */
+    CHOICE_SETTING(0, bcm_piezo_speaker, LANG_PIEZO_SPEAKER, 0, "click speaker", "off,no headphones,always",
+                   bcm_piezo_setting_cb, 3, ID2P(LANG_OFF), ID2P(LANG_PIEZO_NO_HEADPHONES), ID2P(LANG_ALWAYS)),
+    CHOICE_SETTING(0, bcm_piezo_method, LANG_PIEZO_METHOD, 0, "click speaker method", "pwm dac,resonant",
+                   bcm_piezo_setting_cb, 2, ID2P(LANG_PIEZO_PWM_DAC), ID2P(LANG_PIEZO_RESONANT)),
+    INT_SETTING_NOWRAP(0, bcm_piezo_carrier, LANG_PIEZO_CARRIER, 0, "click speaker carrier", UNIT_INT, 0, 60, 1,
+                       bcm_piezo_carrier_fmt, NULL, bcm_piezo_setting_cb),
+    CHOICE_SETTING(0, bcm_piezo_boost, LANG_PIEZO_BOOST, 2, "click speaker boost", "x1,x2,x4,x8",
+                   bcm_piezo_setting_cb, 4, ID2P(LANG_PIEZO_X1), ID2P(LANG_PIEZO_X2), ID2P(LANG_PIEZO_X4),
+                   ID2P(LANG_PIEZO_X8)),
+    CHOICE_SETTING(0, bcm_piezo_boot, LANG_PIEZO_BOOT, 2, "click speaker start-up", "off,chime,voice,chime + voice",
+                   NULL, 4, ID2P(LANG_OFF), ID2P(LANG_PIEZO_CHIME), ID2P(LANG_PIEZO_VOICE),
+                   ID2P(LANG_PIEZO_CHIME_VOICE)),
+    OFFON_SETTING(0, bcm_piezo_shutdown, LANG_PIEZO_SHUTDOWN, false, "click speaker shutdown", NULL),
+    CHOICE_SETTING(0, bcm_piezo_quality, LANG_PIEZO_QUALITY, 1, "click speaker quality", "normal,high",
+                   bcm_piezo_setting_cb, 2, ID2P(LANG_PIEZO_Q_NORMAL), ID2P(LANG_PIEZO_Q_HIGH)),
+    OFFON_SETTING(0, bcm_piezo_loudness, LANG_PIEZO_LOUDNESS, true, "click speaker loudness", bcm_piezo_bool_cb),
 #ifdef HAVE_BATTERY_SMOOTH_API
     CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "smooth,exact", battery_reading_cb, 2,
                    ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),

@@ -114,9 +114,16 @@ static void vpref_put(int cls, int v)
         default: vpref_store[cls & 15] = v; break;
     }
 }
+static volatile bool usb_vid;     /* v77: a USB iAP accessory asked about / turned on video out */
+static bool vpref_nosave;        /* v77: a change from USB iAP (USB thread): saved later by the UI thread */
+static volatile bool vpref_save_pending;
 static int vpref_set(int cls, int v, bool restore)
 {
     int old = vpref_get(cls), max;
+    if (cls == 0x00)
+        restore = true;     /* v78: an accessory never changes Video Out for good: it comes back when the accessory goes
+                               (a dock / car that asked for "TV on" left it On, and every video went to a TV that was not
+                               there -- the iPod's screen stays dark then).  Per-dock TV choice: Video Out "Auto". */
     if (old < 0)
         return IAP_ACK_BAD_PARAM;
     max = cls == 0x00 ? 2 : cls == 0x08 ? 3 : 1;
@@ -135,7 +142,15 @@ static int vpref_set(int cls, int v, bool restore)
     if (cls == 0x00 && v == 1)
         iap_dock_video_interest();      /* v74: it turned video out on: a video dock */
     if (!restore && (cls <= 0x02 || cls == 0x0A))
-        settings_save();
+    {
+        if (vpref_nosave)
+        {
+            vpref_save_pending = true;
+            queue_broadcast(SYS_IAP_DOCK, 3);
+        }
+        else
+            settings_save();
+    }
     logf("iap: SetiPodPreferences class %d = %d%s", cls, v, restore ? " (restore on exit)" : "");
     return 0;
 }
@@ -168,6 +183,9 @@ void iap_video_prefs_restore(void)
 #include "power.h"
 #include "usb.h"
 #include "lang.h"
+#ifndef SIMULATOR
+#include "piezo.h"
+#endif
 #define DOCK_FILE ROCKBOX_DIR "/bcm_docks.txt"
 #define DOCK_MAX 32
 static struct {
@@ -225,6 +243,9 @@ static void dk_connected(void)
         snprintf(dk.key, sizeof dk.key, "lingoes %08lx pin21 %d", (unsigned long)dk.lingoes, dk.pin);
     dk.prof_tv = -1;
     dk.state = 2;
+#ifndef SIMULATOR
+    piezo_docked = true;                 /* v77: the click speaker leaves the sound to the dock */
+#endif
     dk.ui_connect = true;
     queue_broadcast(SYS_IAP_DOCK, 1);
 }
@@ -239,11 +260,19 @@ void iap_dock_pin21(int code, int was)
         strlcpy(dk.gone_name, dk.name, sizeof dk.gone_name);
         dk.gone_tv = dk.prof_tv;
         dk.state = 0;
+#ifndef SIMULATOR
+        piezo_docked = false;
+#endif
         dk.ui_disconnect = true;
         queue_broadcast(SYS_IAP_DOCK, 0);
     }
     else if (code == 15)
+    {
         dk.state = 0;
+#ifndef SIMULATOR
+        piezo_docked = false;
+#endif
+    }
     (void)was;
 }
 /* every 100 ms from the iap thread */
@@ -411,6 +440,11 @@ static struct dk_line dk_tab[DOCK_MAX];
 void iap_dock_ui(void)
 {
     bool notify = global_settings.bcm_dock_notify;
+    if (vpref_save_pending)
+    {   /* v77: a lasting video preference set over USB iAP */
+        vpref_save_pending = false;
+        settings_save();
+    }
     if (dk.ui_disconnect)
     {
         int n = dk_read(dk_tab, DOCK_MAX), i;
@@ -465,7 +499,7 @@ void iap_dock_ui(void)
 /* for the video player: -1 = no dock / nothing known, 0 = iPod screen, 1 = TV */
 int iap_dock_tv_choice(void)
 {
-    if (dk.state != 2) return -1;
+    if (dk.state != 2) return usb_vid ? 1 : -1;    /* v77: a USB iAP stereo that wants video */
     if (dk.prof_tv >= 0) return dk.prof_tv;
     return dk.video ? 1 : -1;
 }
@@ -476,6 +510,28 @@ void iap_dock_remember_tv(bool tv)
 const char *iap_dock_name(void)
 {
     return dk.state == 2 ? (dk.name[0] ? dk.name : dk.key) : NULL;
+}
+/* ---- bcm overlay v77: the same video preferences for accessories that talk iAP over USB (car stereos with a
+   USB + AV cable: iAP and audio over USB, the picture over the cable's composite plug).  libiap (firmware/usbstack/
+   iap) used to answer "video out: off" and ignore changes, so such a stereo never asked for the picture. */
+int iap_usb_pref_get(int cls)
+{
+    if (cls <= 0x02 || cls == 0x08 || cls == 0x0A) usb_vid = true;
+    return vpref_get(cls);
+}
+int iap_usb_pref_set(int cls, int v, bool restore)
+{
+    int r;
+    vpref_nosave = true;
+    r = vpref_set(cls, v, restore);
+    vpref_nosave = false;
+    if (r == 0 && cls == 0x00) usb_vid = v != 0;
+    return r;
+}
+void iap_usb_gone(void)
+{
+    usb_vid = false;
+    iap_video_prefs_restore();
 }
 #endif
 

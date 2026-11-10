@@ -18030,3 +18030,649 @@
     ipodvideo: "Dock Line-Out Profile"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_USB_CONNECTION
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB Connection"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB Connection"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB Connection"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_MS
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Mass Storage"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Mass Storage"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Mass Storage"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_MS_DAC
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Mass Storage + USB DAC"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Mass Storage + USB DAC"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Mass Storage + USB DAC"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_DAC
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB DAC (charging)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB DAC (charging)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB DAC (charging)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_DAC_NOCHARGE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB DAC (no charging)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB DAC (no charging)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB DAC (no charging)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_CAR
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Car / Accessory (iPod mode)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Car / Accessory (iPod mode)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Car / Accessory (iPod mode)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_CHARGE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Charge Only"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Charge Only"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Charge Only"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_CONN_MANUAL
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Manual (items below)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Manual (items below)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Manual (items below)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_IDENT
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Car Mode Identity"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Car Mode Identity"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Car Mode Identity"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_IDENT_ROCKBOX
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Rockbox"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Rockbox"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Rockbox"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_IDENT_IPOD
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "iPod"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "iPod"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "iPod"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_IDENT_IPHONE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "iPhone"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "iPhone"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "iPhone"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_RECONNECT
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Reconnect the cable to switch"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Reconnect the cable to switch"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Reconnect the cable to switch"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_MENU
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Click Speaker"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Click Speaker"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Click Speaker"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_SPEAKER
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Speaker for Music & Video"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Speaker for Music & Video"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Speaker for Music & Video"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_NO_HEADPHONES
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "When No Headphones"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "When No Headphones"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "When No Headphones"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_METHOD
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Method"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Method"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Method"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_PWM_DAC
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "PWM DAC (cleaner)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "PWM DAC (cleaner)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "PWM DAC (cleaner)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_RESONANT
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Resonant (louder)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Resonant (louder)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Resonant (louder)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_CARRIER
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Carrier Period"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Carrier Period"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Carrier Period"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_BOOST
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Boost"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Boost"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Boost"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_BOOT
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Start-up Sound"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Start-up Sound"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Start-up Sound"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_CHIME
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Chime"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Chime"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Chime"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_VOICE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Rockbox Plus voice"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Rockbox Plus voice"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Rockbox Plus voice"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_CHIME_VOICE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Chime + voice"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Chime + voice"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Chime + voice"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_SHUTDOWN
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Shutdown Sound"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Shutdown Sound"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Shutdown Sound"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_TEST
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Test Start-up Sound"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Test Start-up Sound"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Test Start-up Sound"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_X1
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "x1"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "x1"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "x1"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_X2
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "x2"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "x2"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "x2"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_X4
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "x4"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "x4"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "x4"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_X8
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "x8"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "x8"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "x8"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_DAC_STATUS
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB DAC Status"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB DAC Status"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB DAC Status"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_ON_TV_NOTICE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Video Out is On: playing on the TV. Hold MENU for the iPod screen"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Video Out is On: playing on the TV. Hold MENU for the iPod screen"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Video Out is On playing on the TV. Hold MENU for the iPod screen"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_QUALITY
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Quality"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Quality"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Quality"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_Q_NORMAL
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Normal (11 kHz)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Normal (11 kHz)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Normal (11 kHz)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_Q_HIGH
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "High (22 kHz)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "High (22 kHz)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "High (22 kHz)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_LOUDNESS
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Automatic Loudness"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Automatic Loudness"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Automatic Loudness"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_TEST_MUSIC
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Test Music"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Test Music"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Test Music"
+  </voice>
+</phrase>

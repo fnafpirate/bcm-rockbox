@@ -86,6 +86,9 @@ int   iap_platform_send_hid_report(struct IAPContext* iap_ctx, const void* ptr, 
 
 /* system info */
 IAPBool iap_platform_get_ipod_serial_num(struct IAPContext* iap_ctx, struct IAPSpan* serial);
+/* rockbox bcm overlay v77: Apple device preferences (video out etc.): value or -1; 0 or an IAPAckStatus */
+int iap_platform_get_ipod_pref(struct IAPContext* iap_ctx, uint8_t class_id);
+int iap_platform_set_ipod_pref(struct IAPContext* iap_ctx, uint8_t class_id, uint8_t setting_id, uint8_t restore_on_exit);
 
 /* audio controls */
 IAPBool iap_platform_get_play_status(struct IAPContext* iap_ctx, struct IAPPlatformPlayStatus* status);

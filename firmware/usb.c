@@ -123,6 +123,13 @@ static bool usb_serial = false;
 #ifdef USB_ENABLE_AUDIO
 static int usb_audio = 0;
 #endif
+#ifdef IPOD_VIDEO
+/* bcm overlay v77: car / accessory mode -- iAP over USB (and its audio to the car) without mass storage, so the
+   iPod stays usable while it plays to the car; and the identity used for it (usb_core.c) */
+bool usb_iap_only;
+int usb_iap_ident;
+extern void usb_core_set_ident(int ident);
+#endif
 static bool usb_host_present = false;
 static int usb_num_acks_to_expect = 0;
 static uint32_t usb_broadcast_seqnum = 0x80000000;
@@ -208,6 +215,9 @@ static inline void usb_configure_drivers(int for_state)
     switch(for_state)
     {
     case USB_POWERED:
+#ifdef IPOD_VIDEO
+        usb_core_set_ident(0);
+#endif
 #ifdef USB_ENABLE_STORAGE
         usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, false);
 #endif
@@ -237,8 +247,15 @@ static inline void usb_configure_drivers(int for_state)
         /* USB_POWERED: */
 
     case USB_INSERTED:
+#ifdef IPOD_VIDEO
+        usb_core_set_ident(usb_iap_only ? usb_iap_ident : 0);
+#endif
 #ifdef USB_ENABLE_STORAGE
+#ifdef IPOD_VIDEO
+        usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, !usb_iap_only);
+#else
         usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, true);
+#endif
 #endif
 #ifdef USB_ENABLE_HID
         usb_core_enable_driver(USB_DRIVER_HID, usb_hid);
@@ -247,7 +264,11 @@ static inline void usb_configure_drivers(int for_state)
         usb_core_enable_driver(USB_DRIVER_SERIAL, usb_serial);
 #endif
 #ifdef USB_ENABLE_AUDIO
+#ifdef IPOD_VIDEO
+        usb_core_enable_driver(USB_DRIVER_AUDIO, !usb_iap_only && ((usb_audio == 1) || (usb_audio == 3)));
+#else
         usb_core_enable_driver(USB_DRIVER_AUDIO, (usb_audio == 1) || (usb_audio == 3)); // while "always" or "only in mass-storage mode"
+#endif
 #endif /* USB_ENABLE_AUDIO */
 #ifdef USB_ENABLE_IAP
         usb_core_enable_driver(USB_DRIVER_IAP, true);

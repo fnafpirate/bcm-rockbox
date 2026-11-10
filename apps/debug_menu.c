@@ -3496,15 +3496,32 @@ static int mp4_open(const char *path)
             uint32_t a, b, ts, dur;
             ra_mode = cfg_ra_mode >= 0 ? cfg_ra_mode : global_settings.bcm_video_buffer;
             if (ra_mode < 0 || ra_mode > 2) ra_mode = 1;
-            if (m4_find(moov_s, moov_e, FOURCC('m','v','h','d'), &a, &b))
-            {
-                bool v1 = m4_u8(a) == 1;
-                ts = m4_u32(a + (v1 ? 20 : 12)); dur = m4_u32(a + (v1 ? 28 : 16));   /* v1: low word of the u64 */
-                if (ts && dur) br = (uint32_t)((uint64_t)fsz * 8ULL * ts / dur);
+            {   /* v78: the longest of the movie header and the tracks' own durations.  v74 used the mvhd alone, and some
+                   encoders write a short one there: "134740 kbit/s" for a 330 kbit/s film, so every mode asked for its
+                   largest ring (24 MB in Performance) -- with subtitles on a 32 MB iPod that left too little memory. */
+                uint64_t best_ms = 0;
+                uint32_t tpos = moov_s, tt, tps, tpe, ma2, mb2, ms2, me2;
+                if (m4_find(moov_s, moov_e, FOURCC('m','v','h','d'), &a, &b))
+                {
+                    bool v1 = m4_u8(a) == 1;
+                    ts = m4_u32(a + (v1 ? 20 : 12)); dur = m4_u32(a + (v1 ? 28 : 16));   /* v1: low word of the u64 */
+                    if (ts && dur) best_ms = (uint64_t)dur * 1000 / ts;
+                }
+                while (m4_box(&tpos, moov_e, &tt, &tps, &tpe))
+                    if (tt == FOURCC('t','r','a','k') && m4_find(tps, tpe, FOURCC('m','d','i','a'), &ms2, &me2)
+                        && m4_find(ms2, me2, FOURCC('m','d','h','d'), &ma2, &mb2))
+                    {
+                        bool v1 = m4_u8(ma2) == 1;
+                        uint32_t t2 = m4_u32(ma2 + (v1 ? 20 : 12)), d2 = m4_u32(ma2 + (v1 ? 28 : 16));
+                        if (t2 && d2 && (uint64_t)d2 * 1000 / t2 > best_ms) best_ms = (uint64_t)d2 * 1000 / t2;
+                    }
+                if (best_ms >= 1000) br = (uint32_t)((uint64_t)fsz * 8000ULL / best_ms);
+                if (br > 20000000) br = 0;                     /* still nonsense: treat as unknown */
             }
             ring = br ? (uint32_t)((uint64_t)br / 8 * secs[ra_mode]) : 4u << 20;
             if (ring < lo_mb[ra_mode] << 20) ring = lo_mb[ra_mode] << 20;
             if (ring > hi_mb[ra_mode] << 20) ring = hi_mb[ra_mode] << 20;
+            if (probed_ramsize != 64 && ring > (8u << 20)) ring = 8u << 20;   /* v78: 32 MB iPods: room for subtitles, fonts */
             if (cfg_ra_kb > 0 && cfg_ra_kb != 4096) ring = (uint32_t)cfg_ra_kb * 1024;     /* an explicit ra_kb wins */
             if (cfg_ra_kb <= 0) ring = 0;
             if (ring > fsz + 65536) ring = (fsz + 65536 + 65535) & ~65535u;               /* a short clip: all of it */
@@ -3834,6 +3851,8 @@ static int bcm_tv;                     /* v55: this video goes to the TV (displa
 static int v_sound;                  /* v53: route in use this run (cfg_sound, or 1 after a stall fallback) */
 static bool v_fallback;              /* v53: the stock route stalled -> restart the video with Rockbox's sound */
 static int cfg_av_ready = 8;                       /* v52: PCM chunks buffered before the sound counts as ready */
+static int cfg_prep = 1;                                                            /* v78: start-up helper thread */
+static int cfg_ff_resume = 1;                    /* v78: FF/REW release: 1 = resume where the VC is, 0 = seek to the shown frame */
 static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
@@ -3958,6 +3977,8 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "vol_start")) cfg_vol_start = v;
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
+        else if (!strcmp(p, "prep"))   cfg_prep = v;
+        else if (!strcmp(p, "ff_resume")) cfg_ff_resume = v;
         else if (!strcmp(p, "probe_ms")) cfg_probe_ms = v < 500 ? 500 : v;
         else if (!strcmp(p, "jump_tick")) cfg_jump_tick = v < 300 ? 300 : v;
         else if (!strcmp(p, "osd_argb")) cfg_osd_argb = v;
@@ -4163,12 +4184,15 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     if (v_frames <= 12 || v_frames % (cfg_quiet ? 900 : 30) == 0 || r < 0)
         BLOG("  frame #%d sample=%u len=%d key=%d ts=%ums send=%d", v_frames, (unsigned)m4.idx, n, key, (unsigned)ts, r);
 }
+static volatile uint32_t v_seek_kms;      /* v78: where the VC's last PDS seek landed (the key frame), and how many */
+static volatile int v_seek_n;
 static void v_seek(int id, uint32_t pos)
 {
     uint32_t k, kms;
     v_seeks++;
-    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
+    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; v_seek_kms = 0; v_seek_n++; BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
     k = m4_key_at(pos, &kms);                          /* v42: pos = milliseconds (it is the mp_seek argument) */
+    v_seek_kms = kms; v_seek_n++;
     m4_seek_sample(k);
     if (ma.ok) { ma_seek_ms(kms); a_eos = 0; }         /* v53: the sound restarts at the key frame too */
     BLOG("  PDS seek: stream=%d pos=%u ms -> key frame sample %u at %u ms (chunk %u +%u)", id, (unsigned)pos, (unsigned)k, (unsigned)kms,
@@ -4325,7 +4349,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v76 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v78 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5518,7 +5542,9 @@ static void st_begin(const char *video)
     st_cur = -1;
     st_find_tracks(video);
     if (on && st_n) st_select(0, false);
-    if (st_cur >= 0) st_setup();                          /* before the picture starts: the images' first full write */
+    /* v78: the VideoCore images (and their first full write, 0.3 s on the LCD, ~1 s for the TV) are made once the picture
+       runs (bcm_video_run, or the first cue) instead of before mp_selectplay: off the start-up path.  This part needs no
+       VideoCore and runs in the start-up helper thread, while the VideoCore boots. */
 }
 /* hold SELECT: next track / off */
 static void st_cycle(void)
@@ -5923,8 +5949,12 @@ static void scrub_begin(int dir)
     if (sc_method == SM_FF || sc_method == SM_FFK)
     {
         if (sc_method == SM_FFK)
-        {   uint32_t dt = 0; pl_disp(&dt, NULL);
-            tf_cur = dt && dt != 0xffffffffu ? dt : sc_pos; tf_jump = 1000; tf_fed = 0; tf_dir = dir; }
+        {   uint32_t dt = 0, kp; pl_disp(&dt, NULL);
+            tf_cur = dt && dt != 0xffffffffu ? dt : sc_pos; tf_jump = 1000; tf_fed = 0; tf_dir = dir;
+            m4_key_at(tf_cur, &kp);                    /* v78: FF starts at the next key frame, not the one before (a jump */
+            if (dir > 0 && tf_cur > kp + 1000)         /* back first: the v76 log went 5.4 s -> 2.3 s -> 12.3 s)          */
+                tf_fed = 1;                            /* (tf_next_key then steps forward from here at once) */
+        }
         sc_rate = cfg_ff_rate;
         snprintf(c, sizeof c, "%s %d", dir > 0 ? "mp_ff" : "mp_rewind", sc_rate);
         pl_cmd(c, true);
@@ -5987,12 +6017,28 @@ static void scrub_end(void)
     sc_active = false;
     if (sc_method == SM_FF || sc_method == SM_FFK)
     {
+        int n0 = v_seek_n;
+        long t;
         tf_dir = 0;
         if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu && dt) sc_pos = dt;
         pl_cmd("mp_play", true); pl_paused = false;
-        m4_key_at(sc_pos, &k);
-        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k); pl_cmd(c, true);
-        sc_pos = k;
+        /* v78: mp_play makes the VC seek by itself (to the key frame it reached); v47-v77 then seeked again to the frame on
+           screen -- a second flush + refill (~1 s more before the picture moved; v76 log: 4.8 s from release to motion).
+           Now the VC's own position is kept when it has one. */
+        t = current_tick + HZ * 4 / 10;
+        while (v_seek_n == n0 && TIME_BEFORE(current_tick, t)) { bcm_host_service(); yield(); }
+        if (v_seek_n != n0 && cfg_ff_resume == 1)
+        {
+            BLOG("  scrub: the VideoCore resumed at %u ms itself (picture was at %u ms): no second seek",
+                 (unsigned)v_seek_kms, (unsigned)sc_pos);
+            sc_pos = v_seek_kms;
+        }
+        else
+        {
+            m4_key_at(sc_pos, &k);
+            snprintf(c, sizeof c, "mp_seek %u", (unsigned)k); pl_cmd(c, true);
+            sc_pos = k;
+        }
         if (!sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
     }
     else if (sc_method == SM_SEEKSTEP && sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
@@ -6077,6 +6123,7 @@ static volatile unsigned char vr_q[16];
 static volatile short vr_qarg[16];
 static volatile unsigned vr_w, vr_r;
 static volatile long vr_status_asked;
+static void bcm_out_switch(void);         /* v78 */
 int bcm_video_next_request;              /* read by apps/filetree.c: +1 / -1 = play the next / previous video */
 /* v74: TV series (apps/filetree.c): this video is an episode with autoplay on; "stop after this episode" (hold PLAY);
    the last video played to its end (not stopped) */
@@ -6283,6 +6330,17 @@ static int bcm_player_input(char *resp, size_t rn)
         }
         return 0;
     }
+    if (base == BUTTON_MENU)
+    {   /* v78: a short press = stop (on release, as before but on letting go), held 1 s = the picture to the other screen
+           (TV <-> iPod).  The way out when Video Out is On with no TV: the iPod's own screen is not driven then. */
+        static bool down, done;
+        static long t0;
+        if (!(b & (BUTTON_REL | BUTTON_REPEAT))) { down = true; done = false; t0 = current_tick; return 0; }
+        if (!down) return 0;                             /* a release without its press (pressed before the video) */
+        if (b & BUTTON_REL) { down = false; return done ? 0 : 1; }
+        if (!done && current_tick - t0 >= HZ) { done = true; bcm_out_switch(); }
+        return 0;
+    }
     if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
     if (b == BUTTON_MENU) return 1;
     if (b == BUTTON_PLAY)
@@ -6426,6 +6484,8 @@ static void bcm_video_run(int secs)
             break;
         }
         bcm_osd_tick();
+        if (st_cur >= 0 && st_ok == 0 && current_tick - run_t0 > HZ && !sc_active)
+            st_setup();                                /* v78: subtitle images made after the start (not before mp_selectplay) */
         if (v_sound == 2 && !av_checked && current_tick - run_t0 > cfg_av_stall * HZ && !pl_paused && !sc_active)
         {   /* v53: does the stock route run?  The VC's clock follows its sound output: no sound output = no clock = no picture */
             uint32_t e = av_vc_elapsed();
@@ -6834,6 +6894,37 @@ static void bcm_tv_enable(bool on)
     }
 }
 
+/* v78: hold MENU while a video plays: the picture moves between the TV and the iPod's screen without stopping
+   (mp_region to the other display; the TV's DAC on / off).  Subtitles are made again for the new screen. */
+static void bcm_region(const char *when);
+static void bcm_out_switch(void)
+{
+    BLOG("  user: hold MENU -> the picture to the %s", bcm_tv ? "iPod screen" : "TV");
+    st_hide();
+    if (st_cv_h > 0) { core_unpin(st_cv_h); core_free(st_cv_h); }
+    st_cv_h = -1; st_cv = NULL; st_wk = NULL; st_ext = NULL;
+    if (st_font >= 0) font_unload(st_font);
+    st_font = -1;
+    st_ok = 0; st_win = 0; st_front = -1; st_nimg = 0; st_nshown = 0; st_shown_any = false; st_shown_msgv = -1;
+    if (bcm_tv)
+    {
+        bcm_tv_enable(false);
+        bcm_region("hold MENU: to the iPod screen");
+        bcm_tv = false;
+        backlight_set_brightness(MAX_BRIGHTNESS_SETTING);
+        backlight_set_on_button_hold(2);
+        backlight_on();
+    }
+    else
+    {
+        bcm_tv = true;
+        bcm_tv_enable(true);
+    }
+    iap_dock_remember_tv(bcm_tv);
+    st_toast(bcm_tv ? "TV" : "iPod");
+    osd_show_for(3000);
+}
+
 static void bcm_dump(const char *what, unsigned vc_addr, unsigned len);   /* defined further down */
 /* v20 diagnostics: after mp_selectplay the VC stops answering. Is its host interface dead, or only some tasks blocked? */
 static void bcm_hi_dump(const char *tag)
@@ -6922,6 +7013,43 @@ static void bcm_scan_vc_ram(uint32_t w0, uint32_t w1)
     if (!hits) BLOG("  no hit (the VC never copied it, or copied it differently)");
 }
 
+/* v78: start-up in parallel.  Opening the MP4 (tables, the read-ahead ring, the sound track) and finding / loading the
+   subtitles need no VideoCore: ~1 s that used to wait until the VideoCore had booted, loaded mplayer.vll and powered the
+   display (~1.7 s of mostly waiting for it).  In player mode a helper thread does them meanwhile; the playback probe takes
+   the result.  Rockbox threads only switch at sleeps / yields / disk waits, which is where the main thread waits for the
+   VideoCore. */
+static struct { char path[MAX_PATH]; volatile int state; int mr; long ms; } prep;   /* state 0 none, 1 running, 2 done */
+static long prep_stack[(16 * 1024) / sizeof(long)];
+static void prep_thread(void)
+{
+    long t0 = current_tick;
+    prep.mr = mp4_open(prep.path);
+    if (prep.mr == 0) st_begin(prep.path);
+    prep.ms = (current_tick - t0) * 1000 / HZ;
+    prep.state = 2;
+    thread_exit();
+}
+static void prep_start(const char *path)
+{
+    snprintf(prep.path, sizeof prep.path, "%s", path);
+    prep.state = 1;
+    if (!create_thread(prep_thread, prep_stack, sizeof prep_stack, 0, "bcm prepare"
+                       IF_PRIO(, PRIORITY_USER_INTERFACE) IF_COP(, CPU)))
+    {
+        prep.state = 0;                                  /* no thread: done in order, as before */
+        BLOG("start-up helper: no thread -- opening the video after the VideoCore start");
+    }
+}
+static int prep_join(void)                               /* -100 = no helper ran */
+{
+    long t0 = current_tick;
+    if (prep.state == 0) return -100;
+    while (prep.state != 2) { bcm_host_service(); yield(); }
+    BLOG("start-up helper: video + subtitles ready (%ld ms of work; waited %ld ms for it)", prep.ms, (current_tick - t0) * 1000 / HZ);
+    prep.state = 0;
+    return prep.mr;
+}
+
 static void bcm_playback_probe(void)
 {
     char resp[256], video[MAX_PATH];
@@ -6948,6 +7076,9 @@ static void bcm_playback_probe(void)
     snprintf(v_path, sizeof v_path, "%s", video);
     BLOG("playback probe: test video = %s", video);
 
+    int pre = prep_join();                             /* v78: opened meanwhile by the start-up helper */
+    if (pre == -100)
+    {
     BLOG("opening test video from Rockbox...");    /* progress marker: if the log stops right
                                                         after this line, the open() call itself
                                                         is what hung or crashed */
@@ -6958,11 +7089,12 @@ static void bcm_playback_probe(void)
         close(vfd);
     }
     BLOG("test video opened OK");
+    }
 
     if (cfg_tv >= 0) bcm_tv = cfg_tv;
     if (!bcm_tv && (cfg_region_when & 1)) bcm_region("before mp_selectplay");
 
-    {   int mr = mp4_open(video);
+    {   int mr = pre != -100 ? pre : mp4_open(video);
         if (mr == 0)
         {
             BLOG("MP4 ok: %ux%u H.264 profile_idc=%u level_idc=%u nal_len=%u timescale=%u samples=%u SPS+PPS=%u B",
@@ -6971,7 +7103,7 @@ static void bcm_playback_probe(void)
             if (m4.profile != 66)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
-            st_begin(video);                            /* v73: subtitles */
+            if (pre == -100) st_begin(video);           /* v73: subtitles (v78: done by the helper when it ran) */
             {   /* v45: the overlay shows the file name without folder and extension */
                 const char *bn = strrchr(video, '/'); char *dot;
                 snprintf(pl_title, sizeof pl_title, "%s", bn ? bn + 1 : video);
@@ -7158,6 +7290,8 @@ bool bcm_video_play(const char *path)
         bcm_tv = sel == 0;
         iap_dock_remember_tv(bcm_tv);
     }
+    else if (bcm_tv && vo == 0 && dock != 1)
+        splash(HZ, ID2P(LANG_VIDEO_ON_TV_NOTICE));    /* v78: Video Out is On: say so (the iPod's screen stays dark) */
     return bcm_run(path);
 }
 /* v63: the dock asked for the next / previous video: same TV choice, no question */
@@ -7193,7 +7327,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v76, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v78, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -7217,7 +7351,10 @@ static bool bcm_run(const char *play_path)
     tick_add_task(bcm_wd_tick);
     bcm_load_cfg();
     if (!cfg_fast) bcm_sync_every = 0;
+    else if (bcm_player_mode && cfg_log_sync > 0)
+        bcm_sync_every = cfg_log_sync * HZ;            /* v78: a flush costs 0.1-0.6 s on a big FAT32 volume: not during start-up */
     bcm_apply_variant();
+    if (bcm_player_mode && cfg_prep) prep_start(play_path);   /* v78 */
 
     /* v56: /.rockbox/VideoCore/ (all files in one folder) first, else the old /.rockbox/vc/Resources/VideoCore/... tree.
        vmcs.bin stays in RAM after the first video (it is re-sent to the BCM for every boot) */
@@ -7392,6 +7529,13 @@ static bool bcm_run(const char *play_path)
     if (v_live && !cfg_nolcd && !bcm_check_dead())
         splashf(HZ*3, "v26: sent %d video frames", v_frames);
 out:
+    if (prep.state != 0)
+    {   /* v78: the start-up helper was not taken (the VideoCore start failed): let it finish, give its memory back */
+        while (prep.state == 1) yield();
+        prep.state = 0;
+        st_end();
+        m4_close();
+    }
     if (bcm_player_mode)
     {   /* v47: back to the file browser: Rockbox's own display firmware is booted again, nothing is rebooted */
         int rr = 0;

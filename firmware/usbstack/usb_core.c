@@ -28,6 +28,7 @@
 #include "usb.h"
 #include "usb_ch9.h"
 #include "usb_core.h"
+#include "powermgmt.h"
 #include "usb_class_driver.h"
 
 #if defined(USB_ENABLE_STORAGE)
@@ -161,6 +162,33 @@ static const struct usb_string_descriptor* const usb_strings[USB_STRING_INDEX_MA
     [USB_STRING_INDEX_PRODUCT] = &usb_string_iProduct,
     [USB_STRING_INDEX_SERIAL] = &usb_string_iSerial,
 };
+
+/* bcm overlay v77: what the iPod says it is over USB, and USB power use.
+   usb_ident (Settings > General Settings > System > USB > Identify As, used in car / accessory mode only):
+     0 Rockbox (the strings above, Apple's iPod 5G product ID 0x1209), 1 iPod (Apple Inc. / iPod, 0x1209),
+     2 iPhone (Apple Inc. / iPhone, 0x12A8 -- the product ID Apple uses for the iPhone 5 and later).
+   usb_charge_suspend: draw no power from the computer / phone (the LTC4066 SUSP pin): "USB DAC (no charging)".
+   Charging comes back by itself below 10 % battery. */
+#ifdef IPOD_VIDEO
+int usb_ident;
+bool usb_charge_suspend;
+static const struct usb_string_descriptor usb_string_apple = USB_STRING_INITIALIZER(u"Apple Inc.");
+static const struct usb_string_descriptor usb_string_ipod = USB_STRING_INITIALIZER(u"iPod");
+static const struct usb_string_descriptor usb_string_iphone = USB_STRING_INITIALIZER(u"iPhone");
+void usb_core_set_ident(int ident)
+{
+    usb_ident = ident;
+    device_descriptor.idProduct = ident == 2 ? 0x12A8 : USB_PRODUCT_ID;
+}
+static const struct usb_string_descriptor *usb_ident_string(int index)
+{
+    if (usb_ident && index == USB_STRING_INDEX_MANUFACTURER)
+        return &usb_string_apple;
+    if (usb_ident && index == USB_STRING_INDEX_PRODUCT)
+        return usb_ident == 2 ? &usb_string_iphone : &usb_string_ipod;
+    return usb_strings[index];
+}
+#endif
 
 static int usb_address = 0;
 static int usb_config = 0;
@@ -821,8 +849,13 @@ static void request_handler_device_get_descriptor(struct usb_ctrlrequest* req, u
         case USB_DT_STRING:
             logf("STRING %d", index);
             if((unsigned)index < USB_STRING_INDEX_MAX) {
+#ifdef IPOD_VIDEO
+                size = usb_ident_string(index)->bLength;
+                ptr = usb_ident_string(index);
+#else
                 size = usb_strings[index]->bLength;
                 ptr = usb_strings[index];
+#endif
             }
             else if(index == 0xee) {
                 /* We don't have a real OS descriptor, and we don't handle
@@ -1401,6 +1434,32 @@ void usb_core_notify_set_config(uint8_t config)
     usb_signal_notify(USB_NOTIFY_SET_CONFIG, config);
 }
 
+#if defined(HAVE_USB_CHARGING_ENABLE) && defined(IPOD_VIDEO)
+/* v77: "no charging" ends by itself on a nearly empty battery: looked at every 5 s */
+static void usb_charge_suspend_tick(void)
+{
+    static int n, last = -1;
+    if (++n < 5 * HZ) return;
+    n = 0;
+    if (usb_charge_suspend || last == 0)
+    {
+        int c = usb_charging_maxcurrent();
+        if ((c == 0) != (last == 0))
+            usb_charging_maxcurrent_change(c);
+        last = c;
+    }
+}
+void usb_charge_suspend_set(bool on)
+{
+    static bool ticking;
+    if (!ticking) { ticking = true; tick_add_task(usb_charge_suspend_tick); }
+    if (on == usb_charge_suspend)
+        return;                         /* settings_apply runs often: only a change touches the charger */
+    usb_charge_suspend = on;
+    usb_charging_maxcurrent_change(usb_charging_maxcurrent());
+}
+#endif
+
 #ifdef HAVE_USB_CHARGING_ENABLE
 void usb_charging_enable(int state)
 {
@@ -1410,6 +1469,14 @@ void usb_charging_enable(int state)
 
 int usb_charging_maxcurrent(void)
 {
+#ifdef IPOD_VIDEO
+    if (usb_charge_suspend)
+    {   /* v77: no power from USB, unless the battery is nearly empty */
+        int l = battery_level();
+        if (l < 0 || l >= 10)
+            return 0;
+    }
+#endif
     if (!initialized || usb_charging_mode == USB_CHARGING_DISABLE)
         return 100;
     if (usb_state == CONFIGURED)

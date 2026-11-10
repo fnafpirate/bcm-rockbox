@@ -431,7 +431,21 @@ MAKE_MENU(sel_softlock, ID2P(LANG_SOFTLOCK_SELECTIVE),
 MENUITEM_SETTING(governor, &global_settings.governor, NULL);
 #endif
 
+#ifdef IPOD_VIDEO
+MENUITEM_SETTING(bcm_usb_connect_item, &global_settings.bcm_usb_connect, NULL);   /* v77 */
+MENUITEM_SETTING(bcm_usb_ident_item, &global_settings.bcm_usb_ident, NULL);       /* v77 */
+#if defined(USB_ENABLE_AUDIO) && !defined(SIMULATOR)
+extern int bcm_usb_dac_status(void);
+MENUITEM_FUNCTION(bcm_usb_dac_status_item, 0, ID2P(LANG_USB_DAC_STATUS), bcm_usb_dac_status, NULL, Icon_NOICON);
+#endif
+#endif
 MAKE_MENU(usb_menu, ID2P(LANG_USB_MENU), 0, Icon_NOICON,
+#ifdef IPOD_VIDEO
+            &bcm_usb_connect_item, &bcm_usb_ident_item,
+#if defined(USB_ENABLE_AUDIO) && !defined(SIMULATOR)
+            &bcm_usb_dac_status_item,
+#endif
+#endif
 #ifdef USB_ENABLE_HID
             &usb_hid,
             &usb_keypad_mode,
