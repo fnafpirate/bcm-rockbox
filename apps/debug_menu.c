@@ -3148,7 +3148,16 @@ static int cfg_m4cache_ref(void);
      steps between frame requests whenever less than a quarter of it is still ahead, until it is full, and then the
      drive is told to sleep at once (an SSD wakes from standby in milliseconds) -- one short burst a minute;
    - a seek / FF / REW outside the ring restarts it at the new place with a small read. */
-static int cfg_ra_kb = 4096, cfg_moov_kb = 3072, cfg_ra_sleep = 1;
+static int cfg_ra_kb = 4096, cfg_moov_kb = -1, cfg_ra_sleep = 1;   /* v79: moov_kb -1 = from the memory profile */
+/* v79: memory profiles -- one build runs on both (the RAM size is probed at boot: probed_ramsize).
+   ring = average bit rate x seconds, between lo and hi MB, per Video Buffering mode (low-power, balanced, performance);
+   moov = the sample tables kept whole in RAM up to this size (no disk reads for seeks / FF: the v76 FF log had 138 table
+   reads from disk); reserve = left free after the ring for subtitles, fonts and the VideoCore's helpers;
+   font = a subtitle font smaller than this is loaded whole (CJK fonts are 1-2 MB). */
+struct bcm_memprof { const char *name; uint16_t secs[3]; uint8_t lo_mb[3], hi_mb[3]; uint16_t moov_kb, reserve_kb, font_kb; };
+static const struct bcm_memprof bcm_mp64 = { "64 MB", { 900, 180, 300 }, { 8, 4, 16 }, { 40, 16, 40 }, 16384, 6144, 2048 };
+static const struct bcm_memprof bcm_mp32 = { "32 MB", { 240, 60, 120 }, { 4, 2, 6 }, { 12, 6, 12 }, 4096, 3072, 400 };
+static const struct bcm_memprof *bcm_memprof(void) { return probed_ramsize == 64 ? &bcm_mp64 : &bcm_mp32; }
 /* v74: Settings > Video Buffering picks the ring and the refill point (cfg ra_kb > 0 / ra_mode still override):
      Low-power    ring = ~3 min of this video (4..24 MB), refilled when 1/8 is left, the SSD sleeps at once after:
                   the fewest drive wake-ups (one ~every 2.5 min)
@@ -3489,9 +3498,12 @@ static int mp4_open(const char *path)
         long t0 = current_tick;
         ra_fsize = fsz;
         uint32_t ring = 0, br = 0;
-        if (mlen > (uint32_t)cfg_moov_kb * 1024) mlen = 0;
-        {   /* v74: the ring from the buffering setting and this file's average bit rate (mvhd duration) */
-            static const uint32_t secs[3] = { 180, 60, 120 }, lo_mb[3] = { 4, 2, 8 }, hi_mb[3] = { 24, 8, 24 };
+        const struct bcm_memprof *mp = bcm_memprof();
+        uint32_t reserve = (uint32_t)mp->reserve_kb * 1024;
+        if (mlen > (uint32_t)(cfg_moov_kb >= 0 ? cfg_moov_kb : mp->moov_kb) * 1024) mlen = 0;
+        {   /* v74: the ring from the buffering setting and this file's average bit rate (mvhd duration); v79: per RAM size */
+            const uint16_t *secs = mp->secs;
+            const uint8_t *lo_mb = mp->lo_mb, *hi_mb = mp->hi_mb;
             static const int div[3] = { 8, 4, 2 };
             uint32_t a, b, ts, dur;
             ra_mode = cfg_ra_mode >= 0 ? cfg_ra_mode : global_settings.bcm_video_buffer;
@@ -3519,9 +3531,9 @@ static int mp4_open(const char *path)
                 if (br > 20000000) br = 0;                     /* still nonsense: treat as unknown */
             }
             ring = br ? (uint32_t)((uint64_t)br / 8 * secs[ra_mode]) : 4u << 20;
-            if (ring < lo_mb[ra_mode] << 20) ring = lo_mb[ra_mode] << 20;
-            if (ring > hi_mb[ra_mode] << 20) ring = hi_mb[ra_mode] << 20;
-            if (probed_ramsize != 64 && ring > (8u << 20)) ring = 8u << 20;   /* v78: 32 MB iPods: room for subtitles, fonts */
+            if (ring < (uint32_t)lo_mb[ra_mode] << 20) ring = (uint32_t)lo_mb[ra_mode] << 20;
+            if (ring > (uint32_t)hi_mb[ra_mode] << 20) ring = (uint32_t)hi_mb[ra_mode] << 20;
+
             if (cfg_ra_kb > 0 && cfg_ra_kb != 4096) ring = (uint32_t)cfg_ra_kb * 1024;     /* an explicit ra_kb wins */
             if (cfg_ra_kb <= 0) ring = 0;
             if (ring > fsz + 65536) ring = (fsz + 65536 + 65535) & ~65535u;               /* a short clip: all of it */
@@ -3529,10 +3541,14 @@ static int mp4_open(const char *path)
             ra_sleep_on = ra_mode != 2;
         }
         want = mlen + ring;
-        while (want && (ra_handle = core_alloc_ex(want, NULL)) <= 0 && ring > (1u << 20))
+        /* v79: ask for the ring + the reserve, then give the reserve back: whatever comes next (subtitles, fonts) still
+           finds that much free, however full memory was.  Smaller rings when even that does not fit. */
+        while (want && (ra_handle = core_alloc_ex(want + reserve, NULL)) <= 0 && ring > (1u << 20))
         {   /* not that much free memory: a smaller ring */
             ring = (ring / 2) & ~65535u; want = mlen + ring;
         }
+        if (want && ra_handle <= 0) ra_handle = core_alloc_ex(want, NULL);   /* no room for the reserve: the ring anyway */
+        else if (want && ra_handle > 0) core_shrink(ra_handle, core_get_data(ra_handle), want);
         if (want && ra_handle > 0)
         {
             uint8_t *p;
@@ -3546,7 +3562,8 @@ static int mp4_open(const char *path)
             }
             if (ring >= 65536) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ring & ~65535u; }
             ra_lo = ra_hi = 0; ra_pos[0] = ra_pos[1] = 0; ra_filling = false; ra_bursts = ra_misses = ra_read_kb = 0;
-            BLOG("read-ahead: moov %u KB in RAM (%ld ms), ring %u KB%s -- %s, %u kbit/s, refill at 1/%d%s", mv_buf ? mlen / 1024 : 0,
+            BLOG("read-ahead: %s profile, moov %u KB in RAM (%ld ms), ring %u KB%s -- %s, %u kbit/s, refill at 1/%d%s", mp->name,
+                 mv_buf ? mlen / 1024 : 0,
                  (current_tick - t0) * 1000 / HZ, ra_size / 1024, ata_disk_isssd() ? " (solid-state drive)" : "",
                  ra_mode == 0 ? "low-power" : ra_mode == 2 ? "performance" : "balanced", (unsigned)(br / 1000), ra_refill_div,
                  ra_sleep_on ? "" : ", no forced sleep");
@@ -4349,7 +4366,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v78 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v79 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5308,7 +5325,8 @@ static void st_font_open(int want)
         long fs = fd >= 0 ? ffilesize(fd) : 0;
         if (fd >= 0) close(fd);
         /* whole font in RAM when it is small (glyph look-ups without disk reads, missing glyphs can be told) */
-        st_font = fs > 0 && fs < 300 * 1024 ? font_load_ex(best, 0, 30000) : font_load(best);
+        st_font = fs > 0 && fs < (long)bcm_memprof()->font_kb * 1024 ?
+                  font_load_ex(best, 0, probed_ramsize == 64 ? 65000 : 30000) : font_load(best);   /* v79: per RAM size */
         if (st_font < 0) st_font = -1;
     }
     st_font_h = font_get(st_font >= 0 ? st_font : FONT_UI)->height;
@@ -7327,7 +7345,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v78, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v79, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
