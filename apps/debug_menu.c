@@ -4325,7 +4325,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v75 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v76 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6201,6 +6201,21 @@ static int bcm_player_input(char *resp, size_t rn)
     if (vr_r != vr_w && vr_drain(resp, rn)) return 1;  /* v63 */
     b = button_get_w_tmo(0);
     if (b == BUTTON_NONE) return 0;
+    if (b == SYS_PHONE_UNPLUGGED || b == SYS_PHONE_PLUGGED)
+    {   /* v76: headphones out = pause (Settings > Playback > Pause on Headphone Unplug); back in = resume with
+           "Pause and Resume".  Not on a TV or a dock: the sound is not in the headphones there. */
+        static bool hp_paused;
+        BLOG("  headphones %s", b == SYS_PHONE_PLUGGED ? "plugged in" : "pulled out");
+        if (global_settings.unplug_mode && !bcm_tv && !iap_dock_name())
+        {
+            if (b == SYS_PHONE_UNPLUGGED && !pl_paused) { pl_set_paused(true, resp, rn); hp_paused = true; osd_show_for(3000); }
+            else if (b == SYS_PHONE_PLUGGED && hp_paused && pl_paused && global_settings.unplug_mode > 1)
+                pl_set_paused(false, resp, rn);
+        }
+        if (b == SYS_PHONE_PLUGGED) hp_paused = false;
+        return 0;
+    }
+    if (IS_SYSEVENT(b)) return 0;
     av_boost_until = current_tick + 3 * HZ;            /* v57 */
     if (!av_boosted && cfg_boost) av_boost(true);
     raw = b & ~(BUTTON_REPEAT | BUTTON_REL);
@@ -7178,7 +7193,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v75, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v76, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");

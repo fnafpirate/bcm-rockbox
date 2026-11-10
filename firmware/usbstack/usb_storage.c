@@ -339,6 +339,15 @@ static void send_command_failed_result(void);
 static void send_block_data(void *data,int size);
 static void receive_block_data(void *data,int size);
 #if CONFIG_RTC && defined(IPOD_VIDEO)
+#define USB_STAT_READ()  (usb_stat_read_bytes += \
+    (unsigned long long)MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count) * cur_cmd.block_size)
+#define USB_STAT_WRITE() (usb_stat_write_bytes += \
+    (unsigned long long)MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count) * cur_cmd.block_size)
+#else
+#define USB_STAT_READ()  do { } while (0)
+#define USB_STAT_WRITE() do { } while (0)
+#endif
+#if CONFIG_RTC && defined(IPOD_VIDEO)
 /* bcm overlay v74: clock sync from the computer without administrator rights.  A PC program (the setup tool, or its
    "iPod Clock Sync" helper that runs in the background) writes /.rockbox/clocksync.txt =
        "RBCLOCK1 2026-11-09 18:23:05.123 \n"
@@ -346,6 +355,8 @@ static void receive_block_data(void *data,int size);
    "RBCLOCK1 " sets the clock at once (the text was made milliseconds before).  Off with Settings > General Settings >
    Time & Date > Set Clock From Computer.  (iTunes' own way -- the SCSI WRITE BUFFER command -- still works too.) */
 bool usb_clocksync_enabled = true;
+/* bcm overlay v76: bytes moved over USB since boot, and the time of the last transfer (the USB screen's live MB/s) */
+volatile unsigned long long usb_stat_read_bytes, usb_stat_write_bytes;
 static int clk_num(const unsigned char *p, int n)
 {
     int v = 0;
@@ -627,6 +638,7 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                         cur_cmd.sector,
                         MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+                    USB_STAT_WRITE();
                 }
 
                 if(result != 0) {
@@ -847,6 +859,7 @@ static void send_and_read_next(void)
                 cur_cmd.sector,
                 MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                 cur_cmd.data[cur_cmd.data_select]);
+        USB_STAT_READ();
         if(cur_cmd.last_result == 0)
             cur_cmd.last_result = result;
 
@@ -1275,6 +1288,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+                USB_STAT_READ();
 #endif
                 send_and_read_next();
             }
@@ -1326,6 +1340,7 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+                USB_STAT_READ();
 #endif
                 send_and_read_next();
             }

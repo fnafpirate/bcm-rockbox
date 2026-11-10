@@ -39,13 +39,19 @@ Command line (also used for testing on a disk image):
                                                firmware partition, Rockbox, music, videos, file dates; the new
                                                exFAT fills the new card; every file is read back and compared
   ipod_exfat_setup.py --clock-sync          -> set the clock of a connected Rockbox iPod (no admin needed)
+  --ipsw FILE (with any of the above)       -> also put Apple's video files from the iPod firmware package
+                                               (iPod_25.1.3.ipsw / Firmware-25.6.3) where Rockbox uses them:
+                                               /.rockbox/VideoCore/ (vmcs.bin, RenderServer.bin, *.vll) and
+                                               /.rockbox/bcm_video_ui.bin (the video overlay bitmaps)
+  ipod_exfat_setup.py --install-ipsw FILE [--to DRIVE]
+                                            -> copy just those onto a connected Rockbox iPod (no reformat)
 
 Clock: with "Keep the iPod clock right automatically" the small ipod_clock_sync.pyw helper starts with Windows and
 sets the clock whenever an iPod with Rockbox (bcm overlay v74 or later) is connected in USB mode.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.5'
+VERSION = '1.6'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 CHUNK = 4 << 20
 
@@ -693,11 +699,13 @@ def create_blank(disk, unit, boot, log=print):
     write_fw_partition(disk, unit, FW_SIZE, (bytes(fw[pos:pos + CHUNK]) for pos in range(0, FW_SIZE, CHUNK)), log)
 
 def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', cluster=128 * 1024,
-              log=print, progress=lambda f: None, layout='auto'):
+              log=print, progress=lambda f: None, layout='auto', ipsw=None):
     boot = load_bootloader(bootloader)
     if len(boot) > OSOS_ROOM:
         raise SetupError('bootloader too big')
     zipfile.ZipFile(rockbox_zip).close()
+    if ipsw:
+        ipsw_files(ipsw, lambda s: None)          # a bad .ipsw stops it before anything is erased
     disk.prepare_write(log)
     if os.name == 'nt':
         disk.lock_volumes(log)
@@ -705,7 +713,7 @@ def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', 
         disk.lock_volumes()
     create_blank(disk, unit, boot, log)
     return setup(disk, rockbox_zip, bootloader, None, keep=bool(keep_dir), keep_dir=keep_dir, label=label,
-                 cluster=cluster, log=log, progress=progress, layout=layout)
+                 cluster=cluster, log=log, progress=progress, layout=layout, ipsw=ipsw)
 
 def list_disks():
     """[(number, WinDisk-info dict)] of every disk; 'ok' = may be offered for a new layout"""
@@ -848,8 +856,8 @@ def keep_skip(rel):
         return True
     return False
 
-def build_tree(up, rockbox_zip, keep_dir=None, log=print):
-    """rockbox.zip on top of the kept /.rockbox files"""
+def build_tree(up, rockbox_zip, keep_dir=None, log=print, ipsw=None):
+    """rockbox.zip on top of the kept /.rockbox files; Apple's video files from an .ipsw on top of both"""
     t = Tree(up)
     nkeep = 0
     if keep_dir and os.path.isdir(keep_dir):
@@ -878,11 +886,203 @@ def build_tree(up, rockbox_zip, keep_dir=None, log=print):
             t.add('/' + info.filename, info.file_size, (lambda i=info: zf.open(i)), src='zip')
             nzip += 1
     log('  %d files from %s, %d kept from your old /.rockbox' % (nzip, os.path.basename(rockbox_zip), nkeep))
+    if ipsw:
+        add_ipsw(t, ipsw, log)
     rb = t.root.children.get(t.key('.rockbox'))
-    if not rb or t.key('vc') not in rb.children:
-        log('  NOTE: no VideoCore files (/.rockbox/vc) -- video playback needs them; copy them onto '
-            'the iPod afterwards')
+    if not rb or (t.key('vc') not in rb.children and t.key('VideoCore') not in rb.children):
+        log('  NOTE: no VideoCore files (/.rockbox/VideoCore) -- video playback needs them: choose your '
+            'iPod firmware (.ipsw) in this tool, or copy them onto the iPod afterwards')
     return t, zf
+
+# --------------------------------------------------------------------------
+# Apple's files from an .ipsw (the iPod Video firmware package, e.g. iPod_25.1.3.ipsw / Firmware-25.6.3):
+# everything the bcm-rockbox video player needs that is not part of Rockbox, put where Rockbox reads it
+#   /.rockbox/VideoCore/*          vmcs.bin, RenderServer.bin and the six .vll libraries (the "Resources" FAT12
+#                                  volume inside the firmware, long names intact) -- one folder, as the player wants
+#   /.rockbox/bcm_video_ui.bin     the stock video-overlay bitmaps (play/pause, bars, digits, volume, hold lock)
+# (same as tools/bcm/vc_extract.py + extract_video_ui.py, built in so the tool stays one file)
+
+def _ipsw_firmware(path):
+    """the Firmware-* image inside an .ipsw, or the file itself"""
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if os.path.basename(n).startswith('Firmware-')]
+            if not names:
+                raise SetupError('%s has no Firmware-* file -- not an iPod firmware package' % os.path.basename(path))
+            return z.read(names[0]), os.path.basename(names[0])
+    with open(path, 'rb') as f:
+        return f.read(), os.path.basename(path)
+
+def _fat12_files(img):
+    """{path: bytes} of the MTOOL-made FAT12 Resources volume in a firmware image"""
+    off = None
+    for o in range(0, len(img) - 512, 512):
+        b = img[o:o + 512]
+        if b[510:512] == b'\x55\xaa' and b[3:8] == b'MTOOL' and le16(b, 11) == 512 and b[16] == 2:
+            off = o
+            break
+    if off is None:
+        raise SetupError('no VideoCore resource volume in this firmware (not an iPod Video 5G / 5.5G one?)')
+    b = img[off:off + 512]
+    bps, spc, rsv, nfat, nroot, spf = le16(b, 11), b[13], le16(b, 14), b[16], le16(b, 17), le16(b, 22)
+    fat = img[off + rsv * bps: off + (rsv + spf) * bps]
+    root = off + (rsv + nfat * spf) * bps
+    data = root + nroot * 32
+    cs = spc * bps
+    def nxt(c):
+        v = fat[c * 3 // 2] | fat[c * 3 // 2 + 1] << 8
+        return v >> 4 if c & 1 else v & 0xfff
+    def read(c, size=None):
+        out, seen = bytearray(), set()
+        while 2 <= c < 0xff8 and c not in seen:
+            seen.add(c)
+            out += img[data + (c - 2) * cs: data + (c - 1) * cs]
+            c = nxt(c)
+        return bytes(out if size is None else out[:size])
+    def parse(d):
+        ents, lfn = [], []
+        for i in range(0, len(d) - 31, 32):
+            e = d[i:i + 32]
+            if e[0] == 0:
+                break
+            if e[0] == 0xe5:
+                lfn = []; continue
+            if e[11] == 0x0f:
+                lfn.insert(0, (e[1:11] + e[14:26] + e[28:32]).decode('utf-16-le', 'replace').split('\x00')[0]
+                           .split('￿')[0])
+                continue
+            if e[11] & 0x08:
+                lfn = []; continue
+            base, ext = e[:8].decode('latin1').rstrip(), e[8:11].decode('latin1').rstrip()
+            name = ''.join(lfn) or base + ('.' + ext if ext else '')
+            lfn = []
+            if name not in ('.', '..'):
+                ents.append((name, bool(e[11] & 0x10), le16(e, 26), le32(e, 28)))
+        return ents
+    out = {}
+    def walk(ents, prefix, depth):
+        for name, is_dir, c, size in ents:
+            if is_dir and depth < 8:
+                walk(parse(read(c)), prefix + '/' + name, depth + 1)
+            elif not is_dir:
+                out[prefix + '/' + name] = read(c, size) if size else b''
+    walk(parse(img[root:root + nroot * 32]), '', 0)
+    return out
+
+# video-overlay bitmaps: player key -> Apple resource id (views 22056..22065 of firmware 1.3)
+VUI_KEYS = {0: 21922, 1: 21923, 2: 21931, 3: 21932, 4: 21933, 5: 21934, 20: 21949, 21: 21950, 22: 21927,
+            23: 21924, 24: 21925, 25: 21928, 26: 21929}
+VUI_KEYS.update({10 + i: 21939 + i for i in range(10)})
+
+def _video_ui(img):
+    """the VUI1 file (/.rockbox/bcm_video_ui.bin) from the OS image's UI resource block"""
+    o, off = 0, None
+    while True:
+        o = img.find(b'paMB', o)
+        if o < 0:
+            break
+        h = o - 12
+        if h >= 0 and le32(img, h) == 3 and le32(img, h + 8) == 8 and img[o + 16:o + 20] == b'stiB':
+            off = h
+            break
+        o += 1
+    if off is None:
+        raise SetupError('no UI resource block in this firmware')
+    length, ns = le32(img, off + 4), le32(img, off + 8)
+    secs = {}
+    for i in range(ns):
+        tag = img[off + 12 + 16 * i: off + 16 + 16 * i][::-1].decode('latin1')
+        secs[tag] = struct.unpack_from('<III', img, off + 16 + 16 * i)
+    cnt, _, to = secs['BMap']
+    bmps = {}
+    for i in range(cnt):
+        rid, _, ro, rs = struct.unpack_from('<hhII', img, off + to + 12 * i)
+        p = img[off + length + ro: off + length + ro + rs]
+        if len(p) < 28:
+            continue
+        fmt, _, bpr, depth, _, h, w, blen = struct.unpack_from('<HHHH8sIII', p, 0)
+        bmps[rid] = (fmt, bpr, w, h, p[28:28 + blen])
+    ents, data = [], b''
+    hdr = 8 + 12 * len(VUI_KEYS)
+    for key, rid in sorted(VUI_KEYS.items()):
+        if rid not in bmps:
+            raise SetupError('video overlay bitmap %d missing -- a different firmware version?' % rid)
+        fmt, bpr, w, h, px = bmps[rid]
+        if fmt != 0x1444:
+            raise SetupError('video overlay bitmap %d has format 0x%x (expected 0x1444)' % (rid, fmt))
+        rows = b''.join(px[y * bpr: y * bpr + 2 * w] for y in range(h))
+        ents.append(struct.pack('<HHHHI', key, w, h, fmt, hdr + len(data)))
+        data += rows
+    return b'VUI1' + struct.pack('<I', len(ents)) + b''.join(ents) + data
+
+def ipsw_files(path, log=print):
+    """{'/.rockbox/...': bytes} -- Apple's VideoCore files and video overlay bitmaps from an .ipsw / firmware file"""
+    img, member = _ipsw_firmware(path)
+    out = {}
+    vc = {p: d for p, d in _fat12_files(img).items() if '/videocore/' in p.lower()}
+    names = {}
+    for p, d in sorted(vc.items()):
+        n = p.rsplit('/', 1)[1]
+        if n.lower() in names:
+            raise SetupError('two VideoCore files named %s in %s' % (n, member))
+        names[n.lower()] = n
+        out['/.rockbox/VideoCore/' + n] = d
+    need = ('vmcs.bin', 'mplayer.vll', 'h264dec.vll', 'aacdec.vll', 'passthruhandler.vll')
+    missing = [n for n in need if n not in names]
+    if missing:
+        raise SetupError('%s lacks %s -- not an iPod Video 5G / 5.5G firmware?' % (member, ', '.join(missing)))
+    try:
+        out['/.rockbox/bcm_video_ui.bin'] = _video_ui(img)
+        ui = 'and the video overlay bitmaps'
+    except SetupError as ex:
+        ui = '(no overlay bitmaps: %s -- the player then draws its own)' % ex
+    log('  from %s: %d VideoCore files (%s) %s' % (member, len(vc), human(sum(len(d) for d in vc.values())), ui))
+    return out
+
+def _norm(name):
+    return ''.join(c for c in name.lower() if c.isalnum())
+
+def add_video_folders(tree, log=print):
+    """the folders the video player sorts by (bcm overlay v74+):
+         /Videos/Movies     a video plays on its own, back to the list after it
+         /Videos/TV Shows   one folder per show (seasons may be subfolders): at the end of an episode the next one
+                            is offered with a countdown (Settings > General Settings > Video)
+       An existing Videos / Video's / Video folder and existing Movies / TV Show(s) folders in it are used as
+       they are (any case); only what is missing is made."""
+    base = None
+    for c in tree.root.children.values():
+        if c.is_dir and _norm(c.name) in ('video', 'videos', 'videos', 'movies and tv', 'moviestv'):
+            base = c
+            break
+    made = []
+    if base is None:
+        tree.add('/Videos', is_dir=True)
+        base = tree.root.children[tree.key('Videos')]
+        made.append('/Videos')
+    names = {_norm(c.name) for c in base.children.values() if c.is_dir}
+    if not names & {'movie', 'movies', 'film', 'films'}:
+        tree.add('/%s/Movies' % base.name, is_dir=True); made.append('/%s/Movies' % base.name)
+    if not names & {'tvshow', 'tvshows', 'tv', 'tvseries'}:
+        tree.add('/%s/TV Shows' % base.name, is_dir=True); made.append('/%s/TV Shows' % base.name)
+    log('  video folders: %s' % (', '.join(made) + ' made' if made else 'already there (/%s)' % base.name))
+
+def add_ipsw(tree, path, log=print):
+    for p, d in ipsw_files(path, log).items():
+        tree.add(p, len(d), (lambda d=d: io.BytesIO(d)), src='ipsw')
+
+def install_ipsw(root, path, log=print):
+    """write them to a mounted iPod (drive root / mount point): no reformat needed"""
+    files = ipsw_files(path, log)
+    for p, d in files.items():
+        dest = os.path.join(root, *p.strip('/').split('/'))
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest + '.part', 'wb') as f:
+            f.write(d)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(dest + '.part', dest)
+    log('copied %d files to %s' % (len(files), os.path.join(root, '.rockbox')))
+    return len(files)
 
 # --------------------------------------------------------------------------
 # exFAT
@@ -1226,7 +1426,7 @@ def keep_source(disk, log):
     return None
 
 def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, label='IPOD',
-          cluster=128 * 1024, log=print, progress=lambda f: None, layout='auto', tree=None):
+          cluster=128 * 1024, log=print, progress=lambda f: None, layout='auto', tree=None, ipsw=None):
     """layout
       'partition': exFAT partition in normal 512-byte units with 512-byte
                    sectors -- any PC / card reader; max 2.2 TB
@@ -1259,9 +1459,10 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         else:
             log('no open /.rockbox folder on the iPod found -- installing fresh settings')
     if tree is None:
-        tree, zf = build_tree(up, rockbox_zip, keep_dir if keep else None, log)
+        tree, zf = build_tree(up, rockbox_zip, keep_dir if keep else None, log, ipsw=ipsw)
     else:
         zf = None
+    add_video_folders(tree, log)
     # 2. backup of the boot area
     if backup_path:
         log('saving a backup of the partition table and firmware partition')
@@ -1576,7 +1777,7 @@ class SrcVolume:
                 yield p, False, size, (lambda r=runs, s=size, v=valid: _RunReader(self, r, s, v)), stamp, utc
 
 def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, cluster=128 * 1024,
-            log=print, progress=lambda f: None, layout='auto'):
+            log=print, progress=lambda f: None, layout='auto', ipsw=None):
     """storage migration: the old card's firmware partition, Rockbox and every file onto a new (bigger) card in
     the right iPod layout, exFAT filling all of it; file dates kept; every file read back and compared (CRC-32)
     with what was read from the old card.  rockbox_zip: also install that Rockbox build (settings kept)."""
@@ -1614,6 +1815,8 @@ def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, 
             else:
                 t.add('/' + info.filename, info.file_size, (lambda i=info: zf.open(i)), src='zip')
         log('  Rockbox from %s (your settings, themes and fonts kept)' % os.path.basename(rockbox_zip))
+    if ipsw:
+        add_ipsw(t, ipsw, log)
     copy_fw = ipod.unit == unit
     if not copy_fw and not bootloader:
         raise SetupError('the new card is for a different iPod model than the old one: choose the bootloader '
@@ -1787,6 +1990,10 @@ def gui():
     zip_var = file_row(5, 'Rockbox build:', os.path.join(here, 'rockbox.zip'), [('Rockbox build', '*.zip')])
     boot_var = file_row(6, 'Bootloader:', os.path.join(here, 'bootloader-ipodvideo.ipod'),
                         [('iPod bootloader', '*.ipod')])
+    # Apple's firmware package: the VideoCore files and the video overlay bitmaps come from it (optional)
+    ipsws = sorted(f for f in os.listdir(here) if f.lower().endswith('.ipsw')) if os.path.isdir(here) else []
+    ipsw_var = file_row(13, 'iPod firmware (.ipsw):', os.path.join(here, ipsws[-1]) if ipsws else '',
+                        [('iPod firmware', '*.ipsw'), ('Firmware file', 'Firmware-*'), ('All files', '*')])
 
     bk_lbl = ttk.Label(frm, text='Backup file:'); bk_lbl.grid(row=7, column=0, sticky='w')
     bdir = os.path.join(os.path.expanduser('~'), 'Documents')
@@ -1840,9 +2047,12 @@ def gui():
     btns = ttk.Frame(frm); btns.grid(row=16, column=0, columnspan=3, sticky='ew', pady=(8, 0))
     go = ttk.Button(btns, text='Erase iPod and install Rockbox on exFAT'); go.pack(side='right')
     rs = ttk.Button(btns, text='Restore a backup...'); rs.pack(side='left')
-    ck = ttk.Button(btns, text='Set iPod clock now'); ck.pack(side='left', padx=(8, 0))
+    extra = ttk.Frame(frm); extra.grid(row=17, column=0, columnspan=3, sticky='ew', pady=(6, 0))
+    ttk.Label(extra, text='Connected Rockbox iPod (no reformat):').pack(side='left')
+    vb = ttk.Button(extra, text='Copy video files from .ipsw'); vb.pack(side='left', padx=(8, 0))
+    ck = ttk.Button(extra, text='Set clock now'); ck.pack(side='left', padx=(8, 0))
     auto_var = tk.BooleanVar(value=clock_helper_installed())
-    auto_chk = ttk.Checkbutton(btns, text='Keep the iPod clock right automatically', variable=auto_var)
+    auto_chk = ttk.Checkbutton(extra, text='Keep the clock right automatically', variable=auto_var)
     auto_chk.pack(side='left', padx=(8, 0))
 
     def log(s):
@@ -2011,7 +2221,15 @@ def gui():
                                      parent=root)
         return (ans or '').strip().upper() == 'ERASE'
 
+    def ipsw_choice():
+        v = ipsw_var.get().strip()
+        if v and not os.path.isfile(v):
+            messagebox.showwarning(TITLE, 'The iPod firmware file (.ipsw) does not exist.'); return False
+        return v or None
     def do_go():
+        ip_ = ipsw_choice()
+        if ip_ is False:
+            return
         i = disk_box.current()
         if not (0 <= i < len(st['items'])):
             messagebox.showwarning(TITLE, 'Nothing selected.'); return
@@ -2043,7 +2261,7 @@ def gui():
                 s_ = WinDisk(n, writable=False); d_ = WinDisk(m)
                 try:
                     migrate(s_, d_, unit=unit, rockbox_zip=zp, bootloader=bl, label=label_var.get() or None,
-                            cluster=cl, log=log, progress=prog, layout=layout_choice())
+                            cluster=cl, log=log, progress=prog, layout=layout_choice(), ipsw=ip_)
                 finally:
                     s_.close(); d_.close()
             return run(job)
@@ -2052,9 +2270,9 @@ def gui():
             kd = kd_var.get().strip() or None
             if kd and not os.path.isdir(kd):
                 messagebox.showwarning(TITLE, 'The saved .rockbox folder does not exist.'); return
-            if not kd and not messagebox.askyesno(TITLE, 'No saved .rockbox folder chosen: the iPod gets fresh '
-                                                  'settings and NO VideoCore files (/.rockbox/vc, needed for '
-                                                  'video).  Continue?'):
+            if not kd and not ip_ and not messagebox.askyesno(TITLE, 'No saved .rockbox folder and no iPod '
+                                                  'firmware (.ipsw) chosen: the iPod gets fresh settings and NO '
+                                                  'VideoCore files (needed for video).  Continue?'):
                 return
             if it['internal'] and not messagebox.askyesno(TITLE, 'Disk %d (%s, %s) is connected INSIDE this PC, '
                                                           'not by USB.  Really use it for the iPod?'
@@ -2067,7 +2285,7 @@ def gui():
                 d = WinDisk(n)
                 try:
                     new_drive(d, unit, zip_var.get(), boot_var.get(), keep_dir=kd, label=label, cluster=cl,
-                              log=log, progress=prog, layout=layout_choice())
+                              log=log, progress=prog, layout=layout_choice(), ipsw=ip_)
                 finally:
                     d.close()
             return run(job)
@@ -2095,7 +2313,7 @@ def gui():
             d = WinDisk(n)
             try:
                 setup(d, zip_var.get(), boot_var.get(), bk_var.get(), keep=keep_var.get(), keep_dir=keep_dir,
-                      label=label, cluster=cl, log=log, progress=prog, layout=layout_choice())
+                      label=label, cluster=cl, log=log, progress=prog, layout=layout_choice(), ipsw=ip_)
             finally:
                 d.close()
         run(job)
@@ -2122,6 +2340,24 @@ def gui():
                 d.close()
         run(job)
 
+    def do_vfiles():
+        ip_ = ipsw_choice()
+        if not ip_:
+            if ip_ is None:
+                messagebox.showwarning(TITLE, 'Choose your iPod firmware (.ipsw) first -- e.g. iPod_25.1.3.ipsw '
+                                       'for a 5G / 5.5G.')
+            return
+        roots = clock_sync_drives()
+        if not roots:
+            messagebox.showwarning(TITLE, 'No iPod with Rockbox found.  Connect it in Rockbox USB mode (Windows '
+                                   'shows it as a drive) and try again.'); return
+        def job():
+            for r in roots:
+                log('copying Apple\'s video files to %s' % r)
+                install_ipsw(r, ip_, log)
+            log('done -- videos play after the iPod is unplugged')
+            return 'clock'
+        run(job)
     def do_clock():
         roots = clock_sync_drives()
         if not roots:
@@ -2144,7 +2380,7 @@ def gui():
         except Exception as ex:
             messagebox.showerror(TITLE, 'Could not change the clock helper: %s' % ex)
     auto_var.trace_add('write', do_auto)
-    go['command'] = do_go; rs['command'] = do_restore; rf['command'] = refresh; ck['command'] = do_clock
+    go['command'] = do_go; rs['command'] = do_restore; rf['command'] = refresh; ck['command'] = do_clock; vb['command'] = do_vfiles
     root.after(100, pump)
     root.after(200, refresh)
     root.mainloop()
@@ -2204,6 +2440,16 @@ def main2():
                   '  (empty)' if i['blank'] else '', '  INTERNAL' if i['internal'] else '',
                   '' if i['ok'] else '  (never used: Windows runs from it)'))
         return
+    if '--install-ipsw' in a:
+        roots = [opt('--to')] if '--to' in a else clock_sync_drives()
+        if not roots or not roots[0]:
+            sys.exit('no iPod with Rockbox found (connect it in Rockbox USB mode, or give --to DRIVE)')
+        try:
+            for r in roots:
+                install_ipsw(r, opt('--install-ipsw'))
+        except SetupError as ex:
+            sys.exit('ERROR: %s' % ex)
+        return
     if '--clock-sync' in a:
         roots = clock_sync_drives()
         if not roots:
@@ -2223,7 +2469,7 @@ def main2():
             model = opt('--model')
             migrate(src, dst, unit=MODELS[model.lower()] if model else None, rockbox_zip=opt('--rockbox-zip'),
                     bootloader=opt('--bootloader'), label=opt('--label'), cluster=int(opt('--cluster-kb', '128')) * 1024,
-                    layout=opt('--layout', 'auto'))
+                    layout=opt('--layout', 'auto'), ipsw=opt('--ipsw'))
         except SetupError as ex:
             sys.exit('ERROR: %s' % ex)
         finally:
@@ -2253,7 +2499,7 @@ def main2():
                 sys.exit('--model must be 5.5g or 5g')
             new_drive(disk, MODELS[model], opt('--rockbox-zip'), opt('--bootloader'), keep_dir=opt('--keep-dir'),
                       label=opt('--label', 'IPOD'), cluster=int(opt('--cluster-kb', '128')) * 1024,
-                      layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'))
+                      layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'), ipsw=opt('--ipsw'))
             return
         if '--yes' not in a:
             sys.exit('add --yes to really erase the iPod')
@@ -2261,7 +2507,8 @@ def main2():
               opt('--backup', 'ipod_backup_%s.bin' % time.strftime('%Y%m%d_%H%M%S')),
               keep='--no-keep' not in a, keep_dir=opt('--keep-dir'), label=opt('--label', 'IPOD'),
               cluster=int(opt('--cluster-kb', '128')) * 1024,
-              progress=(lambda f: None), layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'))
+              progress=(lambda f: None), layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'),
+              ipsw=opt('--ipsw'))
     except SetupError as ex:
         sys.exit('ERROR: %s' % ex)
     finally:

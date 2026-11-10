@@ -311,6 +311,101 @@ static void dk_write(const struct dk_line *t, int n)
         fdprintf(fd, "%s|%s|%d|%d|%d|%d\n", t[i].key, t[i].name, t[i].tv, t[i].v[1], t[i].v[2], t[i].v[0]);
     close(fd);
 }
+
+/* ---- bcm overlay v76: sound profiles -- headphones and dock line-out (Settings > Sound Settings > Dock Line-Out
+   Profile).  When a dock connects, the sound settings in use are kept as the headphone profile and the dock profile
+   is put in (EQ, crossfeed, bass, treble, balance, volume -- crossfeed is a headphone effect, docks / speakers
+   usually want another EQ); when it goes, what was used on the dock is kept as the dock profile and the headphone
+   profile comes back.  Both live in /.rockbox/bcm_audio_profiles.txt.  Undocking while music plays also pauses it
+   when Pause on Headphone Unplug is on (the sound would otherwise jump from the speakers to whatever is in the
+   headphone jack), and docking again resumes it with "Pause and Resume". */
+#include "audio.h"
+#include "sound.h"
+#include "eq.h"
+#include "crossfeed.h"
+#define PROFILE_FILE ROCKBOX_DIR "/bcm_audio_profiles.txt"
+struct snd_prof { int ok, vol, eq, xfeed, bass, treble, balance; };
+static struct snd_prof prof_phones, prof_dock;
+static bool dock_caused_pause;
+static void prof_get(struct snd_prof *p)
+{
+    p->ok = 1; p->vol = global_status.volume; p->eq = global_settings.eq_enabled; p->xfeed = global_settings.crossfeed;
+    p->bass = global_settings.bass; p->treble = global_settings.treble; p->balance = global_settings.balance;
+}
+static void prof_put(const struct snd_prof *p)
+{
+    if (!p->ok) return;
+    global_status.volume = p->vol; global_settings.eq_enabled = p->eq; global_settings.crossfeed = p->xfeed;
+    global_settings.bass = p->bass; global_settings.treble = p->treble; global_settings.balance = p->balance;
+    sound_settings_apply();
+    sound_set(SOUND_VOLUME, global_status.volume);
+    dsp_eq_enable(global_settings.eq_enabled);
+    dsp_set_crossfeed_type(global_settings.crossfeed);
+    settings_save();
+}
+static void prof_load(void)
+{
+    char line[120];
+    int fd = open(PROFILE_FILE, O_RDONLY);
+    if (fd < 0) return;
+    while (read_line(fd, line, sizeof line) > 0)
+    {
+        struct snd_prof p;
+        char name[16];
+        if (sscanf(line, "%15[^|]|%d|%d|%d|%d|%d|%d", name, &p.vol, &p.eq, &p.xfeed, &p.bass, &p.treble, &p.balance) != 7)
+            continue;
+        p.ok = 1;
+        if (!strcmp(name, "dock")) prof_dock = p;
+        else if (!strcmp(name, "headphones")) prof_phones = p;
+    }
+    close(fd);
+}
+static void prof_save(void)
+{
+    int fd = open(PROFILE_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    const struct snd_prof *t[2] = { &prof_phones, &prof_dock };
+    static const char *const n[2] = { "headphones", "dock" };
+    int i;
+    if (fd < 0) return;
+    fdprintf(fd, "# bcm overlay: sound profiles -- name|volume dB|eq|crossfeed|bass|treble|balance\n");
+    for (i = 0; i < 2; i++)
+        if (t[i]->ok)
+            fdprintf(fd, "%s|%d|%d|%d|%d|%d|%d\n", n[i], t[i]->vol, t[i]->eq, t[i]->xfeed, t[i]->bass, t[i]->treble,
+                     t[i]->balance);
+    close(fd);
+}
+static void prof_docked(bool docked)
+{
+    int st = audio_status();
+    if (global_settings.bcm_dock_profile)
+    {
+        static bool loaded;
+        if (!loaded) { prof_load(); loaded = true; }
+        if (docked)
+        {
+            prof_get(&prof_phones);
+            if (prof_dock.ok) prof_put(&prof_dock);
+        }
+        else
+        {
+            prof_get(&prof_dock);
+            if (prof_phones.ok) prof_put(&prof_phones);
+        }
+        prof_save();
+        logf("sound profile: %s", docked ? "dock" : "headphones");
+    }
+    if (!docked && global_settings.unplug_mode && (st & AUDIO_STATUS_PLAY) && !(st & AUDIO_STATUS_PAUSE))
+    {
+        audio_pause();
+        dock_caused_pause = true;
+    }
+    else if (docked && dock_caused_pause && global_settings.unplug_mode > 1 && (st & AUDIO_STATUS_PAUSE))
+    {
+        audio_resume();
+        dock_caused_pause = false;
+    }
+    if (docked) dock_caused_pause = false;
+}
 static struct dk_line dk_tab[DOCK_MAX];
 /* UI thread (default_event_handler on SYS_IAP_DOCK, and the video player before it starts): notices, profiles */
 void iap_dock_ui(void)
@@ -329,6 +424,7 @@ void iap_dock_ui(void)
         dk_tab[i].v[0] = dk.snap[0]; dk_tab[i].v[1] = dk.snap[1]; dk_tab[i].v[2] = dk.snap[2];
         dk_write(dk_tab, n);
         logf("dock gone: %s", dk.gone_key);
+        prof_docked(false);                  /* v76 */
         if (notify) splash(HZ * 2, ID2P(LANG_DOCK_DISCONNECTED));
     }
     if (dk.ui_connect)
@@ -349,6 +445,7 @@ void iap_dock_ui(void)
                 break;
             }
         logf("dock: %s%s", dk.key, applied ? " (its TV settings applied)" : "");
+        prof_docked(true);                   /* v76 */
         if (notify)
         {
             if (dk.name[0])

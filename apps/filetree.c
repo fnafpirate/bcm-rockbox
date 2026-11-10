@@ -575,11 +575,14 @@ extern bool bcm_tvs_episode, bcm_tvs_stop_after, bcm_video_finished;   /* v74 */
 #include "backlight.h"
 /* v74: TV series autoplay -- "Up next" with a countdown; true = play it (SELECT / PLAY = now, MENU = stop) */
 static bool ft_tvs_countdown(const char *label)
-{
+{   /* v76: "Play the next episode?  Yes / No" -- the wheel picks, SELECT / >> confirms, PLAY = yes, MENU / << = no;
+       when the countdown (Settings: 5..10 s) runs out the highlighted answer (Yes unless changed) is taken */
     struct screen *d = &screens[SCREEN_MAIN];
-    const int total = 10 * HZ;
+    int secs = global_settings.bcm_tv_countdown;
+    const int total = (secs < 5 ? 5 : secs > 10 ? 10 : secs) * HZ;
     long end = current_tick + total;
     char l1[80], l2[120];
+    int sel = 0;                                         /* 0 = Yes, 1 = No */
     const char *nl = strchr(label, '\n');
     if (nl)
     {
@@ -591,14 +594,14 @@ static bool ft_tvs_countdown(const char *label)
     while (1)
     {
         long left = end - current_tick;
-        int fh, w, h, y, a, bw = d->lcdwidth - 40;
+        int fh, w, h, y, a, k, bw = d->lcdwidth - 40, btw;
         char t[64];
-        if (left <= 0) return true;
+        if (left <= 0) return sel == 0;
         d->set_viewport(NULL);
         d->setfont(FONT_UI);
         d->clear_display();
         fh = font_get(FONT_UI)->height;
-        y = d->lcdheight / 2 - fh * 3;
+        y = d->lcdheight / 2 - fh * 4;
 #define FT_CENTER(s) do { d->getstringsize((const unsigned char *)(s), &w, &h); \
                           d->putsxy((d->lcdwidth - w) / 2 > 0 ? (d->lcdwidth - w) / 2 : 0, y, (const unsigned char *)(s)); y += fh + 2; } while (0)
         FT_CENTER(str(LANG_TVS_UP_NEXT));
@@ -606,18 +609,42 @@ static bool ft_tvs_countdown(const char *label)
         FT_CENTER(l1);
         if (l2[0]) FT_CENTER(l2);
         y += fh / 2;
-        snprintf(t, sizeof t, str(LANG_TVS_PLAYING_IN), (int)((left + HZ - 1) / HZ));
+        FT_CENTER(str(LANG_TVS_PLAY_NEXT_Q));
+        y += 4;
+        /* the two answers */
+        btw = d->lcdwidth / 3;
+        for (k = 0; k < 2; k++)
+        {
+            const char *s = str(k == 0 ? LANG_SET_BOOL_YES : LANG_SET_BOOL_NO);
+            int bx = d->lcdwidth / 2 + (k == 0 ? -btw - 6 : 6);
+            d->getstringsize((const unsigned char *)s, &w, &h);
+            if (k == sel)
+            {
+                d->fillrect(bx, y, btw, fh + 6);
+                d->set_drawmode(DRMODE_COMPLEMENT);
+                d->putsxy(bx + (btw - w) / 2, y + 3, (const unsigned char *)s);
+                d->set_drawmode(DRMODE_SOLID);
+            }
+            else
+            {
+                d->drawrect(bx, y, btw, fh + 6);
+                d->putsxy(bx + (btw - w) / 2, y + 3, (const unsigned char *)s);
+            }
+        }
+        y += fh + 14;
+        snprintf(t, sizeof t, str(sel == 0 ? LANG_TVS_PLAYING_IN : LANG_TVS_STOPPING_IN), (int)((left + HZ - 1) / HZ));
         FT_CENTER(t);
         d->drawrect(20, y, bw, 8);
         d->fillrect(20, y, (int)((long)bw * (total - left) / total), 8);
-        y += 14;
-        FT_CENTER(str(LANG_TVS_HINT));
 #undef FT_CENTER
         d->update();
         a = get_action(CONTEXT_TREE, HZ / 10);
-        if (a == ACTION_STD_OK || a == ACTION_TREE_WPS) return true;
-        if (a == ACTION_STD_CANCEL || a == ACTION_STD_MENU) return false;
-        if (IS_SYSEVENT(a) && default_event_handler(a) == SYS_USB_CONNECTED) return false;
+        if (a == ACTION_STD_NEXT || a == ACTION_STD_PREV || a == ACTION_STD_NEXTREPEAT || a == ACTION_STD_PREVREPEAT)
+            sel = !sel;
+        else if (a == ACTION_STD_OK) return sel == 0;
+        else if (a == ACTION_TREE_WPS) return true;
+        else if (a == ACTION_STD_CANCEL || a == ACTION_STD_MENU) return false;
+        else if (IS_SYSEVENT(a) && default_event_handler(a) == SYS_USB_CONNECTED) return false;
     }
 }
 /* v63: a dock / remote asked for the next (+1) or previous (-1) video: the neighbouring video file of this folder

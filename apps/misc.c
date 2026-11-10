@@ -579,7 +579,8 @@ static void hp_unplug_change(bool inserted)
 {
     static bool headphone_caused_pause = true;
 
-    if (global_settings.unplug_mode)
+    /* bcm overlay v76: while docked the sound goes to the dock: pulling the headphones out does not pause it */
+    if (global_settings.unplug_mode && !iap_dock_name())
     {
         int audio_stat = audio_status();
         if (inserted)

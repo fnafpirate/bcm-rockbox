@@ -770,6 +770,8 @@ struct user_settings
     bool bcm_tv_autoplay;  /* v74: TV show episodes: the next one follows (countdown) */
     bool bcm_dock_notify;  /* v74: notices for docks / power sources */
     bool bcm_clock_sync;   /* v74: set the clock from the computer (clocksync.txt over USB) */
+    int bcm_tv_countdown;  /* v76: TV shows: seconds before the next episode (5..10) */
+    bool bcm_dock_profile; /* v76: separate sound settings while docked (line-out) */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

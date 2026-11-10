@@ -17962,3 +17962,71 @@
     ipodvideo: "Set Clock From Computer"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_TVS_COUNTDOWN
+  desc: TV shows: seconds before the next episode
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Next Episode Countdown"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Next Episode Countdown"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Next Episode Countdown"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_PLAY_NEXT_Q
+  desc: TV shows: the question on the Up Next screen
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Play the next episode?"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Play the next episode?"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Play the next episode"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TVS_STOPPING_IN
+  desc: TV shows: countdown when No is chosen, %d = seconds
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Stopping in %d s"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Stopping in %d s"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Stopping in  s"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_DOCK_PROFILE
+  desc: sound settings of their own while docked
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Dock Line-Out Profile"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Dock Line-Out Profile"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Dock Line-Out Profile"
+  </voice>
+</phrase>

@@ -41,6 +41,16 @@
 #include "playlist.h"
 #include "misc.h"
 #include "icons.h"
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v76: live USB statistics under the USB logo */
+#include "usb_drv.h"
+#include "ata.h"
+#include "powermgmt.h"
+#include "power.h"
+#include "system.h"
+#define USB_STATS 1
+extern volatile unsigned long long usb_stat_read_bytes, usb_stat_write_bytes;   /* usbstack/usb_storage.c */
+#endif
 
 #include "bitmaps/usblogo.h"
 
@@ -75,6 +85,121 @@ static void draw_usb_keypad_mode(struct viewport *title)
 }
 #endif /* USB_ENABLE_HID */
 
+
+#ifdef USB_STATS
+/* bcm overlay v76: what the link is doing, refreshed 4 times a second (Windows' copy dialog averages over seconds):
+   the speed the computer negotiated, the real read / write rate over the last second, totals and peaks of this
+   connection, the CPU clock, the battery, and the drive's own temperature when it reports one (SMART 194 / 190).
+   The PP5022 has no temperature sensor, and on the 5G / 5.5G the PCF50605's battery-temperature input is wired to
+   dock pin 21 (accessory identification), so there is no CPU or battery temperature to show. */
+static struct {
+    unsigned long long r0, w0;               /* counters when this connection started */
+    unsigned long long r[5], w[5];           /* the last 5 samples, 0.25 s apart */
+    long t[5];
+    int n, k;
+    unsigned peak_r, peak_w;                 /* KB/s */
+    long smart_next;
+    int temp;                                /* degrees C, -1 = not reported, -2 = not read yet */
+} us;
+static void usb_stats_start(void)
+{
+    memset(&us, 0, sizeof us);
+    us.r0 = usb_stat_read_bytes; us.w0 = usb_stat_write_bytes;
+    us.temp = -2;
+}
+static int usb_drive_temp(void)
+{
+    static struct ata_smart_values sv;
+    int i;
+    if (ata_read_smart(&sv, ATA_SMART_READ_DATA) != 0)
+        return -1;
+    for (i = 0; i < NUMBER_ATA_SMART_ATTRIBUTES; i++)
+    {
+        const struct ata_smart_attribute *a = &sv.vendor_attributes[i];
+        if ((a->id == 194 || a->id == 190) && a->raw[0] > 0 && a->raw[0] < 100)
+            return a->raw[0];
+    }
+    return -1;
+}
+static void fmt_bytes(char *b, size_t n, unsigned long long v)
+{
+    if (v >= (1ULL << 30)) snprintf(b, n, "%lu.%02lu GB", (unsigned long)(v >> 30), (unsigned long)(((v >> 20) & 1023) * 100 / 1024));
+    else if (v >= (1ULL << 20)) snprintf(b, n, "%lu.%lu MB", (unsigned long)(v >> 20), (unsigned long)(((v >> 10) & 1023) * 10 / 1024));
+    else snprintf(b, n, "%lu KB", (unsigned long)(v >> 10));
+}
+static void usb_stats_draw(const struct viewport *logo)
+{
+    struct screen *d = &screens[SCREEN_MAIN];
+    struct viewport vp;
+    unsigned long long r = usb_stat_read_bytes, w = usb_stat_write_bytes;
+    int i = us.k % 5, o, lh, y;
+    unsigned rr = 0, wr = 0;
+    char a[24], b[24];
+    us.r[i] = r; us.w[i] = w; us.t[i] = current_tick; us.k++;
+    if (us.n < 5) us.n++;
+    o = (us.k - us.n) % 5;                                  /* the oldest sample */
+    if (us.n > 1 && us.t[i] != us.t[o])
+    {
+        long dt = us.t[i] - us.t[o];
+        rr = (unsigned)((us.r[i] - us.r[o]) * HZ / dt / 1024);
+        wr = (unsigned)((us.w[i] - us.w[o]) * HZ / dt / 1024);
+        if (rr > us.peak_r) us.peak_r = rr;
+        if (wr > us.peak_w) us.peak_w = wr;
+    }
+    if (us.temp == -2 || TIME_AFTER(current_tick, us.smart_next))
+    {
+        us.temp = usb_drive_temp();
+        us.smart_next = current_tick + 20 * HZ;
+    }
+    vp = *logo;
+    vp.x = 0; vp.width = LCD_WIDTH;
+    vp.y = logo->y + logo->height + 4; vp.height = LCD_HEIGHT - vp.y;
+    vp.font = FONT_SYSFIXED;
+    vp.flags &= ~VP_FLAG_ALIGN_CENTER;
+    d->set_viewport(&vp);
+    d->clear_viewport();
+    lh = font_get(FONT_SYSFIXED)->height + 2;
+    y = 0;
+    d->putsxyf(4, y, "Link    %s", !usb_inserted() ? "USB power only (no computer)" :
+               usb_drv_port_speed() ? "USB 2.0 High Speed (480 Mbit/s)" : "USB Full Speed (12 Mbit/s)");
+    y += lh;
+    fmt_bytes(a, sizeof a, r - us.r0); fmt_bytes(b, sizeof b, w - us.w0);
+    d->putsxyf(4, y, "Read   %3u.%u MB/s   peak %3u.%u   total %s", rr / 1024, rr % 1024 * 10 / 1024,
+               us.peak_r / 1024, us.peak_r % 1024 * 10 / 1024, a);
+    y += lh;
+    d->putsxyf(4, y, "Write  %3u.%u MB/s   peak %3u.%u   total %s", wr / 1024, wr % 1024 * 10 / 1024,
+               us.peak_w / 1024, us.peak_w % 1024 * 10 / 1024, b);
+    y += lh;
+    /* a bar for the current rate: full = 30 MB/s */
+    {
+        int bw = LCD_WIDTH - 8, fr = (int)((long)bw * (rr > 30720 ? 30720 : rr) / 30720),
+            fw = (int)((long)bw * (wr > 30720 ? 30720 : wr) / 30720);
+        d->drawrect(4, y, bw, 5); d->fillrect(4, y, fr, 5);
+        d->drawrect(4, y + 7, bw, 5); d->fillrect(4, y + 7, fw, 5);
+        y += 16;
+    }
+    d->putsxyf(4, y, "CPU    %ld MHz", cpu_frequency / 1000000);
+    y += lh;
+#if CONFIG_CHARGING
+    d->putsxyf(4, y, "Battery %d mV  %d %%%s", battery_voltage(), battery_level(), charging_state() ? "  charging" : "");
+#else
+    d->putsxyf(4, y, "Battery %d mV  %d %%", battery_voltage(), battery_level());
+#endif
+    y += lh;
+    if (us.temp >= 0)
+        d->putsxyf(4, y, "Drive  %d C  (SMART)", us.temp);
+    else
+        d->putsxyf(4, y, "Drive  temperature not reported");
+    y += lh;
+    d->putsxyf(4, y, "CPU / battery temperature: no sensor");
+    d->update_viewport();
+    d->set_viewport(NULL);
+}
+#endif
+
+#ifdef USB_STATS
+static const struct viewport *usb_stats_logo;
+#endif
 static void handle_usb_events(struct viewport *title)
 {
 #if (CONFIG_STORAGE & STORAGE_MMC) && !defined(SIMULATOR)
@@ -100,7 +225,12 @@ static void handle_usb_events(struct viewport *title)
         {
             /* hid emits the event in get_action */
             send_event(GUI_EVENT_ACTIONUPDATE, NULL);
+#ifdef USB_STATS
+            usb_stats_draw(usb_stats_logo);
+            button = button_get_w_tmo(HZ/4);
+#else
             button = button_get_w_tmo(HZ/2);
+#endif
         }
         if (button == SYS_USB_DISCONNECTED)
             return;
@@ -166,6 +296,10 @@ static void usb_screen_fix_viewports(struct screen *screen,
     }
 #else
     logo->y = parent->y + (parent->height - logo_height) / 2;
+#endif
+#ifdef USB_STATS
+    if (screen->screen_type == SCREEN_MAIN)
+        logo->y = parent->y + 2;              /* v76: room for the statistics below it */
 #endif
     logo->width = logo_width;
     logo->height = logo_height;
@@ -277,6 +411,10 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     }
     usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
     usb_screens_draw(usb_screen_vps_ar);
+#ifdef USB_STATS
+    usb_stats_logo = &usb_screen_vps_ar[SCREEN_MAIN].logo;
+    usb_stats_start();
+#endif
     handle_usb_events(title);
 
 #if defined(USB_ENABLE_HID)
