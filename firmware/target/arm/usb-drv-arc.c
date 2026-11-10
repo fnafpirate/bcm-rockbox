@@ -478,18 +478,6 @@ static void init_endpoint(int ep, int type, int mps) {
             mps = usb_drv_port_speed() ? 512 : 64;
         }
     }
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-    {   /* bcm overlay v83: the receive (OUT) side of an isochronous endpoint: Mult 1 (as before) or 0 -- what Linux's
-           ChipIdea driver uses for isochronous OUT (only its IN side gets a Mult).  Chosen in USB DAC Status (SELECT),
-           used from the next connection.  Only the USB DAC has an isochronous OUT endpoint. */
-        extern int usb_iso_rx_mult;
-        if(type == USB_ENDPOINT_XFER_ISOC && ep_dir == DIR_OUT) {
-            qh->max_pkt_length = mps << QH_MAX_PKT_LEN_POS | QH_ZLT_SEL | (unsigned)usb_iso_rx_mult << QH_MULT_POS;
-            qh->dtd.next_td_ptr = QH_NEXT_TERMINATE;
-            return;
-        }
-    }
-#endif
     if(type == USB_ENDPOINT_XFER_ISOC)
         /* FIXME: we can adjust the number of packets per frame, currently use one */
         qh->max_pkt_length = mps << QH_MAX_PKT_LEN_POS | QH_ZLT_SEL | 1 << QH_MULT_POS;
@@ -512,16 +500,6 @@ void usb_drv_init(void)
     /* Force device to full speed */
     /* See 32.9.5.9.2 */
     REG_PORTSC1 |= PORTSCX_PORT_FORCE_FULL_SPEED;
-#elif defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-    /* bcm overlay v82: USB DAC presets connect at full speed (12 Mbit/s): USB Audio Class 1 is a full-speed design and
-       the isochronous OUT path of this controller is unproven at high speed (Settings: USB DAC Speed) */
-    {
-        extern bool usb_force_full_speed;
-        if (usb_force_full_speed)
-            REG_PORTSC1 |= PORTSCX_PORT_FORCE_FULL_SPEED;
-        else
-            REG_PORTSC1 &= ~PORTSCX_PORT_FORCE_FULL_SPEED;
-    }
 #endif
 
     init_control_queue_heads();

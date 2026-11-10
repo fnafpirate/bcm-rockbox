@@ -123,15 +123,6 @@ static bool usb_serial = false;
 #ifdef USB_ENABLE_AUDIO
 static int usb_audio = 0;
 #endif
-#ifdef IPOD_VIDEO
-/* bcm overlay v77: car / accessory mode -- iAP over USB (and its audio to the car) without mass storage, so the
-   iPod stays usable while it plays to the car; and the identity used for it (usb_core.c) */
-bool usb_iap_only;
-int usb_iap_ident;
-bool usb_force_full_speed;      /* v82: read by usb-drv-arc.c usb_drv_init() */
-int usb_iso_rx_mult = 1;        /* v83: usb-drv-arc.c, isochronous OUT queue head Mult (1 or 0) */
-extern void usb_core_set_ident(int ident);
-#endif
 static bool usb_host_present = false;
 static int usb_num_acks_to_expect = 0;
 static uint32_t usb_broadcast_seqnum = 0x80000000;
@@ -208,27 +199,6 @@ static inline void usb_handle_hotswap(long id)
 }
 #endif /* HAVE_HOTSWAP */
 
-#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && defined(USB_ENABLE_HID)
-/* bcm overlay v81: the PP502x USB controller has two endpoint pairs besides control (USB_NUM_ENDPOINTS 3), and both
-   directions of a pair must use the same transfer type.  Mass storage takes a pair (bulk in + out), the USB DAC a pair
-   (isochronous data out + feedback in), iAP 1.5 pairs (isochronous in + interrupt in), HID half a pair (interrupt in).
-   They do not all fit, and usb_core drops whatever does not, silently, in driver order -- storage, HID, DAC, iAP: so
-   v77's "Mass Storage + USB DAC" never had a DAC, and car mode's iAP lost to HID.  The functions asked for now get the
-   endpoints; HID (the iPod as a keyboard / remote for the computer) gives way. */
-static void usb_fit_endpoints(bool audio)
-{
-    if (audio)
-    {
-        usb_core_enable_driver(USB_DRIVER_HID, false);
-#ifdef USB_ENABLE_IAP
-        usb_core_enable_driver(USB_DRIVER_IAP, false);
-#endif
-    }
-    else if (usb_iap_only)
-        usb_core_enable_driver(USB_DRIVER_HID, false);
-}
-#endif
-
 static inline void usb_configure_drivers(int for_state)
 {
 #ifdef USB_ENABLE_AUDIO
@@ -238,9 +208,6 @@ static inline void usb_configure_drivers(int for_state)
     switch(for_state)
     {
     case USB_POWERED:
-#ifdef IPOD_VIDEO
-        usb_core_set_ident(0);
-#endif
 #ifdef USB_ENABLE_STORAGE
         usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, false);
 #endif
@@ -264,24 +231,14 @@ static inline void usb_configure_drivers(int for_state)
 #ifdef USB_ENABLE_CHARGING_ONLY
         usb_core_enable_driver(USB_DRIVER_CHARGING_ONLY, true);
 #endif
-#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && defined(USB_ENABLE_HID)
-        usb_fit_endpoints((usb_audio == 1) || (usb_audio == 2));
-#endif
 
         usb_attach();
         break;
         /* USB_POWERED: */
 
     case USB_INSERTED:
-#ifdef IPOD_VIDEO
-        usb_core_set_ident(usb_iap_only ? usb_iap_ident : 0);
-#endif
 #ifdef USB_ENABLE_STORAGE
-#ifdef IPOD_VIDEO
-        usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, !usb_iap_only);
-#else
         usb_core_enable_driver(USB_DRIVER_MASS_STORAGE, true);
-#endif
 #endif
 #ifdef USB_ENABLE_HID
         usb_core_enable_driver(USB_DRIVER_HID, usb_hid);
@@ -290,20 +247,13 @@ static inline void usb_configure_drivers(int for_state)
         usb_core_enable_driver(USB_DRIVER_SERIAL, usb_serial);
 #endif
 #ifdef USB_ENABLE_AUDIO
-#ifdef IPOD_VIDEO
-        usb_core_enable_driver(USB_DRIVER_AUDIO, !usb_iap_only && ((usb_audio == 1) || (usb_audio == 3)));
-#else
         usb_core_enable_driver(USB_DRIVER_AUDIO, (usb_audio == 1) || (usb_audio == 3)); // while "always" or "only in mass-storage mode"
-#endif
 #endif /* USB_ENABLE_AUDIO */
 #ifdef USB_ENABLE_IAP
         usb_core_enable_driver(USB_DRIVER_IAP, true);
 #endif
 #ifdef USB_ENABLE_CHARGING_ONLY
         usb_core_enable_driver(USB_DRIVER_CHARGING_ONLY, false);
-#endif
-#if defined(IPOD_VIDEO) && defined(USB_ENABLE_AUDIO) && defined(USB_ENABLE_HID)
-        usb_fit_endpoints(!usb_iap_only && ((usb_audio == 1) || (usb_audio == 3)));
 #endif
 
         usb_attach();
@@ -860,14 +810,6 @@ bool usb_inserted(void)
 }
 
 #if defined(USB_FULL_INIT)
-#ifdef IPOD_VIDEO
-/* bcm overlay v82: storage is (being made) exclusive: the other threads stop / are stopped for USB */
-bool usb_exclusive_storage_pending(void)
-{
-    return exclusive_storage_requested;
-}
-#endif
-
 bool usb_exclusive_storage(void)
 {
     /* Storage isn't actually exclusive until slave mode has been entered */

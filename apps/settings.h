@@ -775,9 +775,6 @@ struct user_settings
     bool bcm_clock_sync;   /* v74: set the clock from the computer (clocksync.txt over USB) */
     int bcm_tv_countdown;  /* v76: TV shows: seconds before the next episode (5..10) */
     bool bcm_dock_profile; /* v76: separate sound settings while docked (line-out) */
-    int bcm_usb_connect;   /* v77: USB connection preset (settings.c bcm_usb_apply) */
-    int bcm_usb_ident;     /* v77: car mode: 0 Rockbox, 1 iPod, 2 iPhone */
-    bool bcm_usb_dac_hs;   /* v82: USB DAC presets at high speed (default: full speed) */
     int bcm_piezo_speaker; /* v77: click speaker for music / video: 0 off, 1 no headphones, 2 always */
     int bcm_piezo_method;  /* v77: 0 PWM DAC, 1 resonant */
     int bcm_piezo_carrier; /* v77: PWM period, 0 = automatic */
