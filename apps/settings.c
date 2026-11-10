@@ -896,7 +896,9 @@ void settings_apply_videoout(int mode)
 #include "bcm_piezo.h"
 void bcm_usb_apply(int preset)
 {
+    extern bool usb_storage_fast_writes;
     (void)preset;
+    usb_storage_fast_writes = global_settings.bcm_usb_fast;   /* v87: read at each connection */
     global_settings.usb_mode = USB_MODE_MASS_STORAGE;
     usb_set_mode(USB_MODE_MASS_STORAGE);
 #ifdef USB_ENABLE_AUDIO

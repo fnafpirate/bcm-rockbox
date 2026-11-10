@@ -18863,3 +18863,139 @@
     ipodvideo: "Strong"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_USB_WRITE_SPEED
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB Write Speed"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB Write Speed"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB Write Speed"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_WRITE_FAST
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Fast (64 KB writes)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Fast (64 KB writes)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Fast (64 KB writes)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_USB_WRITE_STOCK
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Stock (24 KB)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Stock (24 KB)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Stock (24 KB)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_CHARGED
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Charging Complete Alert"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Charging Complete Alert"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Charging Complete Alert"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_TEST_CHARGED
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Test Charging Chime"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Test Charging Chime"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Test Charging Chime"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_CHARGING_COMPLETE
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Charging complete"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Charging complete"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Charging complete"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_PIEZO_PREPARING
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Preparing click speaker sound..."
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Preparing click speaker sound..."
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Preparing click speaker sound..."
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_CRT
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Retro CRT Filter (TV)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Retro CRT Filter (TV)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Retro CRT Filter (TV)"
+  </voice>
+</phrase>

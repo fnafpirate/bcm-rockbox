@@ -10,7 +10,12 @@
  *   Shutdown Sound              Off / On
  *   Test Start-up Sound
  * The voice is apps/bcm_piezo_voice.h (tools/bcm/piezo_voice.py), or /.rockbox/piezo/boot.wav when that exists:
- * any PCM WAV (8 / 16-bit, mono / stereo, any rate), its first 3 s.
+ * any PCM WAV (8 / 16-bit, mono / stereo, any rate), its first 5 s.
+ * v88: your own sounds -- any one file (any name; MP3, M4A, FLAC, OGG, WAV ...) in
+ *   /.rockbox/startup chime     replaces the start-up chime and voice
+ *   /.rockbox/charging chime    replaces the charging-complete chime
+ * Empty folder = the built-in sound.  Both folders are made at start-up when missing.  A new file is converted once
+ * (plugin viewers/piezo_snd.rock, "Preparing click speaker sound...") and kept in /.rockbox/piezo.
  *
  * This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public
  * License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later
@@ -29,21 +34,32 @@
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
 #include "piezo.h"
 #include "bcm_piezo_voice.h"
+#include "dir.h"
+#include "rbpaths.h"
+#include "plugin.h"
+#include "splash.h"
+#include "lang.h"
 
 #define BOOT_WAV ROCKBOX_DIR "/piezo/boot.wav"
-#define MAX_SECONDS 3
+#define MAX_SECONDS 5                     /* v88: 3 -> 5 s (the start-up / charging sounds) */
 #define SAMPLE_RATE 16000                 /* v78: the voice / WAV / test sounds are kept at 16 kHz */
 
 static const unsigned short chime_up[] = { 1047, 70, 1319, 70, 1568, 70, 2093, 150, 0, 40, 0, 0 };
 static const unsigned short chime_down[] = { 2093, 70, 1568, 70, 1319, 70, 1047, 160, 0, 0 };
 
 static unsigned char wav_buf[MAX_SECONDS * SAMPLE_RATE];
+static unsigned char chg_buf[MAX_SECONDS * SAMPLE_RATE];   /* v88: the charging chime stays in memory (USB mode) */
+static unsigned chg_n;
+#define DIR_STARTUP  ROCKBOX_DIR "/startup chime"
+#define DIR_CHARGING ROCKBOX_DIR "/charging chime"
+#define CACHE_DIR    ROCKBOX_DIR "/piezo"
+#define DECODER      VIEWERS_DIR "/piezo_snd.rock"
 
 static unsigned rd16(const unsigned char *p) { return p[0] | p[1] << 8; }
 static unsigned long rd32(const unsigned char *p) { return rd16(p) | (unsigned long)rd16(p + 2) << 16; }
 
 /* the WAV, as 8-bit unsigned at the piezo's rate, loudest part at full scale: the number of samples, 0 = none */
-static unsigned load_wav(const char *path)
+static unsigned load_wav(const char *path, unsigned char *dst)
 {
     unsigned char h[44], chunk[512];
     int fd = open(path, O_RDONLY);
@@ -132,7 +148,7 @@ static unsigned load_wav(const char *path)
         for (i = 0; i < out; i++)
         {
             int v = 128 + tmp[i] * 127 / peak;
-            wav_buf[i] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
+            dst[i] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
         }
         core_unpin(hnd);
         core_free(hnd);
@@ -142,6 +158,75 @@ static unsigned load_wav(const char *path)
 fail:
     close(fd);
     return 0;
+}
+
+/* v88: the user's sound in `dir` (the first file by name; hidden files and Windows / macOS clutter skipped) -> dst as
+   8-bit 16 kHz, the number of samples (0 = none: the built-in sound).  The decoded copy is kept as `cache` with a stamp
+   of the source (name|size|date) in cache".id"; a file that could not be decoded is remembered there as well, so it is
+   not tried again at every start-up. */
+static unsigned prepare_sound(const char *dir, const char *cache, unsigned char *dst)
+{
+    char best[MAX_PATH], src[MAX_PATH], idpath[MAX_PATH], stamp[MAX_PATH + 40], old[MAX_PATH + 40];
+    DIR *d;
+    struct dirent *e;
+    struct dirinfo bi = { 0, 0, 0 };
+    unsigned n;
+    int fd, len;
+    best[0] = 0;
+    if (!dir_exists(dir)) { mkdir(dir); return 0; }
+    d = opendir(dir);
+    if (!d) return 0;
+    while ((e = readdir(d)) != NULL)
+    {
+        struct dirinfo inf = dir_get_info(d, e);
+        if (e->d_name[0] == '.' || (inf.attribute & ATTR_DIRECTORY) || inf.size <= 0
+            || !strcasecmp(e->d_name, "desktop.ini") || !strcasecmp(e->d_name, "thumbs.db"))
+            continue;
+        if (!best[0] || strcasecmp(e->d_name, best) < 0)
+        {
+            strlcpy(best, e->d_name, sizeof best);
+            bi = inf;
+        }
+    }
+    closedir(d);
+    if (!best[0]) return 0;
+    snprintf(src, sizeof src, "%s/%s", dir, best);
+    {   const char *ext = strrchr(best, '.');
+        if (ext && !strcasecmp(ext, ".wav") && (n = load_wav(src, dst)) != 0)
+            return n;                                  /* a PCM WAV: read as it is */
+    }
+    snprintf(stamp, sizeof stamp, "%s|%ld|%ld", best, (long)bi.size, (long)bi.mtime);
+    snprintf(idpath, sizeof idpath, "%s.id", cache);
+    old[0] = 0;
+    fd = open(idpath, O_RDONLY);
+    if (fd >= 0) { len = read(fd, old, sizeof old - 1); old[len > 0 ? len : 0] = 0; close(fd); }
+    if (!strcmp(old, stamp) && (n = load_wav(cache, dst)) != 0)
+        return n;                                      /* decoded before */
+    if (!strncmp(old, "FAIL|", 5) && !strcmp(old + 5, stamp))
+        return 0;                                      /* this file could not be decoded: the built-in sound */
+    if (!file_exists(DECODER)) return 0;
+    if (!dir_exists(CACHE_DIR)) mkdir(CACHE_DIR);
+    remove(cache);
+    {   char param[2 * MAX_PATH + 8];
+        snprintf(param, sizeof param, "%s\n%s\n%d", src, cache, MAX_SECONDS);
+        splash(0, ID2P(LANG_PIEZO_PREPARING));
+        plugin_load(DECODER, param);
+    }
+    n = file_exists(cache) ? load_wav(cache, dst) : 0;
+    fd = open(idpath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0)
+    {
+        if (!n) write(fd, "FAIL|", 5);
+        write(fd, stamp, strlen(stamp));
+        close(fd);
+    }
+    return n;
+}
+
+static void charge_setup(void)
+{
+    chg_n = prepare_sound(DIR_CHARGING, CACHE_DIR "/charging.wav", chg_buf);
+    piezo_charge_alert(global_settings.bcm_piezo_charged, chg_buf, chg_n, SAMPLE_RATE);
 }
 
 void bcm_piezo_apply(void)
@@ -167,15 +252,21 @@ void bcm_piezo_apply(void)
     }
     piezo_set_clarity(global_settings.bcm_piezo_clarity);
     piezo_set_max(global_settings.bcm_piezo_max);
+    piezo_charge_alert(global_settings.bcm_piezo_charged, chg_buf, chg_n, SAMPLE_RATE);   /* v88 */
 }
 
-static void play_boot(int what)
+static void play_boot(int what, unsigned custom)
 {
+    if (custom)
+    {   /* v88: the user's sound replaces the chime and the voice */
+        piezo_play_samples(wav_buf, custom, SAMPLE_RATE);
+        return;
+    }
     if (what & 1)
         piezo_play_tune(chime_up);
     if (what & 2)
     {
-        unsigned n = load_wav(BOOT_WAV);
+        unsigned n = load_wav(BOOT_WAV, wav_buf);    /* the v77 place, still read */
         if (n)
             piezo_play_samples(wav_buf, n, SAMPLE_RATE);
         else
@@ -185,14 +276,31 @@ static void play_boot(int what)
 
 void bcm_piezo_startup(void)
 {
+    unsigned custom;
     bcm_piezo_apply();
-    play_boot(global_settings.bcm_piezo_boot);
+    custom = prepare_sound(DIR_STARTUP, CACHE_DIR "/startup.wav", wav_buf);
+    charge_setup();                                  /* v88: decoded (if needed) before anything plays */
+    if (global_settings.bcm_piezo_boot)
+        play_boot(global_settings.bcm_piezo_boot, custom);
 }
 
 int bcm_piezo_test(void)
 {
+    unsigned custom;
+    while (piezo_busy()) sleep(HZ / 20);             /* wav_buf may still be playing */
     bcm_piezo_apply();
-    play_boot(global_settings.bcm_piezo_boot ? global_settings.bcm_piezo_boot : 3);
+    custom = prepare_sound(DIR_STARTUP, CACHE_DIR "/startup.wav", wav_buf);
+    play_boot(global_settings.bcm_piezo_boot ? global_settings.bcm_piezo_boot : 3, custom);
+    return 0;
+}
+
+/* v88 */
+int bcm_piezo_test_charged(void)
+{
+    while (piezo_busy()) sleep(HZ / 20);
+    bcm_piezo_apply();
+    charge_setup();
+    piezo_play_charged();
     return 0;
 }
 

@@ -782,8 +782,11 @@ struct user_settings
     bool bcm_piezo_shutdown; /* v77 */
     int bcm_piezo_quality; /* v78: 0 11 kHz, 1 22 kHz */
     bool bcm_piezo_loudness; /* v78: compressor */
+    bool bcm_usb_fast;     /* v87: USB Write Speed: Fast = 64 KB (flash) / 32 KB (disk) write chunks */
     int bcm_piezo_clarity; /* v86: presence EQ 0 off, 1 +4 dB, 2 +10 dB */
     int bcm_piezo_max;       /* v80: Sound Mode: 0 custom, 1 Maximum Loudness, 2 Highest Quality */
+    bool bcm_piezo_charged;  /* v88: charging-complete chime + message */
+    bool bcm_tv_crt;         /* v88: retro CRT scanlines over the TV picture */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

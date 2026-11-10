@@ -715,6 +715,12 @@ long default_event_handler_ex(long event, void (*callback)(void *), void *parame
             unpause_action(true);
             return SYS_CAR_ADAPTER_RESUME;
 #endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+        case SYS_BCM_CHARGED:                    /* bcm overlay v88: the piezo thread saw the battery get full */
+            if (global_settings.bcm_piezo_charged)
+                splash(2 * HZ, ID2P(LANG_CHARGING_COMPLETE));
+            return SYS_BCM_CHARGED;
+#endif
 #if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
         case SYS_IAP_DOCK:                       /* bcm overlay v74: dock connected / gone, power source */
             iap_dock_ui();

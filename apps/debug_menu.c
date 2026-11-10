@@ -2954,9 +2954,10 @@ static volatile int  bcm_wd_on;
 static long bcm_last_sync;
 static long bcm_sync_every;      /* v45: while a video plays, fsync at most this often (ticks; 0 = old rules) */
 static int  bcm_trace_42;        /* v45: number of PDS 0x42 trace lines written */
+static volatile int bcm_wd_secs = BCM_WD_SECS;   /* v87: 15 s while the display is handed back */
 static void bcm_wd_tick(void)
 {
-    if (bcm_wd_on && (long)(current_tick - bcm_wd_last) > BCM_WD_SECS * HZ)
+    if (bcm_wd_on && (long)(current_tick - bcm_wd_last) > bcm_wd_secs * HZ)
         system_reboot();
 }
 static void bcm_logline(const char *s, int n)
@@ -3881,7 +3882,14 @@ static int v_sound;                  /* v53: route in use this run (cfg_sound, o
 static bool v_fallback;              /* v53: the stock route stalled -> restart the video with Rockbox's sound */
 static int cfg_av_ready = 8;                       /* v52: PCM chunks buffered before the sound counts as ready */
 static int cfg_prep = 1;                                                            /* v78: start-up helper thread */
+static int cfg_hang_s = 12;                      /* v87: seconds without a frame request while playing = the VC has stopped */
 static int cfg_ff_resume = 1;                    /* v78: FF/REW release: 1 = resume where the VC is, 0 = seek to the shown frame */
+/* v88: movie quiz (apps/plugins/movie_quiz.c through bcm_video_quiz) and the TV's retro CRT layer */
+static bool qz_on, qz_ran;
+static int qz_permille, qz_state;
+static long qz_t, qz_since;
+static uint32_t qz_k;
+static int cfg_crt_alpha = 0x5c, cfg_crt_edge = 0x70, cfg_crt_layer = 0;   /* 0 = just below the subtitles */
 static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
@@ -3968,6 +3976,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "play_secs")) cfg_play_secs = v;
         else if (!strcmp(p, "osd"))      cfg_osd = v;
         else if (!strcmp(p, "osd_layer")) cfg_osd_layer = v;
+        else if (!strcmp(p, "crt_alpha")) cfg_crt_alpha = v < 0 ? 0 : v > 255 ? 255 : v;   /* v88 */
+        else if (!strcmp(p, "crt_edge"))  cfg_crt_edge = v < 0 ? 0 : v > 255 ? 255 : v;
+        else if (!strcmp(p, "crt_layer")) cfg_crt_layer = v;
         else if (!strcmp(p, "subs"))     cfg_subs = v;
         else if (!strcmp(p, "subs_layer")) cfg_subs_layer = v;
         else if (!strcmp(p, "subs_sync")) cfg_subs_sync = v < 200 ? 200 : v;
@@ -4007,6 +4018,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "vol_step")) cfg_vol_step = v < 1 ? 1 : v;
         else if (!strcmp(p, "trickprobe")) cfg_trickprobe = v;
         else if (!strcmp(p, "prep"))   cfg_prep = v;
+        else if (!strcmp(p, "hang_s")) cfg_hang_s = v;
         else if (!strcmp(p, "ff_resume")) cfg_ff_resume = v;
         else if (!strcmp(p, "probe_ms")) cfg_probe_ms = v < 500 ? 500 : v;
         else if (!strcmp(p, "jump_tick")) cfg_jump_tick = v < 300 ? 300 : v;
@@ -4378,7 +4390,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v86 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v88 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5567,7 +5579,7 @@ static void st_tick(void)
 /* the start of a video: tracks, the first choice (Settings > Subtitles) */
 static void st_begin(const char *video)
 {
-    bool on = cfg_subs >= 0 ? cfg_subs != 0 : global_settings.bcm_subs;
+    bool on = !qz_on && (cfg_subs >= 0 ? cfg_subs != 0 : global_settings.bcm_subs);   /* v88: none in the quiz */
     st_end();
     st_cur = -1;
     st_find_tracks(video);
@@ -6293,6 +6305,22 @@ static int bcm_player_input(char *resp, size_t rn)
         return 0;
     }
     if (IS_SYSEVENT(b)) return 0;
+    if (qz_on)
+    {   /* v88 quiz: MENU = make a guess (the normal MENU handling below: short = back to the quiz, held = TV / iPod);
+           PLAY once the frame is up = a hint: 3 s more, muted, then paused again.  Nothing else (seeking, the wheel's
+           volume, the controls) -- they would give the film away. */
+        raw = rc_to_local(b & ~(BUTTON_REPEAT | BUTTON_REL));
+        if (raw != BUTTON_MENU)
+        {
+            if (raw == BUTTON_PLAY && !(b & (BUTTON_REL | BUTTON_REPEAT)) && qz_state == 3)
+            {
+                pl_cmd("mp_play", true); pl_paused = false;
+                qz_state = 4; qz_t = current_tick + 3 * HZ;
+                BLOG("  quiz: hint (3 s)");
+            }
+            return 0;
+        }
+    }
     av_boost_until = current_tick + 3 * HZ;            /* v57 */
     if (!av_boosted && cfg_boost) av_boost(true);
     raw = b & ~(BUTTON_REPEAT | BUTTON_REL);
@@ -6425,6 +6453,135 @@ static void av_boost_tick(long run_t0)
     else av_boost(false);
 }
 static int bcm_hw_model(int log);
+/* v88: full-screen layers made of one image W x 48 shown as a column of windows (the VideoCore cannot scale a window,
+   and one 720 x 576 ARGB image would be 1.6 MB of its memory; a 48-line strip is 138 KB, written once over the bus).
+   Layer 0 = the TV's retro CRT look, 1 = the quiz cover (black, hides the film's opening until the random frame is up). */
+#define TL_H 48
+static uint32_t tl_img[2], tl_addr[2], tl_win[2][13];
+static int tl_n[2], tl_disp[2];
+static uint8_t tl_row[2][720 * 4] __attribute__((aligned(4)));
+static uint32_t tl_add(int disp, int layer, uint32_t img, int y, int w)
+{
+    uint32_t o[4], pl[8];
+    memset(pl, 0, sizeof pl);
+    pl[0] = (uint32_t)disp; pl[1] = (uint32_t)layer; pl[3] = img;
+    ((uint16_t *)pl)[8] = 0; ((uint16_t *)pl)[9] = (uint16_t)y;
+    ((uint16_t *)pl)[12] = (uint16_t)w; ((uint16_t *)pl)[13] = TL_H;
+    return bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0 ? (o[0] ? o[0] : 0xffffffffu) : 0;
+}
+static void tl_off(int k)
+{
+    uint32_t o[4];
+    int i;
+    if (!tl_n[k]) return;
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    for (i = 0; i < tl_n[k]; i++) st_rm_win(tl_win[k][i]);
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    tl_n[k] = 0;
+}
+/* rows: tl_row[0] for lines with (y & 3) < 2, tl_row[1] for the others; type 15 = ARGB8888, 1 = RGB565 */
+static int tl_on(int k, int type, int disp, int layer, int w, int h)
+{
+    uint32_t o[4];
+    int y, i, bpp = type == 15 ? 4 : 2;
+    if (tl_n[k]) return 0;
+    if (!tl_img[k] || tl_disp[k] != w)
+    {   /* the images live until the VideoCore reboots at the end of the video */
+        if (osd_alloc(type, w, TL_H, &tl_img[k], &tl_addr[k]) != 0) { tl_img[k] = 0; BLOG("  layer %d: the VideoCore refused a %dx%d image", k, w, TL_H); return -1; }
+        tl_disp[k] = w;
+        for (y = 0; y < TL_H; y++)
+        {
+            bcm_io_lock(); bcm_io_write(tl_addr[k] + (unsigned)y * w * bpp, tl_row[(y & 3) >= 2], (unsigned)w * bpp); bcm_io_unlock();
+            if ((y & 7) == 7) bcm_host_service();
+        }
+    }
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    for (i = 0; i * TL_H < h && i < 13; i++)
+    {
+        uint32_t wn = tl_add(disp, layer, tl_img[k], i * TL_H, w);
+        if (!wn) break;
+        tl_win[k][tl_n[k]++] = wn;
+    }
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    BLOG("  layer %d: %d window(s) of %dx%d on display %d, layer %d", k, tl_n[k], w, TL_H, disp, layer);
+    return tl_n[k] ? 0 : -1;
+}
+/* the retro CRT look on the TV: 240-line scanlines (2 lines lit, 2 darkened -- the same in both fields, so an
+   interlaced set does not flicker) and the left / right edges shaded like a curved tube */
+static void crt_on(void)
+{
+    int x, th = global_settings.bcm_tv_signal ? 576 : 480, edge = 72;
+    uint32_t *a = (uint32_t *)tl_row[0], *b = (uint32_t *)tl_row[1];
+    if (!bcm_tv || !global_settings.bcm_tv_crt || tl_n[0]) return;
+    for (x = 0; x < 720; x++)
+    {
+        int d = x < 720 - 1 - x ? x : 720 - 1 - x, e = d < edge ? cfg_crt_edge * (edge - d) * (edge - d) / (edge * edge) : 0;
+        int dark = 255 - (255 - cfg_crt_alpha) * (255 - e) / 255;
+        a[x] = (uint32_t)e << 24;                       /* black, alpha only */
+        b[x] = (uint32_t)dark << 24;
+    }
+    tl_img[0] = tl_img[0] && tl_disp[0] == 720 ? tl_img[0] : 0;
+    tl_on(0, 15, 2, cfg_crt_layer ? cfg_crt_layer : (cfg_subs_layer ? cfg_subs_layer : cfg_osd_layer - 1) - 1, 720, th);
+}
+static void qz_cover_on(void)
+{
+    int w = bcm_tv ? 720 : LCD_WIDTH, h = bcm_tv ? (global_settings.bcm_tv_signal ? 576 : 480) : LCD_HEIGHT;
+    memset(tl_row, 0, sizeof tl_row);                /* black, RGB565 */
+    tl_on(1, 1, bcm_tv ? 2 : 0, cfg_osd_layer + 10, w, h);
+}
+/* the quiz: the picture starts under the cover; once it moves it is paused and sent to a key frame at qz_permille of
+   the film; when that frame is on screen the cover goes */
+static void qz_tick(long run_t0)
+{
+    if (!qz_on || qz_state == 0 || qz_state == 3 || TIME_BEFORE(current_tick, qz_t)) return;
+    if (qz_state == 4)
+    {   /* the hint ran its 3 s: paused again */
+        pl_cmd("mp_pause", true); pl_paused = true; av_hold();
+        qz_state = 3;
+        return;
+    }
+    qz_t = current_tick + HZ / 4;
+    if (qz_state == 1)
+    {
+        uint32_t len = m4_dur_ms ? m4_dur_ms : pl_dur_ms, want;
+        char c[40];
+        pl_status();
+        if (!len) len = pl_dur_ms;
+        if (pl_el_ms < 200 && current_tick - run_t0 < 15 * HZ) return;   /* not moving yet */
+        want = (uint32_t)((uint64_t)len * (uint32_t)qz_permille / 1000u);
+        av_hold();
+        pl_cmd("mp_pause", true); pl_paused = true;
+        m4_key_at(want, &qz_k);
+        snprintf(c, sizeof c, "mp_seek %u", (unsigned)qz_k);
+        pl_cmd(c, true);
+        pl_el_ms = qz_k; pl_target_ms = qz_k; vr_el_tick = current_tick; st_seeked();
+        av_prep(qz_k, false);
+        BLOG("  quiz: %d.%d %% of %u ms -> key frame at %u ms (paused)", qz_permille / 10, qz_permille % 10, (unsigned)len, (unsigned)qz_k);
+        qz_state = 2; qz_t = current_tick + HZ; qz_since = current_tick;
+    }
+    else
+    {   /* 2: paused after the seek -- the VideoCore normally shows the key frame by itself.  5: it did not within 3 s:
+           let it run (muted, still covered) until the new place is on screen, then pause there */
+        uint32_t dt = 0;
+        bool shown = pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu && dt + 2000 >= qz_k && dt <= qz_k + 8000;
+        if (!shown)
+        {
+            if (qz_state == 2 && current_tick - qz_since > 3 * HZ)
+            {
+                BLOG("  quiz: no picture at the new place while paused (on screen %u ms) -- playing to it", (unsigned)dt);
+                pl_cmd("mp_play", true); pl_paused = false;
+                qz_state = 5; qz_since = current_tick;
+            }
+            if (current_tick - qz_since < 5 * HZ) return;
+        }
+        if (!pl_paused) { pl_cmd("mp_pause", true); pl_paused = true; av_hold(); }
+        tl_off(1);
+        qz_state = 3;
+        BLOG("  quiz: frame at %u ms wanted, %u ms on screen -- cover off", (unsigned)qz_k, (unsigned)dt);
+        st_toast("MENU = guess   PLAY = hint");
+    }
+}
+
 static void bcm_video_run(int secs)
 {
     long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
@@ -6435,6 +6592,7 @@ static void bcm_video_run(int secs)
     long pw1 = 0, pw2 = 0;
     static int framedumped;
     BLOG("  >>> LOOK: mp_play sent -- VIDEO should appear from here (variant post=%d)", cfg_post);
+    bcm_wd_secs = BCM_WD_SECS;                         /* v87: playing: the usual 45 s */
     if (cfg_post >= 1 && gfx_front >= 0)
     {
         uint32_t o[4], w4[4] = { gfx_win[gfx_front], 0, 0, 0 };
@@ -6457,14 +6615,27 @@ static void bcm_video_run(int secs)
         backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* v47.1: video at full brightness (restored when it ends) */
         backlight_set_on_button_hold(2);                   /* v50: the hold switch does not turn the screen off while a video plays */
     }
+    else
+    {   /* v87: on the TV the iPod's panel shows nothing (the VideoCore drives the TV only): a lit, empty panel is white.
+           Backlight off now (a button lights it; Rockbox's timeout turns it off again).  Saves power too. */
+        backlight_off();
+    }
     av_boost(true);                                    /* v51: boosted; v57: only while it is needed (av_boost_tick) */
 #ifdef HAVE_BATTERY_SMOOTH_API
     powermgmt_set_load_hint(3, true);                  /* v58: the battery reading knows the video decoder is running */
 #endif
     av_open(bcm_play_path ? bcm_play_path : v_path);   /* v51: sound (starts when the picture moves) */
-    backlight_on();
+    if (!bcm_tv) backlight_on();                       /* v87: not on the TV (see above) */
     bool hold_was = button_hold();
-    bool probed = !cfg_trickprobe;
+    bool probed = !cfg_trickprobe || qz_on;            /* v88: the trick probe seeks around: not in the quiz */
+    qz_ran = true;
+    if (qz_on)
+    {   /* v88: muted (av_close puts the volume back), covered until the random frame is up */
+        av_set_vol(0);
+        qz_state = 1; qz_t = current_tick;
+        qz_cover_on();
+    }
+    crt_on();                                          /* v88: TV + Settings > Video Out > Retro CRT Filter */
     bool av_checked = false;
     uint32_t rate_e0 = 0; long rate_t0 = 0; int rate_seeks = 0;   /* v54: VC clock speed vs real time */
     if (v_sound == 2 && cfg_vcvol >= 0)
@@ -6514,6 +6685,7 @@ static void bcm_video_run(int secs)
             break;
         }
         bcm_osd_tick();
+        qz_tick(run_t0);                               /* v88 */
         if (st_cur >= 0 && st_ok == 0 && current_tick - run_t0 > HZ && !sc_active)
             st_setup();                                /* v78: subtitle images made after the start (not before mp_selectplay) */
         if (v_sound == 2 && !av_checked && current_tick - run_t0 > cfg_av_stall * HZ && !pl_paused && !sc_active)
@@ -6641,6 +6813,16 @@ static void bcm_video_run(int secs)
         if (v_getframes != gf_last) { gf_last = v_getframes; last_req = current_tick; yield(); }
         else if (current_tick - last_req < HZ / 20) yield();
         else sleep(1);
+        if (cfg_hang_s > 0 && !pl_paused && !sc_active && !v_eos && current_tick - run_t0 > 20 * HZ
+            && current_tick - last_req > cfg_hang_s * HZ)
+        {   /* v87: playing, not paused, not at the end, and the VideoCore has not asked for a single frame for cfg_hang_s
+               seconds (it asks ~70 times a second while it plays): it has stopped.  Leave like MENU does -- the display goes
+               back to Rockbox -- instead of a frozen or white screen until a reboot. */
+            BLOG("  HANG: no frame request for %d s while playing -- stopping the video, the display goes back to Rockbox",
+                 cfg_hang_s);
+            st_toast("VideoCore stopped");
+            break;
+        }
     }
     bcm_video_running = false;                         /* v63 */
     sc_remote = false;
@@ -6938,6 +7120,7 @@ static void bcm_out_switch(void)
     st_ok = 0; st_win = 0; st_front = -1; st_nimg = 0; st_nshown = 0; st_shown_any = false; st_shown_msgv = -1;
     if (bcm_tv)
     {
+        tl_off(0);                                     /* v88 */
         bcm_tv_enable(false);
         bcm_region("hold MENU: to the iPod screen");
         bcm_tv = false;
@@ -6951,6 +7134,7 @@ static void bcm_out_switch(void)
         bcm_tv_enable(true);
     }
     iap_dock_remember_tv(bcm_tv);
+    if (bcm_tv) crt_on();                              /* v88: the CRT layer is for the TV only */
     st_toast(bcm_tv ? "TV" : "iPod");
     osd_show_for(3000);
 }
@@ -7318,6 +7502,8 @@ static void bcm_reset_run_state(void)
     sc_active = false; sc_btn = 0; mon_until = 0;
     av_have = false; av_state = 0; av_vol_until = 0;
     m4c_miss = m4d_miss = 0;
+    tl_n[0] = tl_n[1] = 0; tl_img[0] = tl_img[1] = 0;  /* v88: the VideoCore rebooted: its images are gone */
+    qz_state = 0;
 }
 static bool bcm_run(const char *play_path);
 static bool dbg_bcm_host(void) { return bcm_run(NULL); }
@@ -7350,6 +7536,15 @@ bool bcm_video_play_again(const char *path)
     bcm_video_finished = false;
     return bcm_run(path);
 }
+/* v88: the movie quiz (apps/plugins/movie_quiz.c): muted, from `permille` of the film, paused on that frame */
+bool bcm_video_quiz(const char *path, int permille, bool first)
+{
+    qz_on = true; qz_ran = false;
+    qz_permille = permille < 0 ? 0 : permille > 990 ? 990 : permille;
+    if (first) bcm_video_play(path); else bcm_video_play_again(path);
+    qz_on = false;
+    return qz_ran;
+}
 bool bcm_video_is_video(const char *path)
 {
     const char *e = strrchr(path, '.');
@@ -7376,7 +7571,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v86, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v88, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -7397,6 +7592,7 @@ static bool bcm_run(const char *play_path)
     }
 #endif
     bcm_wd_last = current_tick; bcm_wd_on = 1;
+    bcm_wd_secs = bcm_player_mode ? 20 : BCM_WD_SECS;   /* v87: a start that goes quiet for 20 s has hung (white screen): reboot */
     tick_add_task(bcm_wd_tick);
     bcm_load_cfg();
     if (!cfg_fast) bcm_sync_every = 0;
@@ -7589,8 +7785,10 @@ out:
     {   /* v47: back to the file browser: Rockbox's own display firmware is booted again, nothing is rebooted */
         int rr = 0;
         bcm_sync_every = 0;                            /* v47.1: every line below reaches the disk (v47 froze here, log lost) */
-        bcm_wd_on = 0;
-        tick_remove_task(bcm_wd_tick);
+        /* v87: the watchdog stays on through the hand-back (it was switched off here: a hang while powering the VideoCore
+           down or booting Rockbox's display firmware left a white screen until the battery ran out); 20 s from now */
+        bcm_wd_last = current_tick;
+        bcm_wd_secs = 15;
         if (bcm_play_path)
         {
             /* v56: panel off first, then the VideoCore (it may stop answering after power_control); backlight off before
@@ -7630,14 +7828,27 @@ out:
             BLOG("player: GPO32 = %08lx -- powering the BCM down and booting Rockbox's display firmware", *(volatile unsigned long *)0x70000080);
             rr = bcm_restore_rom_vmcs();
             BLOG("player: display back to Rockbox (%d: 0 ok, -3 BCM did not boot, -2 no first update)", rr);
+            {   /* v87: -2 (the display firmware booted but its first picture never finished) was accepted -- a white
+                   panel.  Now: power the BCM down and boot the display firmware again, twice more, then reboot. */
+                int tries;
+                for (tries = 1; tries <= 2 && rr != 0; tries++)
+                {
+                    bcm_wd_last = current_tick;
+                    sleep(HZ / 5);
+                    rr = bcm_restore_rom_vmcs();
+                    BLOG("player: display hand-back again (%d/2) -> %d", tries, rr);
+                }
+            }
             backlight_set_brightness(global_settings.brightness);
-            if (rr != 0 && rr != -2)
+            if (rr != 0)
             {
-                BLOG("player: the display did not come back -- rebooting instead of freezing");
+                BLOG("player: the display did not come back -- rebooting instead of a white screen");
                 bcm_log_close();
                 system_reboot();
             }
         }
+        bcm_wd_on = 0;
+        tick_remove_task(bcm_wd_tick);
         bcm_log_close();
         bcm_sync_every = 0; bcm_player_mode = false; bcm_play_path = NULL;
         backlight_on();

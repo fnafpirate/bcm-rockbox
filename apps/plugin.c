@@ -20,6 +20,9 @@
 #define DIRFUNCTIONS_DEFINED
 #define FILEFUNCTIONS_DEFINED
 #include "plugin.h"
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+extern bool bcm_video_quiz(const char *path, int permille, bool first);   /* bcm overlay v88 */
+#endif
 #include "open_plugin.h"
 #include <ctype.h>
 #include <string.h>
@@ -891,6 +894,9 @@ static const struct plugin_api rockbox_api = {
 #endif
 #if defined(HAVE_REMOTE_LCD) && defined(HAS_REMOTE_BUTTON_HOLD)
     remote_backlight_set_on_button_hold,
+#endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    bcm_video_quiz,              /* bcm overlay v88: apps/debug_menu.c */
 #endif
 };
 

@@ -38,3 +38,7 @@ void piezo_settings(int method, int carrier, int boost, int speaker, int quality
 extern volatile bool piezo_docked;
 void piezo_set_clarity(int c);                  /* v86: 0 off, 1 +4 dB, 2 +10 dB at ~3 kHz */
 void piezo_set_max(int mode);                   /* v80: 0 custom, 1 Maximum Loudness, 2 Highest Quality */
+/* v88: the charging-complete alert: on/off and the sound (NULL / 0 = the built-in chime; the data must stay) */
+void piezo_charge_alert(int on, const unsigned char *u8, unsigned n, unsigned rate);
+void piezo_play_charged(void);
+#define SYS_BCM_CHARGED MAKE_SYS_EVENT(SYS_EVENT_CLS_MISC, 7)   /* v88: broadcast once the battery is full */

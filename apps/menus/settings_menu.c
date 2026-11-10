@@ -431,7 +431,13 @@ MAKE_MENU(sel_softlock, ID2P(LANG_SOFTLOCK_SELECTIVE),
 MENUITEM_SETTING(governor, &global_settings.governor, NULL);
 #endif
 
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+MENUITEM_SETTING(bcm_usb_fast_item, &global_settings.bcm_usb_fast, NULL);     /* v87 */
+#endif
 MAKE_MENU(usb_menu, ID2P(LANG_USB_MENU), 0, Icon_NOICON,
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+            &bcm_usb_fast_item,
+#endif
 #ifdef USB_ENABLE_HID
             &usb_hid,
             &usb_keypad_mode,
@@ -861,8 +867,9 @@ MENUITEM_SETTING(bcm_video_out_item, &global_settings.bcm_video_out, NULL);
 MENUITEM_SETTING(bcm_tv_signal_item, &global_settings.bcm_tv_signal, NULL);
 MENUITEM_SETTING(bcm_tv_picture_item, &global_settings.bcm_tv_picture, NULL);
 MENUITEM_SETTING(bcm_tv_wide_item, &global_settings.bcm_tv_wide, NULL);
+MENUITEM_SETTING(bcm_tv_crt_item, &global_settings.bcm_tv_crt, NULL);   /* v88 */
 MAKE_MENU(video_out_menu, ID2P(LANG_VIDEO_OUT), 0, Icon_Display_menu,
-          &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_wide_item, &bcm_tv_picture_item);
+          &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_wide_item, &bcm_tv_picture_item, &bcm_tv_crt_item);
 /* bcm overlay v73: video subtitles */
 MENUITEM_SETTING(bcm_subs_item, &global_settings.bcm_subs, NULL);
 MENUITEM_SETTING(bcm_sub_size_item, &global_settings.bcm_sub_size, NULL);

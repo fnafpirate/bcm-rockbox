@@ -37,6 +37,8 @@
 #include "pcm_sampr.h"
 #include "pcm_sink.h"
 #include "pcm_mixer.h"
+#include "power.h"
+#include "powermgmt.h"
 #endif
 
 static long piezo_stack[DEFAULT_STACK_SIZE/sizeof(long)];
@@ -470,6 +472,68 @@ static inline void piezo_hw_stop(void)
 #endif
 }
 
+#ifdef HAVE_PIEZO_SPEAKER_CODE
+/* v88: charging complete.  The iPod's charger reports "charging" on a pin (charging_state()); when it has charged for at
+   least a minute and then stops while the charger is still in -- for 30 s in a row, with the battery at 90 % or more --
+   the battery is full: one chime (the user's sound from /.rockbox/charging chime when apps/bcm_piezo.c gave one) and
+   SYS_BCM_CHARGED for the screen.  Once per plug-in.  This runs in the piezo thread, which (since v88) does not stop for
+   USB, so it also works while the iPod is connected to a computer. */
+static const unsigned short chime_full[] = { 1319, 90, 0, 40, 1568, 90, 0, 40, 2093, 260, 0, 0 };
+static volatile int chg_on = 1;
+static const unsigned char * volatile chg_smp;
+static volatile unsigned chg_n, chg_rate;
+static long chg_since, chg_stop_since;
+static bool chg_seen, chg_done;
+void piezo_charge_alert(int on, const unsigned char *u8, unsigned n, unsigned rate)
+{
+    chg_on = on;
+    chg_smp = n ? u8 : NULL;
+    chg_n = n; chg_rate = rate;
+}
+void piezo_play_charged(void)
+{
+    if (chg_smp && chg_n)
+        piezo_play_samples(chg_smp, chg_n, chg_rate);
+    else
+        piezo_play_tune(chime_full);
+}
+static void chg_tick(void)
+{
+    if (!charger_inserted())
+    {
+        chg_since = chg_stop_since = 0; chg_seen = chg_done = false;
+        return;
+    }
+    if (charging_state())
+    {
+        if (!chg_since) chg_since = current_tick;
+        if (current_tick - chg_since > 60 * HZ) chg_seen = true;
+        chg_stop_since = 0;
+        return;
+    }
+    chg_since = 0;
+    if (!chg_seen || chg_done) return;
+    if (!chg_stop_since) { chg_stop_since = current_tick; return; }
+    if (current_tick - chg_stop_since < 30 * HZ || battery_level() < 90) return;
+    chg_done = true;
+    if (chg_on && !sk_run)
+    {   /* posted to our own queue: played by this thread right after */
+        if (chg_smp && chg_n)
+        {
+            if (!smp_on)
+            {
+                smp = chg_smp; smp_n = chg_n; smp_rate = chg_rate;
+                sk_calc_step();
+                queue_post(&piezo_queue, Q_PIEZO_SAMPLES, 0);
+            }
+        }
+        else
+            queue_post(&piezo_queue, Q_PIEZO_TUNE, (intptr_t)chime_full);
+    }
+    queue_broadcast(SYS_BCM_CHARGED, 0);
+}
+#endif
+
 static void piezo_thread(void)
 {
     struct queue_event ev;
@@ -478,7 +542,11 @@ static void piezo_thread(void)
     while(1)
     {
 #ifdef HAVE_PIEZO_SPEAKER_CODE
-        queue_wait_w_tmo(&piezo_queue, &ev, HZ / 4);
+        /* v87: only look every 0.25 s when there is something to look after (the speaker setting on, or the timer in use);
+           otherwise sleep until a message comes (v77-v86 woke the thread 4 times a second for nothing: battery) */
+        queue_wait_w_tmo(&piezo_queue, &ev,
+                         (piezo_speaker_mode || pz_timer_on || sk_run) ? HZ / 4 :
+                         charger_inserted() ? 2 * HZ : TIMEOUT_BLOCK);   /* v88: + the charge watch (a broadcast wakes us) */
         /* the speaker / a sample owns the element: no clicks or beeps over it */
         if (piezo_speaker_active() && ev.id >= Q_PIEZO_BEEP && ev.id <= Q_PIEZO_STOP)
             continue;
@@ -524,7 +592,11 @@ static void piezo_thread(void)
                 piezo_hw_stop();
                 queue_clear(&piezo_queue);
                 usb_acknowledge(SYS_USB_CONNECTED_ACK, ev.data);
+#ifndef HAVE_PIEZO_SPEAKER_CODE
                 usb_wait_for_disconnect(&piezo_queue);
+#endif
+                /* v88: this thread never touches the disk: it keeps running while the computer has the drive, so the
+                   charging-complete chime works there too */
                 break ;
 #endif
 #ifdef HAVE_PIEZO_SPEAKER_CODE
@@ -555,6 +627,7 @@ static void piezo_thread(void)
 #endif
             case SYS_TIMEOUT:
 #ifdef HAVE_PIEZO_SPEAKER_CODE
+                chg_tick();                    /* v88 */
                 sk_route();
                 pz_timer_check();
                 {   /* v86: the CPU at full speed while music / video sound plays on the click speaker (its interrupt runs

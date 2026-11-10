@@ -7,6 +7,7 @@ void bcm_piezo_startup(void);
 void bcm_piezo_shutdown(void);
 int bcm_piezo_test(void);
 int bcm_piezo_test_music(void);   /* v78 */
+int bcm_piezo_test_charged(void); /* v88 */
 #else
 #define bcm_piezo_apply() do { } while (0)
 #define bcm_piezo_startup() do { } while (0)

@@ -1,4 +1,9 @@
 /* plugins common to all models */
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v88: the click speaker's sound converter and the movie quiz */
+piezo_snd.c
+movie_quiz.c
+#endif
 #if !defined(SIMULATOR) && (CONFIG_BATTERY_MEASURE != 0)
 battery_bench.c
 #endif

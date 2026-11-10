@@ -1354,6 +1354,7 @@ const struct settings_list settings[] = {
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
                    ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
     OFFON_SETTING(0, bcm_tv_wide, LANG_TV_WIDESCREEN, false, "tv widescreen", NULL),
+    OFFON_SETTING(0, bcm_tv_crt, LANG_TV_CRT, false, "tv retro crt", NULL),   /* v88 */
     /* bcm overlay v73: soft subtitles (SRT / WebVTT / ASS next to the video, MP4 timed text) */
     OFFON_SETTING(0, bcm_subs, LANG_SUBTITLES, true, "subtitles", NULL),
     CHOICE_SETTING(0, bcm_sub_size, LANG_SUBTITLE_SIZE, 1, "subtitle size", "small,medium,large", NULL, 3,
@@ -1368,6 +1369,10 @@ const struct settings_list settings[] = {
     INT_SETTING_NOWRAP(0, bcm_tv_countdown, LANG_TVS_COUNTDOWN, 5, "next episode countdown", UNIT_SEC, 5, 10, 1,
                        NULL, NULL, NULL),
     OFFON_SETTING(0, bcm_dock_profile, LANG_DOCK_PROFILE, true, "dock line-out profile", NULL),
+#if !defined(SIMULATOR)
+    BOOL_SETTING(0, bcm_usb_fast, LANG_USB_WRITE_SPEED, false, "usb write speed", "stock,fast",
+                 LANG_USB_WRITE_FAST, LANG_USB_WRITE_STOCK, NULL),     /* v87 */
+#endif
     /* bcm overlay v77: the click speaker (apps/bcm_piezo.c) */
     CHOICE_SETTING(0, bcm_piezo_speaker, LANG_PIEZO_SPEAKER, 0, "click speaker", "off,no headphones,always",
                    bcm_piezo_setting_cb, 3, ID2P(LANG_OFF), ID2P(LANG_PIEZO_NO_HEADPHONES), ID2P(LANG_ALWAYS)),
@@ -1389,6 +1394,7 @@ const struct settings_list settings[] = {
     OFFON_SETTING(0, bcm_piezo_loudness, LANG_PIEZO_LOUDNESS, true, "click speaker loudness", bcm_piezo_bool_cb),
     CHOICE_SETTING(0, bcm_piezo_max, LANG_PIEZO_MODE, 0, "click speaker mode", "custom,loudest,best quality",
                    bcm_piezo_setting_cb, 3, ID2P(LANG_PIEZO_MODE_CUSTOM), ID2P(LANG_PIEZO_MAX), ID2P(LANG_PIEZO_BEST)),
+    OFFON_SETTING(0, bcm_piezo_charged, LANG_PIEZO_CHARGED, true, "charging complete alert", bcm_piezo_bool_cb),   /* v88 */
 #ifdef HAVE_BATTERY_SMOOTH_API
     CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "smooth,exact", battery_reading_cb, 2,
                    ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),

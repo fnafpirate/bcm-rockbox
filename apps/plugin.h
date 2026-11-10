@@ -182,7 +182,7 @@ int plugin_open(const char *plugin, const char *parameter);
  * when this happens please take the opportunity to sort in
  * any new functions "waiting" at the end of the list.
  */
-#define PLUGIN_API_VERSION 285
+#define PLUGIN_API_VERSION 286   /* bcm overlay v88: + bcm_video_quiz */
 
 /* 239 Marks the removal of ARCHOS HWCODEC and CHARCELL */
 
@@ -1057,6 +1057,11 @@ struct plugin_api {
 #endif
 #if defined(HAVE_REMOTE_LCD) && defined(HAS_REMOTE_BUTTON_HOLD)
     void (*remote_backlight_set_on_button_hold)(int index);
+#endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    /* bcm overlay v88: the movie quiz -- play `path` muted from `permille` of its length, paused on that frame,
+       until MENU (first = ask TV / iPod screen like the file browser does).  false = it could not play. */
+    bool (*bcm_video_quiz)(const char *path, int permille, bool first);
 #endif
 };
 
