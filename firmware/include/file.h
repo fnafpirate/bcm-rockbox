@@ -90,6 +90,12 @@ int fdprintf(int fildes, const char *fmt, ...) ATTRIBUTE_PRINTF(2, 3);
 #ifndef ffilesize
 #define ffilesize       FS_PREFIX(ffilesize)
 #endif
+#ifndef lseek64
+#define lseek64         FS_PREFIX(lseek64)
+#endif
+#ifndef ffilesize64
+#define ffilesize64     FS_PREFIX(ffilesize64)
+#endif
 #ifndef fsamefile
 #define fsamefile       FS_PREFIX(fsamefile)
 #endif

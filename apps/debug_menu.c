@@ -2929,6 +2929,9 @@ static bool bcm_vc_flat;               /* v56: the VideoCore files are in /.rock
    second log line) and cut to its length when it is closed */
 static void bcm_log_open(void)
 {
+    bcm_log_fd = -1;
+    if (!global_settings.bcm_debug_log)
+        return;                                 /* v89: Settings > General Settings > System > Debug Log is off */
     bcm_log_fd = open(BCM_LOG_PATH, O_WRONLY);
     if (bcm_log_fd < 0) bcm_log_fd = creat(BCM_LOG_PATH, 0666);
 }
@@ -2965,8 +2968,16 @@ static void bcm_logline(const char *s, int n)
     char b[200], t[160];
     long e;
     int m;
-    if (bcm_log_fd < 0 || n <= 0)
+    if (n <= 0)
         return;
+    if (bcm_log_fd < 0)
+    {   /* v89: no log file -- the line still counts as a sign of life for the watchdog and the bus-dead report */
+        bcm_wd_last = current_tick;
+        if (n > (int)sizeof bcm_last_line - 1) n = sizeof bcm_last_line - 1;
+        memcpy(bcm_last_line, s, n); bcm_last_line[n] = 0;
+        bcm_last_tick = current_tick;
+        return;
+    }
     if (n > 159) n = 159;
     memcpy(t, s, n); t[n] = 0;
     e = current_tick - bcm_t_start;
@@ -3111,13 +3122,18 @@ static int cfg_frame_avcc = 1;     /* v27: 1 = send MP4 samples unchanged (AVCC,
 #define FOURCC(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
 static uint8_t m4_raw[M4_RAW_MAX];
 static uint8_t m4_out[M4_OUT_MAX];
+/* v89: file offsets are 64-bit -- MP4s bigger than 4 GiB (co64 chunk offsets, 64-bit box sizes) read through
+   lseek64(); everything that is a position in the file is an m4off_t, sizes / counts stay 32-bit */
+typedef uint64_t m4off_t;
+static bool m4_seek(int fd, m4off_t off) { return lseek64(fd, (int64_t)off, SEEK_SET) == (int64_t)off; }
 static struct {
     int fd;
     uint32_t timescale, width, height;
     uint8_t  profile, level, nal_len;
     uint8_t  ps[512]; uint32_t ps_len;                  /* SPS+PPS, Annex B */
     uint8_t  avcc[128]; uint32_t avcc_len;              /* raw avcC record (v22: candidate "extradata" for the 0x60 block) */
-    uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n, stss, stss_n;   /* v42: stss */
+    m4off_t  stts, stsc, stsz, stco, stss;              /* v89: table positions in the file */
+    uint32_t stts_n, stsc_n, stsz_fixed, stsz_n, stco_n, stss_n;   /* v42: stss */
     bool     need_ps;                                   /* v42: prepend SPS/PPS to the next sample (after a seek) */
     bool     co64;
     uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first;   /* sample cursor */
@@ -3128,14 +3144,15 @@ static struct {
     bool ok;
     uint32_t timescale, channels, rate, bitrate;
     uint8_t asc[16]; uint32_t asc_len;
-    uint32_t stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n; bool co64;
+    m4off_t stts, stsc, stsz, stco;                      /* v89 */
+    uint32_t stts_n, stsc_n, stsz_fixed, stsz_n, stco_n; bool co64;
     uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first, stts_i, stts_left, stts_delta; uint64_t dts;
 } ma;
 
 static uint32_t m4_be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
-static bool m4_rd(uint32_t off, void *buf, uint32_t n)
+static bool m4_rd(m4off_t off, void *buf, uint32_t n)
 {
-    if (lseek(m4.fd, (off_t)off, SEEK_SET) != (off_t)off) return false;
+    if (!m4_seek(m4.fd, off)) return false;
     return read(m4.fd, buf, n) == (ssize_t)n;
 }
 /* v45: table and data caches.  Up to v44 every frame did three lseek+read pairs at unrelated file offsets (the
@@ -3175,27 +3192,27 @@ static bool ra_sleep_on = true;
 static int ra_handle = -1;
 static uint8_t *ra_buf;               /* ring: cfg_ra_kb KB */
 static uint32_t ra_size;
-static uint32_t ra_lo, ra_hi;         /* file bytes [ra_lo, ra_hi) are in the ring at offset % ra_size */
-static uint32_t ra_fsize;
-static uint32_t ra_pos[2];            /* last data offsets read: video, audio */
+static m4off_t ra_lo, ra_hi;          /* file bytes [ra_lo, ra_hi) are in the ring at offset % ra_size */
+static m4off_t ra_fsize;
+static m4off_t ra_pos[2];             /* last data offsets read: video, audio */
 static int ra_stream;                 /* which of the two the next m4_rdd is for */
 static bool ra_filling, ra_slept;
 static uint32_t ra_bursts, ra_misses, ra_read_kb;
 static uint8_t *mv_buf;               /* the moov box */
-static uint32_t mv_s, mv_e;
+static m4off_t mv_s, mv_e;
 static void ra_free(void)
 {
     if (ra_handle > 0) { core_unpin(ra_handle); core_free(ra_handle); }
     ra_handle = -1; ra_buf = NULL; mv_buf = NULL; ra_size = 0; ra_lo = ra_hi = 0;
 }
-static bool ra_read_at(uint32_t off, uint32_t n)      /* file [off, off+n) -> ring; off == ra_hi */
+static bool ra_read_at(m4off_t off, uint32_t n)       /* file [off, off+n) -> ring; off == ra_hi */
 {
     while (n)
     {
-        uint32_t p = off % ra_size, c = ra_size - p;
+        uint32_t p = (uint32_t)(off % ra_size), c = ra_size - p;
         ssize_t r;
         if (c > n) c = n;
-        if (lseek(m4.fd, (off_t)off, SEEK_SET) != (off_t)off) return false;
+        if (!m4_seek(m4.fd, off)) return false;
         r = read(m4.fd, ra_buf + p, c);
         if (r <= 0) return false;
         off += (uint32_t)r; n -= (uint32_t)r; ra_hi = off; ra_read_kb += (uint32_t)r / 1024;
@@ -3204,18 +3221,18 @@ static bool ra_read_at(uint32_t off, uint32_t n)      /* file [off, off+n) -> ri
     return true;
 }
 /* restart the ring at off (seek / first read) */
-static bool ra_restart(uint32_t off, uint32_t need)
+static bool ra_restart(m4off_t off, uint32_t need)
 {
     uint32_t n = 65536;
     if (need + 1024 > n) n = need + 1024;
     if (n > ra_size) n = ra_size;
-    ra_lo = ra_hi = off & ~511u;
-    if (ra_hi + n > ra_fsize) n = ra_fsize - ra_hi;
+    ra_lo = ra_hi = off & ~(m4off_t)511;
+    if (ra_hi + n > ra_fsize) n = (uint32_t)(ra_fsize - ra_hi);
     ra_misses++;
     ra_filling = true;
     return ra_read_at(ra_hi, n);
 }
-static bool ra_get(uint32_t off, void *buf, uint32_t n)
+static bool ra_get(m4off_t off, void *buf, uint32_t n)
 {
     uint8_t *o = buf;
     if (!(off >= ra_lo && off + n <= ra_hi))
@@ -3226,7 +3243,7 @@ static bool ra_get(uint32_t off, void *buf, uint32_t n)
     ra_pos[ra_stream & 1] = off;
     while (n)
     {
-        uint32_t p = off % ra_size, c = ra_size - p;
+        uint32_t p = (uint32_t)(off % ra_size), c = ra_size - p;
         if (c > n) c = n;
         memcpy(o, ra_buf + p, c); o += c; off += c; n -= c;
     }
@@ -3235,7 +3252,8 @@ static bool ra_get(uint32_t off, void *buf, uint32_t n)
 /* called from the playback loop between frame requests */
 static void ra_tick(void)
 {
-    uint32_t keep, lead, room, n, ahead;
+    m4off_t keep, lead;
+    uint32_t room, n, ahead;
     int k, inside = 0;
     if (!ra_buf || m4.fd < 0 || ra_hi >= ra_fsize) return;
     keep = ra_hi; lead = ra_lo;
@@ -3249,12 +3267,12 @@ static void ra_tick(void)
     if (!inside) return;
     keep = keep > ra_lo + 131072 ? keep - 131072 : ra_lo;                     /* keep 128 KB behind it */
     ra_lo = keep;
-    ahead = ra_hi - lead;
+    ahead = (uint32_t)(ra_hi - lead);
     if (!ra_filling && ahead < ra_size / ra_refill_div) { ra_filling = true; ra_slept = false; ra_bursts++; }
     if (!ra_filling) return;
-    room = ra_size - (ra_hi - ra_lo);
+    room = ra_size - (uint32_t)(ra_hi - ra_lo);
     n = room < 65536 ? room : 65536;
-    if (ra_hi + n > ra_fsize) n = ra_fsize - ra_hi;
+    if (ra_hi + n > ra_fsize) n = (uint32_t)(ra_fsize - ra_hi);
     if (n < 4096 || !ra_read_at(ra_hi, n) || ra_hi >= ra_fsize || room - n < 65536)
     {
         ra_filling = false;
@@ -3264,19 +3282,21 @@ static void ra_tick(void)
 }
 #define M4C_WIN 4096
 #define M4C_N   6
-static struct { uint32_t base, len, use; uint8_t d[M4C_WIN]; } m4c[M4C_N];
+static struct { m4off_t base; uint32_t len, use; uint8_t d[M4C_WIN]; } m4c[M4C_N];
 static uint32_t m4c_clock, m4c_miss, m4d_miss;
 static uint8_t m4d[65536];
-static uint32_t m4d_base, m4d_len;
+static m4off_t m4d_base;
+static uint32_t m4d_len;
 static void m4c_reset(void) { int i; for (i = 0; i < M4C_N; i++) { m4c[i].len = 0; m4c[i].use = 0; } m4d_len = 0; }
-static bool m4_rdc(uint32_t off, void *buf, uint32_t n)
+static bool m4_rdc(m4off_t off, void *buf, uint32_t n)
 {
     uint8_t *o = buf;
-    if (mv_buf && off >= mv_s && off + n <= mv_e) { memcpy(buf, mv_buf + (off - mv_s), n); return true; }   /* v59 */
+    if (mv_buf && off >= mv_s && off + n <= mv_e) { memcpy(buf, mv_buf + (uint32_t)(off - mv_s), n); return true; }   /* v59 */
     if (!cfg_m4cache_ref()) return m4_rd(off, buf, n);
     while (n)
     {
-        uint32_t base = off & ~(uint32_t)(M4C_WIN - 1), k, c;
+        m4off_t base = off & ~(m4off_t)(M4C_WIN - 1);
+        uint32_t k, c;
         int i, best = 0;
         for (i = 0; i < M4C_N; i++) if (m4c[i].len && m4c[i].base == base) break;
         if (i == M4C_N)
@@ -3284,13 +3304,13 @@ static bool m4_rdc(uint32_t off, void *buf, uint32_t n)
             ssize_t r;
             for (i = 1; i < M4C_N; i++) if (m4c[i].use < m4c[best].use) best = i;
             i = best; m4c[i].len = 0; m4c_miss++;
-            if (lseek(m4.fd, (off_t)base, SEEK_SET) != (off_t)base) return false;
+            if (!m4_seek(m4.fd, base)) return false;
             r = read(m4.fd, m4c[i].d, M4C_WIN);
             if (r <= 0) return false;
             m4c[i].base = base; m4c[i].len = (uint32_t)r;
         }
         m4c[i].use = ++m4c_clock;
-        k = off - base;
+        k = (uint32_t)(off - base);
         if (k >= m4c[i].len) return false;
         c = m4c[i].len - k; if (c > n) c = n;
         memcpy(o, m4c[i].d + k, c); o += c; off += c; n -= c;
@@ -3298,53 +3318,65 @@ static bool m4_rdc(uint32_t off, void *buf, uint32_t n)
     return true;
 }
 /* sample data: served from the read-ahead window when it is inside it, else the window is refilled from there */
-static bool m4_rdd(uint32_t off, void *buf, uint32_t n)
+static bool m4_rdd(m4off_t off, void *buf, uint32_t n)
 {
     if (ra_buf && n <= ra_size / 2)
     {   /* v59 -- unless the sound lies far from the picture in the file (not interleaved): then it uses the small window */
-        uint32_t d = ra_stream == 1 && ra_pos[0] ? (off > ra_pos[0] ? off - ra_pos[0] : ra_pos[0] - off) : 0;
+        m4off_t d = ra_stream == 1 && ra_pos[0] ? (off > ra_pos[0] ? off - ra_pos[0] : ra_pos[0] - off) : 0;
         if (d < ra_size / 2) return ra_get(off, buf, n);
     }
     if (!cfg_m4cache_ref() || n > sizeof m4d / 2) return m4_rd(off, buf, n);
     if (!(m4d_len && off >= m4d_base && off + n <= m4d_base + m4d_len))
     {
-        uint32_t base = off & ~511u; ssize_t r;
+        m4off_t base = off & ~(m4off_t)511; ssize_t r;
         m4d_len = 0; m4d_miss++;
-        if (lseek(m4.fd, (off_t)base, SEEK_SET) != (off_t)base) return false;
+        if (!m4_seek(m4.fd, base)) return false;
         r = read(m4.fd, m4d, sizeof m4d);
         if (r <= 0) return false;
         m4d_base = base; m4d_len = (uint32_t)r;
         if (off + n > m4d_base + m4d_len) return false;
     }
-    memcpy(buf, m4d + (off - m4d_base), n);
+    memcpy(buf, m4d + (uint32_t)(off - m4d_base), n);
     return true;
 }
-static uint32_t m4_u32(uint32_t off) { uint8_t b[4]; return m4_rdc(off, b, 4) ? m4_be32(b) : 0; }
-static uint32_t m4_u16(uint32_t off) { uint8_t b[2]; return m4_rdc(off, b, 2) ? (uint32_t)((b[0]<<8)|b[1]) : 0; }
-static uint32_t m4_u8(uint32_t off)  { uint8_t b[1]; return m4_rdc(off, b, 1) ? b[0] : 0; }
+static uint32_t m4_u32(m4off_t off) { uint8_t b[4]; return m4_rdc(off, b, 4) ? m4_be32(b) : 0; }
+static uint32_t m4_u16(m4off_t off) { uint8_t b[2]; return m4_rdc(off, b, 2) ? (uint32_t)((b[0]<<8)|b[1]) : 0; }
+static uint32_t m4_u8(m4off_t off)  { uint8_t b[1]; return m4_rdc(off, b, 1) ? b[0] : 0; }
+/* v89: a chunk's file offset (stco: 32-bit, co64: 64-bit -- v13..v88 took only the low word) */
+static m4off_t m4_chunk_off(m4off_t stco, bool co64, uint32_t chunk)
+{
+    if (co64)
+        return (m4off_t)m4_u32(stco + 8 * (m4off_t)(chunk - 1)) << 32 | m4_u32(stco + 8 * (m4off_t)(chunk - 1) + 4);
+    return m4_u32(stco + 4 * (m4off_t)(chunk - 1));
+}
 
 /* iterate the boxes in [*pos,end): payload range returned via ps and pe; false when none left or malformed */
-static bool m4_box(uint32_t *pos, uint32_t end, uint32_t *type, uint32_t *ps, uint32_t *pe)
+static bool m4_box(m4off_t *pos, m4off_t end, uint32_t *type, m4off_t *ps, m4off_t *pe)
 {
-    uint8_t h[8]; uint32_t size, hdr = 8;
+    uint8_t h[8]; uint64_t size; uint32_t hdr = 8;
     if (*pos + 8 > end || !m4_rd(*pos, h, 8)) return false;
     size = m4_be32(h); *type = m4_be32(h + 4);
-    if (size == 1) { uint8_t e[8]; if (!m4_rd(*pos + 8, e, 8) || m4_be32(e)) return false; size = m4_be32(e + 4); hdr = 16; }
+    if (size == 1)
+    {   /* v89: a 64-bit size (an mdat over 4 GiB) -- v88 refused any with the high word set */
+        uint8_t e[8];
+        if (!m4_rd(*pos + 8, e, 8)) return false;
+        size = (uint64_t)m4_be32(e) << 32 | m4_be32(e + 4); hdr = 16;
+    }
     else if (size == 0) size = end - *pos;
     if (size < hdr || size > end - *pos) return false;
     *ps = *pos + hdr; *pe = *pos + size; *pos += size;
     return true;
 }
-static bool m4_find(uint32_t s, uint32_t e, uint32_t want, uint32_t *cs, uint32_t *ce)
+static bool m4_find(m4off_t s, m4off_t e, uint32_t want, m4off_t *cs, m4off_t *ce)
 {
-    uint32_t pos = s, t, a, b;
+    m4off_t pos = s, a, b; uint32_t t;
     while (m4_box(&pos, e, &t, &a, &b)) if (t == want) { *cs = a; *ce = b; return true; }
     return false;
 }
 
-static bool m4_trak(uint32_t ps, uint32_t pe)
+static bool m4_trak(m4off_t ps, m4off_t pe)
 {
-    uint32_t ms, me, a, b, minf_s, minf_e, stbl_s, stbl_e, pos, t, s, e;
+    m4off_t ms, me, a, b, minf_s, minf_e, stbl_s, stbl_e, pos, s, e; uint32_t t;
     bool have_avc = false, have[5] = { false, false, false, false, false };
     if (!m4_find(ps, pe, FOURCC('m','d','i','a'), &ms, &me)) return false;
     if (!m4_find(ms, me, FOURCC('h','d','l','r'), &a, &b) || m4_u32(a + 8) != FOURCC('v','i','d','e')) return false;
@@ -3359,15 +3391,15 @@ static bool m4_trak(uint32_t ps, uint32_t pe)
     {
         if (t == FOURCC('s','t','s','d'))
         {
-            uint32_t ent = s + 8, esz = m4_u32(ent), cs, ce;
+            m4off_t ent = s + 8, cs, ce; uint32_t esz = m4_u32(ent);
             if (m4_u32(ent + 4) != FOURCC('a','v','c','1') || esz < 86 + 8) return false;
             m4.width = m4_u16(ent + 32); m4.height = m4_u16(ent + 34);
             if (!m4_find(ent + 86, ent + esz, FOURCC('a','v','c','C'), &cs, &ce) || ce - cs < 7) return false;
-            m4.avcc_len = (ce - cs) <= sizeof m4.avcc ? (ce - cs) : 0;
+            m4.avcc_len = (ce - cs) <= sizeof m4.avcc ? (uint32_t)(ce - cs) : 0;
             if (m4.avcc_len && !m4_rd(cs, m4.avcc, m4.avcc_len)) m4.avcc_len = 0;
             m4.profile = (uint8_t)m4_u8(cs + 1); m4.level = (uint8_t)m4_u8(cs + 3);
             m4.nal_len = (uint8_t)((m4_u8(cs + 4) & 3) + 1);
-            {   uint32_t p = cs + 6, i, n = m4_u8(cs + 5) & 0x1f; int pass;
+            {   m4off_t p = cs + 6; uint32_t i, n = m4_u8(cs + 5) & 0x1f; int pass;
                 m4.ps_len = 0;
                 for (pass = 0; pass < 2; pass++)
                 {
@@ -3480,26 +3512,27 @@ static void m4_seek_sample(uint32_t k)
     m4.need_ps = true;
 }
 static uint32_t m4_dur_ms, m4_br;            /* v20: duration (ms) and average bit rate (bit/s) of the whole file */
-static uint32_t m4_moov_s, m4_moov_e;        /* v73: the moov payload (the subtitle track scan) */
+static m4off_t m4_moov_s, m4_moov_e;         /* v73: the moov payload (the subtitle track scan) */
 
-static bool ma_trak(uint32_t ps, uint32_t pe);   /* v53: audio track (below) */
+static bool ma_trak(m4off_t ps, m4off_t pe);     /* v53: audio track (below) */
 static void ma_rewind(void);
 /* 0 = ok, <0 = reason */
 static int mp4_open(const char *path)
 {
-    uint32_t fsz, pos = 0, t, ps, pe, moov_s = 0, moov_e = 0;
-    off_t sz;
+    m4off_t fsz, pos = 0, ps, pe, moov_s = 0, moov_e = 0;
+    uint32_t t;
+    int64_t sz;
     m4_close();
     m4.fd = open(path, O_RDONLY);
     if (m4.fd < 0) return -1;
-    sz = lseek(m4.fd, 0, SEEK_END);
+    sz = ffilesize64(m4.fd);                     /* v89: the real size (v88: lseek(SEEK_END), capped at 2 GiB) */
     if (sz <= 0) { m4_close(); return -2; }
-    fsz = (uint32_t)sz;
+    fsz = (m4off_t)sz;
     while (m4_box(&pos, fsz, &t, &ps, &pe)) if (t == FOURCC('m','o','o','v')) { moov_s = ps; moov_e = pe; break; }
     if (!moov_e) { m4_close(); return -3; }
     m4_moov_s = moov_s; m4_moov_e = moov_e;
     {   /* v59: one buffer: the moov box + the read-ahead ring */
-        uint32_t mlen = moov_e - moov_s + 8, want;
+        uint32_t mlen = moov_e - moov_s + 8 > 0x7fffffff ? 0 : (uint32_t)(moov_e - moov_s + 8), want;
         long t0 = current_tick;
         ra_fsize = fsz;
         uint32_t ring = 0, br = 0;
@@ -3510,14 +3543,14 @@ static int mp4_open(const char *path)
             const uint16_t *secs = mp->secs;
             const uint8_t *lo_mb = mp->lo_mb, *hi_mb = mp->hi_mb;
             static const int div[3] = { 8, 4, 2 };
-            uint32_t a, b, ts, dur;
+            m4off_t a, b; uint32_t ts, dur;
             ra_mode = cfg_ra_mode >= 0 ? cfg_ra_mode : global_settings.bcm_video_buffer;
             if (ra_mode < 0 || ra_mode > 2) ra_mode = 1;
             {   /* v78: the longest of the movie header and the tracks' own durations.  v74 used the mvhd alone, and some
                    encoders write a short one there: "134740 kbit/s" for a 330 kbit/s film, so every mode asked for its
                    largest ring (24 MB in Performance) -- with subtitles on a 32 MB iPod that left too little memory. */
                 uint64_t best_ms = 0;
-                uint32_t tpos = moov_s, tt, tps, tpe, ma2, mb2, ms2, me2;
+                m4off_t tpos = moov_s, tps, tpe, ma2, mb2, ms2, me2; uint32_t tt;
                 if (m4_find(moov_s, moov_e, FOURCC('m','v','h','d'), &a, &b))
                 {
                     bool v1 = m4_u8(a) == 1;
@@ -3541,7 +3574,7 @@ static int mp4_open(const char *path)
 
             if (cfg_ra_kb > 0 && cfg_ra_kb != 4096) ring = (uint32_t)cfg_ra_kb * 1024;     /* an explicit ra_kb wins */
             if (cfg_ra_kb <= 0) ring = 0;
-            if (ring > fsz + 65536) ring = (fsz + 65536 + 65535) & ~65535u;               /* a short clip: all of it */
+            if (ring > fsz + 65536) ring = (uint32_t)((fsz + 65536 + 65535) & ~(m4off_t)65535);   /* a short clip: all of it */
             ra_refill_div = div[ra_mode];
             ra_sleep_on = ra_mode != 2;
         }
@@ -3562,7 +3595,7 @@ static int mp4_open(const char *path)
             if (mlen)
             {
                 mv_s = moov_s - 8; mv_e = mv_s + mlen;
-                if (lseek(m4.fd, (off_t)mv_s, SEEK_SET) == (off_t)mv_s && read(m4.fd, p, mlen) == (ssize_t)mlen) mv_buf = p;
+                if (m4_seek(m4.fd, mv_s) && read(m4.fd, p, mlen) == (ssize_t)mlen) mv_buf = p;
                 else mlen = 0;
             }
             if (ring >= 65536) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ring & ~65535u; }
@@ -3600,12 +3633,12 @@ static int mp4_open(const char *path)
    that was skipped (too big / unreadable -- cursor still advances so the caller can just retry). */
 static int m4_next(uint32_t *ts_ms, bool *key)
 {
-    uint32_t size, coff, off, p, o = 0, n, k;
+    m4off_t off;
+    uint32_t size, p, o = 0, n, k;
     bool idr = false, first = (m4.idx == 0);
     if (m4.fd < 0 || m4.idx >= m4.stsz_n || m4.chunk > m4.stco_n) return 0;
-    size = m4.stsz_fixed ? m4.stsz_fixed : m4_u32(m4.stsz + 4 * m4.idx);
-    coff = m4.co64 ? m4_u32(m4.stco + 8 * (m4.chunk - 1) + 4) : m4_u32(m4.stco + 4 * (m4.chunk - 1));
-    off  = coff + m4.off_in_chunk;
+    size = m4.stsz_fixed ? m4.stsz_fixed : m4_u32(m4.stsz + 4 * (m4off_t)m4.idx);
+    off  = m4_chunk_off(m4.stco, m4.co64, m4.chunk) + m4.off_in_chunk;
     *ts_ms = (uint32_t)(m4.dts * 1000ULL / m4.timescale);
 
     m4.idx++; m4.off_in_chunk += size;                                   /* advance the cursors first */
@@ -3668,15 +3701,15 @@ static int m4_next(uint32_t *ts_ms, bool *key)
    RAM snapshot of the stock media object, findings 1.2/3ar) and the get-frame handler (rt 0x20b39c) serves a request
    for stream -1 with whichever stream is behind.  Samples go out raw (no ADTS header), timestamps in ms. */
 static uint8_t ma_buf[8192];
-static uint32_t ma_desc_len(uint32_t *p)
+static uint32_t ma_desc_len(m4off_t *p)
 {   /* MPEG-4 descriptor length: up to 4 bytes, 7 bits each */
     uint32_t n = 0; int i;
     for (i = 0; i < 4; i++) { uint32_t b = m4_u8((*p)++); n = (n << 7) | (b & 0x7f); if (!(b & 0x80)) break; }
     return n;
 }
-static bool ma_trak(uint32_t ps, uint32_t pe)
+static bool ma_trak(m4off_t ps, m4off_t pe)
 {
-    uint32_t ms, me, a, b, minf_s, minf_e, stbl_s, stbl_e, pos, t, s, e;
+    m4off_t ms, me, a, b, minf_s, minf_e, stbl_s, stbl_e, pos, s, e; uint32_t t;
     bool have_esds = false;
     if (!m4_find(ps, pe, FOURCC('m','d','i','a'), &ms, &me)) return false;
     if (!m4_find(ms, me, FOURCC('h','d','l','r'), &a, &b) || m4_u32(a + 8) != FOURCC('s','o','u','n')) return false;
@@ -3690,13 +3723,13 @@ static bool ma_trak(uint32_t ps, uint32_t pe)
     {
         if (t == FOURCC('s','t','s','d'))
         {
-            uint32_t ent = s + 8, esz = m4_u32(ent), cs, ce;
+            m4off_t ent = s + 8, cs, ce; uint32_t esz = m4_u32(ent);
             if (m4_u32(ent + 4) != FOURCC('m','p','4','a') || esz < 36) return false;
             ma.channels = m4_u16(ent + 24);
             ma.rate = m4_u32(ent + 32) >> 16;
             if (m4_find(ent + 36, ent + esz, FOURCC('e','s','d','s'), &cs, &ce))
             {
-                uint32_t p = cs + 4, l, end;                         /* skip version/flags */
+                m4off_t p = cs + 4, end; uint32_t l;                 /* skip version/flags */
                 if (m4_u8(p++) == 0x03)                              /* ES_Descriptor */
                 {
                     l = ma_desc_len(&p); end = p + l; (void)end;
@@ -3777,11 +3810,11 @@ static uint32_t m4_next_ts(void) { return m4.idx < m4.stsz_n ? (uint32_t)(m4.dts
 /* next audio sample into ma_buf: length, 0 at the end, -1 skipped */
 static int ma_next(uint32_t *ts_ms)
 {
-    uint32_t size, coff, off;
+    m4off_t off;
+    uint32_t size;
     if (!ma.ok || ma.idx >= ma.stsz_n || ma.chunk > ma.stco_n) return 0;
-    size = ma.stsz_fixed ? ma.stsz_fixed : m4_u32(ma.stsz + 4 * ma.idx);
-    coff = ma.co64 ? m4_u32(ma.stco + 8 * (ma.chunk - 1) + 4) : m4_u32(ma.stco + 4 * (ma.chunk - 1));
-    off = coff + ma.off_in_chunk;
+    size = ma.stsz_fixed ? ma.stsz_fixed : m4_u32(ma.stsz + 4 * (m4off_t)ma.idx);
+    off = m4_chunk_off(ma.stco, ma.co64, ma.chunk) + ma.off_in_chunk;
     *ts_ms = (uint32_t)(ma.dts * 1000ULL / ma.timescale);
     ma.idx++; ma.off_in_chunk += size;
     if (++ma.s_in_chunk >= ma.spc)
@@ -3889,7 +3922,7 @@ static bool qz_on, qz_ran;
 static int qz_permille, qz_state;
 static long qz_t, qz_since;
 static uint32_t qz_k;
-static int cfg_crt_alpha = 0x5c, cfg_crt_edge = 0x70, cfg_crt_layer = 0;   /* 0 = just below the subtitles */
+static int cfg_crt_alpha = 0x5c, cfg_crt_edge = 0x70, cfg_crt_layer = 0;   /* v89: 0 = over everything (osd_layer + 5) */
 static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
@@ -4249,6 +4282,7 @@ static void bcm_vc_dump(const char *tag, uint32_t start, uint32_t len)
     static uint32_t dbuf[1024];
     char path[48]; int fd; uint32_t a; long t0 = current_tick; unsigned n = 0;
     if ((!cfg_dump && strcmp(tag, "frame")) || bcm_io_dead()) return;   /* v41: the decoded-frame dump is always allowed */
+    if (bcm_log_fd < 0) return;                 /* v89: ... but only with the debug log on */
     snprintf(path, sizeof path, "/.rockbox/vcdump_%s.bin", tag);
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { BLOG("dump: cannot create %s", path); return; }
@@ -4390,7 +4424,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v88 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v89 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5043,7 +5077,7 @@ static void osd_show_for(int ms)
    holds go over the bus (a 2-line cue on the LCD: ~40 KB), then the two images swap windows in one display update, so a
    half-written subtitle is never seen. */
 #define ST_TRACKS (SUBS_MAX_TRACKS + 6)
-struct st_tx3g { uint32_t timescale, stts, stts_n, stsc, stsc_n, stsz, stsz_fixed, stsz_n, stco, stco_n, bytes; bool co64; };
+struct st_tx3g { m4off_t stts, stsc, stsz, stco; uint32_t timescale, stts_n, stsc_n, stsz_fixed, stsz_n, stco_n, bytes; bool co64; };
 static struct subs_track st_trk[ST_TRACKS];
 static struct st_tx3g st_tx[6];
 static int st_n, st_ntx;
@@ -5088,9 +5122,10 @@ static const char *st_lang_name(const char *c)
     return NULL;
 }
 /* an MP4 timed-text track: handler 'text' / 'sbtl' / 'subt' with a 'tx3g' sample description */
-static bool st_tx3g_trak(uint32_t ps, uint32_t pe, struct st_tx3g *x, char *label, size_t ln)
+static bool st_tx3g_trak(m4off_t ps, m4off_t pe, struct st_tx3g *x, char *label, size_t ln)
 {
-    uint32_t ms, me, a, b, mi_s, mi_e, sb_s, sb_e, pos, t, s, e, h, lang, flags = 0;
+    m4off_t ms, me, a, b, mi_s, mi_e, sb_s, sb_e, pos, s, e;
+    uint32_t t, h, lang, flags = 0;
     bool have_stsd = false;
     char code[4];
     memset(x, 0, sizeof *x);
@@ -5122,7 +5157,7 @@ static bool st_tx3g_trak(uint32_t ps, uint32_t pe, struct st_tx3g *x, char *labe
     if (!have_stsd || !x->stts_n || !x->stsc_n || !x->stsz_n || !x->stco_n) return false;
     {   uint32_t i;
         if (x->stsz_fixed) x->bytes = x->stsz_fixed * x->stsz_n;
-        else for (i = 0; i < x->stsz_n && x->bytes < 8u << 20; i++) x->bytes += m4_u32(x->stsz + 4 * i);
+        else for (i = 0; i < x->stsz_n && x->bytes < 8u << 20; i++) x->bytes += m4_u32(x->stsz + 4 * (m4off_t)i);
     }
     code[0] = (char)(((lang >> 10) & 31) + 0x60); code[1] = (char)(((lang >> 5) & 31) + 0x60); code[2] = (char)((lang & 31) + 0x60); code[3] = 0;
     {
@@ -5134,7 +5169,7 @@ static bool st_tx3g_trak(uint32_t ps, uint32_t pe, struct st_tx3g *x, char *labe
 }
 static void st_find_tracks(const char *video)
 {
-    uint32_t pos, t, ps, pe;
+    m4off_t pos, ps, pe; uint32_t t;
     snprintf(st_video, sizeof st_video, "%s", video);
     st_n = subs_find_sidecars(video, st_trk, SUBS_MAX_TRACKS);
     st_ntx = 0;
@@ -5175,9 +5210,9 @@ static int st_load_tx3g(const struct st_tx3g *x)
     stts_left = m4_u32(x->stts); delta = m4_u32(x->stts + 4);
     for (k = 0; k < x->stsz_n && chunk <= x->stco_n; k++)
     {
-        uint32_t size = x->stsz_fixed ? x->stsz_fixed : m4_u32(x->stsz + 4 * k);
-        uint32_t coff = x->co64 ? m4_u32(x->stco + 8 * (chunk - 1) + 4) : m4_u32(x->stco + 4 * (chunk - 1));
-        uint32_t off = coff + off_in_chunk, start = (uint32_t)(dts * 1000ULL / x->timescale);
+        uint32_t size = x->stsz_fixed ? x->stsz_fixed : m4_u32(x->stsz + 4 * (m4off_t)k);
+        m4off_t off = m4_chunk_off(x->stco, x->co64, chunk) + off_in_chunk;
+        uint32_t start = (uint32_t)(dts * 1000ULL / x->timescale);
         uint32_t end = (uint32_t)((dts + delta) * 1000ULL / x->timescale);
         /* advance the cursors */
         off_in_chunk += size;
@@ -5198,7 +5233,7 @@ static int st_load_tx3g(const struct st_tx3g *x)
         if ((k & 31) == 31) bcm_host_service();          /* the picture keeps being fed meanwhile */
         if (size < 3) continue;                           /* an empty sample = nothing shown (a gap) */
         if (size > sizeof sb) size = sizeof sb;
-        if (lseek(fd, (off_t)off, SEEK_SET) != (off_t)off || read(fd, sb, size) != (ssize_t)size) continue;
+        if (!m4_seek(fd, off) || read(fd, sb, size) != (ssize_t)size) continue;
         {
             uint32_t tl = (uint32_t)sb[0] << 8 | sb[1], i, o = 0, q;
             uint32_t ist[16], ien[16];                    /* italic runs, in characters */
@@ -6456,19 +6491,27 @@ static int bcm_hw_model(int log);
 /* v88: full-screen layers made of one image W x 48 shown as a column of windows (the VideoCore cannot scale a window,
    and one 720 x 576 ARGB image would be 1.6 MB of its memory; a 48-line strip is 138 KB, written once over the bus).
    Layer 0 = the TV's retro CRT look, 1 = the quiz cover (black, hides the film's opening until the random frame is up). */
-#define TL_H 48
-static uint32_t tl_img[2], tl_addr[2], tl_win[2][13];
+#define TL_H 24        /* v89: 48 -> 24 lines (an ARGB strip is 69 KB of VideoCore memory; at 138 KB the controls could
+                          no longer get their ARGB images: "type 15 refused" in the v88 TV log) */
+#define TL_MAXW 32
+static uint32_t tl_img[2], tl_addr[2], tl_win[2][TL_MAXW];
 static int tl_n[2], tl_disp[2];
 static uint8_t tl_row[2][720 * 4] __attribute__((aligned(4)));
-static uint32_t tl_add(int disp, int layer, uint32_t img, int y, int w)
+static uint32_t tl_add_h(int disp, int layer, uint32_t img, int y, int w, int h)
 {
     uint32_t o[4], pl[8];
     memset(pl, 0, sizeof pl);
     pl[0] = (uint32_t)disp; pl[1] = (uint32_t)layer; pl[3] = img;
     ((uint16_t *)pl)[8] = 0; ((uint16_t *)pl)[9] = (uint16_t)y;
-    ((uint16_t *)pl)[12] = (uint16_t)w; ((uint16_t *)pl)[13] = TL_H;
+    ((uint16_t *)pl)[12] = (uint16_t)w; ((uint16_t *)pl)[13] = (uint16_t)h;
     return bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0 ? (o[0] ? o[0] : 0xffffffffu) : 0;
 }
+static uint32_t tl_add(int disp, int layer, uint32_t img, int y, int w) { return tl_add_h(disp, layer, img, y, w, TL_H); }
+/* v89: the "strong" CRT look: solid black 2-line windows (one tiny 720 x 2 RGB565 image) over every other line pair --
+   needs no transparency from the VideoCore */
+#define CRT_MAXW 160
+static uint32_t crt_img, crt_addr, crt_win[CRT_MAXW];
+static int crt_n;
 static void tl_off(int k)
 {
     uint32_t o[4];
@@ -6496,7 +6539,7 @@ static int tl_on(int k, int type, int disp, int layer, int w, int h)
         }
     }
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    for (i = 0; i * TL_H < h && i < 13; i++)
+    for (i = 0; i * TL_H < h && i < TL_MAXW; i++)
     {
         uint32_t wn = tl_add(disp, layer, tl_img[k], i * TL_H, w);
         if (!wn) break;
@@ -6507,21 +6550,65 @@ static int tl_on(int k, int type, int disp, int layer, int w, int h)
     return tl_n[k] ? 0 : -1;
 }
 /* the retro CRT look on the TV: 240-line scanlines (2 lines lit, 2 darkened -- the same in both fields, so an
-   interlaced set does not flicker) and the left / right edges shaded like a curved tube */
+   interlaced set does not flicker).  v89: Settings > Video > Video Out > Retro CRT Filter (TV) = Soft: a see-through
+   ARGB layer (the darkened lines + the left / right edges shaded like a curved tube); Strong: solid black line pairs
+   (no transparency needed).  Both now lie OVER the picture, the subtitles and the controls (v88 put the layer at 98,
+   under them, and on the TV it did not show) -- layer cfg_osd_layer + 5, below the quiz cover (+10). */
+static void crt_strong(int layer, int th)
+{
+    static uint16_t zero[720 * 2];
+    uint32_t o[4];
+    int y;
+    if (!crt_img)
+    {
+        if (osd_alloc(1, 720, 2, &crt_img, &crt_addr) != 0) { crt_img = 0; BLOG("  CRT: the VideoCore refused a 720x2 image"); return; }
+        bcm_io_lock(); bcm_io_write(crt_addr, zero, sizeof zero); bcm_io_unlock();
+    }
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    for (y = 2; y + 2 <= th && crt_n < CRT_MAXW; y += 4)
+    {
+        uint32_t wn = tl_add_h(2, layer, crt_img, y, 720, 2);
+        if (!wn) break;
+        crt_win[crt_n++] = wn;
+        if ((crt_n & 15) == 0) bcm_host_service();
+    }
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    BLOG("  CRT strong: %d black line pair(s) of %d on display 2, layer %d", crt_n, th / 4, layer);
+}
+static void crt_off(void)
+{
+    uint32_t o[4];
+    int i;
+    tl_off(0);
+    if (!crt_n) return;
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    for (i = 0; i < crt_n; i++) st_rm_win(crt_win[i]);
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    crt_n = 0;
+}
+static void osd_init(void);
 static void crt_on(void)
 {
-    int x, th = global_settings.bcm_tv_signal ? 576 : 480, edge = 72;
+    int x, th = global_settings.bcm_tv_signal ? 576 : 480, edge = 72, mode = global_settings.bcm_tv_crt;
+    int layer = cfg_crt_layer ? cfg_crt_layer : cfg_osd_layer + 5;
     uint32_t *a = (uint32_t *)tl_row[0], *b = (uint32_t *)tl_row[1];
-    if (!bcm_tv || !global_settings.bcm_tv_crt || tl_n[0]) return;
-    for (x = 0; x < 720; x++)
+    if (!bcm_tv || !mode || tl_n[0] || crt_n) return;
+    if (osd_ok < 0) osd_init();                  /* v89: the controls take their (ARGB) images first */
+    if (mode == 1)
     {
-        int d = x < 720 - 1 - x ? x : 720 - 1 - x, e = d < edge ? cfg_crt_edge * (edge - d) * (edge - d) / (edge * edge) : 0;
-        int dark = 255 - (255 - cfg_crt_alpha) * (255 - e) / 255;
-        a[x] = (uint32_t)e << 24;                       /* black, alpha only */
-        b[x] = (uint32_t)dark << 24;
+        for (x = 0; x < 720; x++)
+        {
+            int d = x < 720 - 1 - x ? x : 720 - 1 - x, e = d < edge ? cfg_crt_edge * (edge - d) * (edge - d) / (edge * edge) : 0;
+            int dark = 255 - (255 - cfg_crt_alpha) * (255 - e) / 255;
+            a[x] = (uint32_t)e << 24;                       /* black, alpha only */
+            b[x] = (uint32_t)dark << 24;
+        }
+        tl_img[0] = tl_img[0] && tl_disp[0] == 720 ? tl_img[0] : 0;
+        if (tl_on(0, 15, 2, layer, 720, th) == 0 && tl_n[0] * TL_H >= th) return;
+        tl_off(0);
+        BLOG("  CRT soft: the see-through layer did not go up -- using the strong (solid lines) look instead");
     }
-    tl_img[0] = tl_img[0] && tl_disp[0] == 720 ? tl_img[0] : 0;
-    tl_on(0, 15, 2, cfg_crt_layer ? cfg_crt_layer : (cfg_subs_layer ? cfg_subs_layer : cfg_osd_layer - 1) - 1, 720, th);
+    crt_strong(layer, th);
 }
 static void qz_cover_on(void)
 {
@@ -6694,14 +6781,19 @@ static void bcm_video_run(int secs)
             av_checked = true;
             BLOG("  audio check (stock route) %d s in: VC elapsed %u ms, AAC frames sent %d (asked %d, %d B, last ts %u ms)", cfg_av_stall,
                  (unsigned)e, a_frames, a_req, a_bytes, (unsigned)a_last_ts);
-            if (e != 0xffffffffu && e < 1000)
+            if (e != 0xffffffffu && e < 1000 && ra_fsize > 0x7fffffffu)
+                BLOG("  audio: the picture does not move with the VC's sound, but the movie is over 2 GiB: Rockbox's own "
+                     "sound route cannot read it -- staying");
+            else if (e != 0xffffffffu && e < 1000)
             {
                 BLOG("  audio: the picture does not move with the VC's sound -> restarting with Rockbox's sound (sound=1)");
                 v_fallback = true;
                 break;
             }
             if (e != 0xffffffffu) { rate_e0 = e; rate_t0 = current_tick; rate_seeks = v_seeks; }
-            if (a_frames == 0)
+            if (a_frames == 0 && ra_fsize > 0x7fffffffu)
+                BLOG("  audio: the VC never asked for sound; the movie is over 2 GiB, so Rockbox cannot play it either");
+            else if (a_frames == 0)
             {   int pct = av_vol_pct;
                 BLOG("  audio: the VC plays the picture but never asked for sound -> Rockbox plays it (sound=1)");
                 av_close(); v_sound = 1; av_open(bcm_play_path ? bcm_play_path : v_path); av_set_vol(pct);
@@ -6724,8 +6816,8 @@ static void bcm_video_run(int secs)
         if (!TIME_BEFORE(current_tick, next_log))
         {
             if (ra_buf)
-                BLOG("  read-ahead: %u KB ahead of the picture, %u bursts, %u restarts, %u KB read, drive %s", ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1]) > ra_size ? 0 :
-                     (ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1])) / 1024, ra_bursts, ra_misses, ra_read_kb, ra_filling ? "reading" : "idle");
+                BLOG("  read-ahead: %u KB ahead of the picture, %u bursts, %u restarts, %u KB read, drive %s", ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1]) > ra_size ? 0u :
+                     (unsigned)((ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1])) / 1024), ra_bursts, ra_misses, ra_read_kb, ra_filling ? "reading" : "idle");
             BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d  cache misses: tables %u data %u",
                  v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
             gf_log = v_getframes;
@@ -7120,7 +7212,7 @@ static void bcm_out_switch(void)
     st_ok = 0; st_win = 0; st_front = -1; st_nimg = 0; st_nshown = 0; st_shown_any = false; st_shown_msgv = -1;
     if (bcm_tv)
     {
-        tl_off(0);                                     /* v88 */
+        crt_off();                                     /* v88; v89: both CRT looks */
         bcm_tv_enable(false);
         bcm_region("hold MENU: to the iPod screen");
         bcm_tv = false;
@@ -7342,7 +7434,12 @@ static void bcm_playback_probe(void)
             v_sound = cfg_sound; v_fallback = false;
             if (v_sound == 2 && !ma.ok) { BLOG("no AAC track found -- no VC sound"); v_sound = cfg_sound ? 1 : 0; }
 #ifndef SIMULATOR
-            if (v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO)
+            if (v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO && ra_fsize > 0x7fffffffu)
+            {   /* v89: Rockbox's own playback (codecs, buffering) reads only the first 2 GiB of a file */
+                BLOG("audio: the movie is over 2 GiB -- Rockbox's own sound route cannot read it; the VideoCore plays the "
+                     "sound (headphones / dock / TV), the click speaker stays silent");
+            }
+            else if (v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO)
             {   /* v86: the VideoCore's sound goes straight to the headphone codec, past Rockbox's mixer, so the click
                    speaker never got it (v77-v85: silent videos).  Rockbox decodes the AAC track instead (the v51 route,
                    kept in step with the picture), and the mixer sends it to the click speaker. */
@@ -7503,6 +7600,7 @@ static void bcm_reset_run_state(void)
     av_have = false; av_state = 0; av_vol_until = 0;
     m4c_miss = m4d_miss = 0;
     tl_n[0] = tl_n[1] = 0; tl_img[0] = tl_img[1] = 0;  /* v88: the VideoCore rebooted: its images are gone */
+    crt_n = 0; crt_img = 0;                            /* v89 */
     qz_state = 0;
 }
 static bool bcm_run(const char *play_path);
@@ -7571,7 +7669,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v88, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v89, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");

@@ -18999,3 +18999,54 @@
     ipodvideo: "Retro CRT Filter (TV)"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_TV_CRT_SOFT
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Soft"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Soft"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Soft"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_CRT_STRONG
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Strong"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Strong"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Strong"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BCM_DEBUG_LOG
+  desc: bcm overlay v77
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Debug Log (bcm_host_log.txt)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Debug Log (bcm_host_log.txt)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Debug Log (bcm_host_log.txt)"
+  </voice>
+</phrase>

@@ -1403,7 +1403,11 @@ static union raw_dirent * cache_direntry(struct bpb *fat_bpb,
 {
     filestr->eof = false;
 
+#ifdef BOOTLOADER
     if (entry >= MAX_DIRENTRIES)
+#else
+    if (entry >= (fat_bpb->is_exfat ? EXFAT_MAX_DIRENTRIES : MAX_DIRENTRIES))   /* bcm overlay v89 */
+#endif
     {
         DEBUGF("%s() - Dir is too large (entry %u)\n", __func__, entry);
         return NULL;
@@ -2120,7 +2124,7 @@ static int free_cluster_chain(struct bpb *fat_bpb, long startcluster)
  ****************************************************************************/
 
 #define EXFAT_CONTIG        0x40000000  /* fat_file.firstcluster: NoFatChain run */
-#define EXFAT_BIG           0x20000000  /* fat_file.firstcluster: file >= 4 GiB */
+#define EXFAT_BIG           0x20000000  /* (v66-v88: file >= 4 GiB, read-only; v89: no longer set, sizes are 64-bit) */
 #define EXFAT_CLUS_MASK     0x1fffffff
 #define EXFAT_EOF           0xffffffffu
 #define EXFAT_BAD           0xfffffff7u
@@ -2775,7 +2779,11 @@ static int exfat_parse_set(struct bpb *fat_bpb, const uint8_t *set, unsigned int
     fatent->wrttime      = mod & 0xffff;
     fatent->wrtdate      = mod >> 16;
     fatent->lstaccdate   = acc >> 16;
+#ifdef BOOTLOADER
     fatent->filesize     = size > 0xffffffffull ? 0xffffffffu : (uint32_t)size;
+#else
+    fatent->filesize     = size;              /* bcm overlay v89: the real 64-bit size */
+#endif
     fatent->shortname[0] = 0;
 
     long fc = 0;
@@ -2787,8 +2795,10 @@ static int exfat_parse_set(struct bpb *fat_bpb, const uint8_t *set, unsigned int
             fc |= EXFAT_CONTIG;
             exfat_run_set(fat_bpb, first, size ? exfat_bytes2clusters(fat_bpb, size) : 1);
         }
+#ifdef BOOTLOADER
         if (size > 0xffffffffull && !(attr & ATTR_DIRECTORY))
             fc |= EXFAT_BIG;
+#endif
     }
     fatent->firstcluster = fc;
 
@@ -2845,7 +2855,7 @@ static int exfat_readdir(struct bpb *fat_bpb, struct fat_filestr *dirstr,
     while (1)
     {
         unsigned int direntry = ++scan->entry;
-        if (direntry >= MAX_DIRENTRIES)
+        if (direntry >= EXFAT_MAX_DIRENTRIES)     /* bcm overlay v89: was 65536 (FAT32's limit) */
             FAT_ERROR(-1);
 
         unsigned long sector = direntry / DIR_ENTRIES_PER_SECTOR;
@@ -3330,7 +3340,7 @@ static bool exfat_name_taken(struct bpb *fat_bpb, struct fat_filestr *dirstr,
         return false;   /* the upper layer already refused ASCII-case twins */
 
     uint8_t other[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
-    for (unsigned int entry = 0; entry < MAX_DIRENTRIES; entry++)
+    for (unsigned int entry = 0; entry < EXFAT_MAX_DIRENTRIES; entry++)
     {
         dc_lock_cache();
         union raw_dirent *ent = cache_direntry(fat_bpb, dirstr, entry);
@@ -3444,7 +3454,7 @@ static int exfat_add_set(struct bpb *fat_bpb, struct fat_filestr *parentstr,
     {
         if (!found)
             firstentry = entry;
-        if (firstentry + count > MAX_DIRENTRIES)
+        if (firstentry + count > EXFAT_MAX_DIRENTRIES)
             FAT_ERROR(-2);
         while (found < count)
         {
@@ -4235,7 +4245,17 @@ fat_error:
 
 /** File stream functions **/
 
-int fat_closewrite(struct fat_filestr *filestr, uint32_t size,
+#ifndef BOOTLOADER
+uint64_t fat_file_max_size(const struct fat_file *file)
+{
+    const struct bpb *fat_bpb = FAT_BPB(file->volume);
+    if (fat_bpb && fat_bpb->is_exfat)
+        return (uint64_t)0xffffffffu * LOG_SECTOR_SIZE(fat_bpb);   /* bcm overlay v89 */
+    return 0xffffffffu;
+}
+#endif
+
+int fat_closewrite(struct fat_filestr *filestr, fat_size_t size,
                    struct fat_direntry *fatentp)
 {
     DEBUGF("%s(size=%ld)\n", __func__, size);
@@ -4249,8 +4269,10 @@ int fat_closewrite(struct fat_filestr *filestr, uint32_t size,
     if (fat_bpb->is_exfat)
     {
         /* bcm overlay v66 */
+#ifdef BOOTLOADER
         if (file->firstcluster > 0 && (file->firstcluster & EXFAT_BIG))
             FAT_ERROR(-5);  /* >= 4 GiB: never written */
+#endif
         struct fat_file old = *file;
         bool freeold = false;
         if (!size && file->firstcluster)
@@ -4450,9 +4472,11 @@ long fat_readwrite(struct fat_filestr *filestr, unsigned long sectorcount,
 
     eof = false;
 
+#ifdef BOOTLOADER
     if (write && fat_bpb->is_exfat && file->firstcluster > 0 &&
         (file->firstcluster & EXFAT_BIG))
         return -1;  /* bcm overlay v66: files >= 4 GiB are read-only here */
+#endif
 
     if (!sector)
     {
@@ -4685,8 +4709,10 @@ int fat_truncate(const struct fat_filestr *filestr)
     {
         /* bcm overlay v66 */
         struct fat_file *file = filestr->fatfilep;
+#ifdef BOOTLOADER
         if (file->firstcluster > 0 && (file->firstcluster & EXFAT_BIG))
             return -1;
+#endif
         if (file->firstcluster > 0 && (file->firstcluster & EXFAT_CONTIG) &&
             exfat_make_chained(fat_bpb, file) < 0)
             return -1;

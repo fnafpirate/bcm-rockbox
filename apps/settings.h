@@ -786,7 +786,8 @@ struct user_settings
     int bcm_piezo_clarity; /* v86: presence EQ 0 off, 1 +4 dB, 2 +10 dB */
     int bcm_piezo_max;       /* v80: Sound Mode: 0 custom, 1 Maximum Loudness, 2 Highest Quality */
     bool bcm_piezo_charged;  /* v88: charging-complete chime + message */
-    bool bcm_tv_crt;         /* v88: retro CRT scanlines over the TV picture */
+    int  bcm_tv_crt;         /* v88: retro CRT scanlines over the TV picture; v89: 0 off, 1 soft, 2 strong */
+    bool bcm_debug_log;      /* v89: write /bcm_host_log.txt (off: no log file at all) */
 #endif
 
 #ifdef HAVE_REMOTE_LCD

@@ -312,21 +312,25 @@ static int copy_move_file(struct file_op_params *src, const char *dst_path,
 
     int src_fd = open(src->path, O_RDONLY);
     if (src_fd >= 0) {
-        off_t src_sz = lseek(src_fd, 0, SEEK_END);
+        /* bcm overlay v89: 64-bit sizes -- the 32-bit lseek(SEEK_END) stopped at 2 GiB (bigger files were copied
+           cut off at 2 GiB) */
+        int64_t src_sz = ffilesize64(src_fd);
         if (!src->total_size && !src->processed) /* single file copy */
             src->total_size = src_sz;
-        lseek(src_fd, 0, SEEK_SET);
 
         int oflag = O_WRONLY|O_CREAT;
 
         if (!(flags & PASTE_OVERWRITE)) {
             oflag |= O_EXCL;
         }
+        else {
+            oflag |= O_TRUNC;   /* v89: no ftruncate() past 2 GiB below */
+        }
 
         int dst_fd = open(dst_path, oflag, 0666);
         if (dst_fd >= 0) {
-            off_t total_size = 0;
-            off_t next_cancel_test = 0; /* No excessive button polling */
+            int64_t total_size = 0;
+            int64_t next_cancel_test = 0; /* No excessive button polling */
 
             rc = FORC_SUCCESS;
 
@@ -369,9 +373,9 @@ static int copy_move_file(struct file_op_params *src, const char *dst_path,
             if (rc == FORC_SUCCESS) {
                 if (total_size != src_sz)
                     rc = FORC_UNKNOWN_FAILURE;
-                else {
+                else if (total_size <= 0x7fffffff) {
                 /* If overwriting, set the correct length if original was longer */
-                    rc = ftruncate(dst_fd, total_size) * 10;
+                    rc = ftruncate(dst_fd, (off_t)total_size) * 10;
                 }
             }
 

@@ -453,8 +453,14 @@ MAKE_MENU(usb_menu, ID2P(LANG_USB_MENU), 0, Icon_NOICON,
 #endif
          );
 
+#ifdef IPOD_VIDEO
+MENUITEM_SETTING(bcm_debug_log_item, &global_settings.bcm_debug_log, NULL);   /* v89 */
+#endif
 MAKE_MENU(system_menu, ID2P(LANG_SYSTEM),
           0, Icon_System_menu,
+#ifdef IPOD_VIDEO
+            &bcm_debug_log_item,
+#endif
 #if (BATTERY_CAPACITY_INC > 0) || defined(HAVE_USB_CHARGING_ENABLE)
             &battery_menu,
 #endif

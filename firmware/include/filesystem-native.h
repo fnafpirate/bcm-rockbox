@@ -56,6 +56,8 @@ int     rbfs_remove(const char *path);
 int     rbfs_rename(const char *old, const char *new);
 int     rbfs_modtime(const char *path, time_t modtime);
 off_t   rbfs_ffilesize(int fildes);
+int64_t rbfs_lseek64(int fildes, int64_t offset, int whence);   /* bcm overlay v89: whole-file range */
+int64_t rbfs_ffilesize64(int fildes);
 int     rbfs_fsamefile(int fildes1, int fildes2);
 int     rbfs_relate(const char *path1, const char *path2);
 bool    rbfs_file_exists(const char *path);
@@ -79,7 +81,11 @@ struct dirent;
 struct dirinfo_native
 {
     unsigned int attr;
+#ifdef BOOTLOADER
     off_t        size;
+#else
+    file_size_t  size;             /* bcm overlay v89: 64-bit */
+#endif
     uint16_t     wrtdate;
     uint16_t     wrttime;
 };

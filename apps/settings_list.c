@@ -483,7 +483,13 @@ static const char graphic_numeric[] = "graphic,numeric";
  * also applies to the database browser so it makes sense to support
  * larger maximums.
  */
-#if MEMORYSIZE >= 16
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v89: big exFAT folders (up to millions of entries).  ~60 bytes per entry: 30 000 = 1.8 MB, the
+   maximum 300 000 = 18 MB (a 64 MB iPod) */
+# define MAX_FILES_IN_DIR_DEFAULT   30000
+# define MAX_FILES_IN_DIR_MAX       300000
+# define MAX_FILES_IN_DIR_STEP      5000
+#elif MEMORYSIZE >= 16
 # define MAX_FILES_IN_DIR_DEFAULT   5000
 # define MAX_FILES_IN_DIR_MAX       100000
 # define MAX_FILES_IN_DIR_STEP      1000
@@ -1354,7 +1360,9 @@ const struct settings_list settings[] = {
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
                    ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
     OFFON_SETTING(0, bcm_tv_wide, LANG_TV_WIDESCREEN, false, "tv widescreen", NULL),
-    OFFON_SETTING(0, bcm_tv_crt, LANG_TV_CRT, false, "tv retro crt", NULL),   /* v88 */
+    CHOICE_SETTING(0, bcm_tv_crt, LANG_TV_CRT, 0, "tv retro crt", "off,soft,strong", NULL, 3,   /* v88, v89 */
+                   ID2P(LANG_OFF), ID2P(LANG_TV_CRT_SOFT), ID2P(LANG_TV_CRT_STRONG)),
+    OFFON_SETTING(0, bcm_debug_log, LANG_BCM_DEBUG_LOG, false, "bcm debug log", NULL),   /* v89 */
     /* bcm overlay v73: soft subtitles (SRT / WebVTT / ASS next to the video, MP4 timed text) */
     OFFON_SETTING(0, bcm_subs, LANG_SUBTITLES, true, "subtitles", NULL),
     CHOICE_SETTING(0, bcm_sub_size, LANG_SUBTITLE_SIZE, 1, "subtitle size", "small,medium,large", NULL, 3,
@@ -1464,7 +1472,9 @@ const struct settings_list settings[] = {
                 set_poweroff_timeout),
     INT_SETTING(F_BANFROMQS, max_files_in_playlist,
                 LANG_MAX_FILES_IN_PLAYLIST,
-#if CONFIG_CPU == PP5002 || CONFIG_CPU == PP5020 || CONFIG_CPU == PP5022
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+                  20000,   /* bcm overlay v89: 4 bytes each; a big folder or album list plays whole */
+#elif CONFIG_CPU == PP5002 || CONFIG_CPU == PP5020 || CONFIG_CPU == PP5022
                   /** Slow CPU benefits greatly from building smaller playlists
                   On the iPod Mini 2nd gen, creating a playlist of 2000 entries takes around 10 seconds */
                   2000,
@@ -1473,7 +1483,13 @@ const struct settings_list settings[] = {
 #else
                   400,
 #endif
-                  "max files in playlist", UNIT_INT, 1000, 32000, 1000,
+                  "max files in playlist", UNIT_INT, 1000,
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+                  200000,                     /* bcm overlay v89: was 32000 */
+#else
+                  32000,
+#endif
+                  1000,
                   NULL, NULL, NULL),
     INT_SETTING(F_BANFROMQS, max_files_in_dir, LANG_MAX_FILES_IN_DIR,
                 MAX_FILES_IN_DIR_DEFAULT, "max files in dir", UNIT_INT,

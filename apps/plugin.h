@@ -182,7 +182,7 @@ int plugin_open(const char *plugin, const char *parameter);
  * when this happens please take the opportunity to sort in
  * any new functions "waiting" at the end of the list.
  */
-#define PLUGIN_API_VERSION 286   /* bcm overlay v88: + bcm_video_quiz */
+#define PLUGIN_API_VERSION 287   /* bcm overlay v89: struct dirent grew (64-bit sizes); v88: + bcm_video_quiz */
 
 /* 239 Marks the removal of ARCHOS HWCODEC and CHARCELL */
 

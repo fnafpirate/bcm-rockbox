@@ -49,6 +49,15 @@
 #define DIRCACHE_RESERVE (1024*64)     /* 64 KB - new entry slack */
 #define DIRCACHE_MIN     (1024*1024*1) /* 1 MB - provision min size */
 #define DIRCACHE_LIMIT   (1024*1024*6) /* 6 MB - provision max size */
+/* bcm overlay v89: big libraries (2 TB cards).  A file costs ~36 bytes + its name; the name offsets are 24 bits, so
+   the cache can address up to 16 MB.  The limit follows the RAM found at boot: 64 MB iPods ~16 MB (~200 000+
+   files), 32 MB iPods 8 MB (~100 000).  It is only taken when the library needs it; Rockbox carries on without the
+   cache (slower browsing) when even that is too small. */
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR) && !defined(BOOTLOADER)
+#define DIRCACHE_LIMIT_NOW (probed_ramsize == 64 ? (1024*1024*16 - 1024*64) : (1024*1024*8))
+#else
+#define DIRCACHE_LIMIT_NOW DIRCACHE_LIMIT
+#endif
 
 /* make it easy to change serialnumber size without modifying anything else;
    32 bits allows 21845 builds before wrapping in a 6MB cache that is filled

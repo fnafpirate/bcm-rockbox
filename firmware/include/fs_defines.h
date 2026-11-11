@@ -64,17 +64,22 @@
 #define STATIC_PATHCOMP_NUM 6
 
 /* unsigned value that will also hold the off_t range we need without
-   overflow */
-#define file_size_t uint32_t
+   overflow.  bcm overlay v89: 64-bit -- exFAT files bigger than 4 GiB keep their real size and are fully readable
+   and writable through lseek64() / ffilesize64(); the classic off_t calls below keep their 2 GiB range */
+#ifdef BOOTLOADER
+#define file_size_t uint32_t   /* v89: the bootloader keeps v88's sizes (byte-identical; it only loads rockbox.ipod) */
+#else
+#define file_size_t uint64_t
+#endif
 
 #ifdef __USE_FILE_OFFSET64
 /* if we want, we can deal with files up to 2^32-1 bytes-- the full FAT16/32
    range */
 #define FILE_SIZE_MAX   (0xffffffffu)
 #else
-/* file contents and size will be preserved by the APIs so long as ftruncate()
-   isn't used; bytes passed 2^31-1 will not accessible nor will writes succeed
-   that would extend the file beyond the max for a 32-bit off_t */
+/* bcm overlay v89: now only the range of the 32-bit off_t calls (lseek, ffilesize, ftruncate); read() and write()
+   go on past it (sequentially or after lseek64()) up to what the volume allows: 4 GiB - 1 on FAT32, 2 TiB (with
+   512-byte sectors) on exFAT -- fat_file_max_size() */
 #define FILE_SIZE_MAX   (0x7fffffffu)
 #endif
 

@@ -57,7 +57,14 @@
 #endif
 #define FAT_MAX_FILE_SIZE  (0xfffffffful) /* 2^32-1 bytes */
 #define MAX_DIRENTRIES     65536
+#ifdef BOOTLOADER
 #define MAX_DIRECTORY_SIZE (MAX_DIRENTRIES*32) /* 2MB max size */
+#define EXFAT_MAX_DIRENTRIES MAX_DIRENTRIES    /* v89: the bootloader keeps v88's limit (byte-identical) */
+#else
+/* bcm overlay v89: exFAT folders may hold up to 256 MiB of entries (8 388 608: e.g. 2.7 million short names) */
+#define EXFAT_MAX_DIRENTRIES (8u << 20)
+#define MAX_DIRECTORY_SIZE ((uint64_t)EXFAT_MAX_DIRENTRIES*32) /* 256 MiB (FAT32 stops at 2 MiB itself) */
+#endif
 
 /* these aren't I/O error conditions, so define specially; failure rc's
  * shouldn't return the last digit as "0", therefore this is unambiguous */
@@ -86,7 +93,11 @@ struct fat_direntry
     uint16_t lstaccdate;        /* last access date */
     uint16_t wrttime;           /* last write time */
     uint16_t wrtdate;           /* last write date */
+#ifdef BOOTLOADER
     uint32_t filesize;          /* file size in bytes */
+#else
+    uint64_t filesize;          /* file size in bytes (bcm overlay v89: 64-bit for exFAT) */
+#endif
     int32_t  firstcluster;      /* first FAT cluster of file, 0 if empty */
 };
 
@@ -152,8 +163,17 @@ int fat_file_sector_size(IF_MV_NONVOID(const struct fat_file *file));
 #define fat_file_sector_size(__file) SECTOR_SIZE
 #endif
 
+/* bcm overlay v89: the largest size a file on this volume can have (FAT32: 4 GiB - 1; exFAT: as far as a 32-bit
+   sector index reaches -- 2 TiB with 512-byte sectors) */
+#ifndef BOOTLOADER
+uint64_t fat_file_max_size(const struct fat_file *file);
+#define fat_size_t uint64_t
+#else
+#define fat_size_t uint32_t
+#endif
+
 /** File stream functions **/
-int fat_closewrite(struct fat_filestr *filestr, uint32_t size,
+int fat_closewrite(struct fat_filestr *filestr, fat_size_t size,
                    struct fat_direntry *fatentp);
 void fat_filestr_init(struct fat_filestr *filestr, struct fat_file *file);
 sector_t fat_query_sectornum(const struct fat_filestr *filestr);

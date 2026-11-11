@@ -151,6 +151,7 @@ static void discard_cache(struct filestr_desc *file)
     cachep->flags = 0;
 }
 
+#ifdef BOOTLOADER   /* bcm overlay v89: the bootloader keeps v88's code (it stays byte-identical) */
 /* set the file pointer */
 static off_t lseek_internal(struct filestr_desc *file, off_t offset,
                             int whence)
@@ -194,6 +195,62 @@ static off_t lseek_internal(struct filestr_desc *file, off_t offset,
 file_error:
     return rc;
 }
+#else
+/* set the file pointer.  bcm overlay v89: 64-bit; `range` is the largest position the caller can be told about
+   (FILE_SIZE_MAX for the 32-bit off_t lseek(), which also sees the size capped there as before; INT64_MAX for
+   lseek64()) */
+static int64_t lseek_internal(struct filestr_desc *file, int64_t offset,
+                              int whence, file_size_t range)
+{
+    int64_t rc;
+    file_size_t pos;
+
+    file_size_t size = MIN(*file->sizep, range);
+
+    switch (whence)
+    {
+    case SEEK_SET:
+        if (offset < 0 || (file_size_t)offset > size)
+            FILE_ERROR(EINVAL, -1);
+
+        pos = offset;
+        break;
+
+    case SEEK_CUR:
+        if ((offset < 0 && (file_size_t)-offset > file->offset) ||
+            (offset > 0 && (file->offset > size || (file_size_t)offset > size - file->offset)))
+            FILE_ERROR(EINVAL, -1);
+
+        pos = file->offset + offset;
+        break;
+
+    case SEEK_END:
+        if (offset > 0 || (file_size_t)-offset > size)
+            FILE_ERROR(EINVAL, -1);
+
+        pos = size + offset;
+        break;
+
+    default:
+        FILE_ERROR(EINVAL, -1);
+    }
+
+    if (pos > range)
+        FILE_ERROR(EOVERFLOW, -1);   /* read past 2 GiB, then asked through the 32-bit call */
+
+    file->offset = pos;
+
+    return pos;
+file_error:
+    return rc;
+}
+
+/* bcm overlay v89: the largest size this file may reach (FAT32 4 GiB - 1, exFAT 2 TiB) */
+static file_size_t file_max_size(struct filestr_desc *file)
+{
+    return fat_file_max_size(file->stream.fatstr.fatfilep);
+}
+#endif /* BOOTLOADER */
 
 /* Handle syncing all file's streams to the truncation */
 static void handle_truncate(struct filestr_desc * const file, file_size_t size)
@@ -617,6 +674,7 @@ static ssize_t readwrite(struct filestr_desc *file, void *buf, size_t nbyte,
            file, (long)buf, (unsigned long)nbyte, write ? "write" : "read");
 #endif
 
+#ifdef BOOTLOADER
     const file_size_t size = *file->sizep;
     file_size_t filerem;
 
@@ -644,6 +702,37 @@ static ssize_t readwrite(struct filestr_desc *file, void *buf, size_t nbyte,
         else if (file->offset >= FILE_SIZE_MAX)
             FILE_ERROR_RETURN(EOVERFLOW, -2); /* can't read here */
     }
+#else
+    const file_size_t size = *file->sizep;
+    const file_size_t maxsize = file_max_size(file);   /* bcm overlay v89: was FILE_SIZE_MAX (2 GiB - 1) */
+    file_size_t filerem;
+
+    if (write)
+    {
+        /* if opened in append mode, move pointer to end */
+        if (file->stream.flags & FD_APPEND)
+            file->offset = MIN(size, maxsize);
+
+        filerem = file->offset < maxsize ? maxsize - file->offset : 0;
+    }
+    else
+    {
+        /* limit to maximum possible offset (EOF or the volume's maximum) */
+        file_size_t end = MIN(size, maxsize);
+        filerem = end > file->offset ? end - file->offset : 0;
+    }
+
+    if (nbyte > filerem)
+    {
+        nbyte = filerem;
+        if (nbyte > 0)
+            {}
+        else if (write)
+            FILE_ERROR_RETURN(EFBIG, -1);     /* would get too large */
+        else if (file->offset >= maxsize)
+            FILE_ERROR_RETURN(EOVERFLOW, -2); /* can't read here */
+    }
+#endif
 
     if (nbyte == 0)
         return 0;
@@ -924,7 +1013,11 @@ off_t rbfs_lseek(int fildes, off_t offset, int whence)
     if (!file)
         FILE_ERROR_RETURN(ERRNO, -1);
 
+#ifdef BOOTLOADER
     off_t rc = lseek_internal(file, offset, whence);
+#else
+    off_t rc = (off_t)lseek_internal(file, offset, whence, FILE_SIZE_MAX);
+#endif
     if (rc < 0)
         FILE_ERROR(ERRNO, rc * 10 - 2);
 
@@ -932,6 +1025,24 @@ file_error:
     RELEASE_FILESTR(READER, file);
     return rc;
 }
+
+#ifndef BOOTLOADER
+/* bcm overlay v89: lseek() over the whole file (exFAT files beyond 2 / 4 GiB) */
+int64_t rbfs_lseek64(int fildes, int64_t offset, int whence)
+{
+    struct filestr_desc * const file = GET_FILESTR(READER, fildes);
+    if (!file)
+        FILE_ERROR_RETURN(ERRNO, -1);
+
+    int64_t rc = lseek_internal(file, offset, whence, (file_size_t)0x7fffffffffffffffull);
+    if (rc < 0)
+        FILE_ERROR(ERRNO, rc * 10 - 2);
+
+file_error:
+    RELEASE_FILESTR(READER, file);
+    return rc;
+}
+#endif
 
 /* read from a file */
 ssize_t rbfs_read(int fildes, void *buf, size_t nbyte)
@@ -1198,6 +1309,20 @@ file_error:
     RELEASE_FILESTR(READER, file);
     return rc;
 }
+
+#ifndef BOOTLOADER
+/* bcm overlay v89: the real size, however big */
+int64_t rbfs_ffilesize64(int fildes)
+{
+    struct filestr_desc * const file = GET_FILESTR(READER, fildes);
+    if (!file)
+        FILE_ERROR_RETURN(ERRNO, -1);
+
+    int64_t rc = (int64_t)*file->sizep;
+    RELEASE_FILESTR(READER, file);
+    return rc;
+}
+#endif
 
 /* test if two file descriptors refer to the same file */
 int rbfs_fsamefile(int fildes1, int fildes2)

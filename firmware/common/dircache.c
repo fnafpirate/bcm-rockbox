@@ -169,7 +169,7 @@ struct dircache_entry
     int         next;              /* next at same level */
     union {
     int         down;              /* first at child level (if directory) */
-    file_size_t filesize;          /* size of file in bytes (if file) */
+    uint32_t    filesize;          /* size of file in bytes (if file); bcm overlay v89: low 32 bits */
     };
     int         up;                /* parent index (-volume-1 if root) */
     union {
@@ -179,7 +179,7 @@ struct dircache_entry
     };
     unsigned char namebuf[MAX_TINYNAME]; /* direct storage (.tinyname == 1) */
     };
-    uint32_t    direntry     : 16; /* entry # in parent - max 0xffff */
+    uint32_t    direntry     : 16; /* entry # in parent - low 16 bits (bcm v89: + direntry_hi) */
     uint32_t    direntries   :  5; /* # of entries used - max 21 */
     uint32_t    tinyname     :  1; /* if == 1, name fits in .namebuf */
     uint32_t    frontier     :  2; /* (FRONTIER_* bitflags) */
@@ -192,7 +192,19 @@ struct dircache_entry
     time_t      mtime;             /* file last-modified time */
 #endif
     dc_serial_t serialnum;         /* entry serial number */
+    /* bcm overlay v89: exFAT -- folders past 65536 entries and files past 4 GiB */
+    uint32_t    direntry_hi  :  8; /* entry # bits 16..23 (exFAT folders: up to 8 388 608 entries) */
+    uint32_t    filesize_hi  : 24; /* size bits 32..55 */
 };
+
+static inline unsigned int dc_get_direntry(const struct dircache_entry *ce)
+    { return ce->direntry | (unsigned int)ce->direntry_hi << 16; }
+static inline void dc_set_direntry(struct dircache_entry *ce, unsigned int e)
+    { ce->direntry = e & 0xffff; ce->direntry_hi = (e >> 16) & 0xff; }
+static inline file_size_t dc_get_filesize(const struct dircache_entry *ce)
+    { return ce->filesize | (file_size_t)ce->filesize_hi << 32; }
+static inline void dc_set_filesize(struct dircache_entry *ce, file_size_t size)
+    { ce->filesize = (uint32_t)size; ce->filesize_hi = (uint32_t)(size >> 32) & 0xffffff; }
 
 /* spare us some tedium */
 #define ENTRYSIZE   (sizeof (struct dircache_entry))
@@ -685,7 +697,7 @@ static void sab_sync_scan(struct sab *sabp, int *prevp, int *nextp)
                 struct dircache_entry *ceprev =
                     container_of(prevp, struct dircache_entry, next);
             #ifdef DIRCACHE_NATIVE
-                sabp->info.fatfile.e.entry   = ceprev->direntry;
+                sabp->info.fatfile.e.entry   = dc_get_direntry(ceprev);
                 sabp->info.fatfile.e.entries = ceprev->direntries;
             #endif
             }
@@ -766,7 +778,9 @@ static int alloc_name(size_t size)
 
         while (1)
         {
-            if ((size_t)(bufend - p) >= size && (p = memchr(p, 0xff, end - p)))
+            /* bcm overlay v89: stop at `end` -- on the wrapped pass end = start and p could pass it, handing
+               memchr() a negative (huge) length */
+            if (p < end && (size_t)(bufend - p) >= size && (p = memchr(p, 0xff, end - p)))
             {
                 /* found a sentinel; see if there are enough in a row */
                 unsigned char *q = p + size - 1;
@@ -1129,7 +1143,7 @@ static void insert_file_entry(struct file_base_info *dirinfop,
             break;
 
 #ifdef DIRCACHE_NATIVE
-        if (nextce->direntry > ce->direntry)
+        if (dc_get_direntry(nextce) > dc_get_direntry(ce))
             break;
 
         /* now, nothing should be equal to ours or that is a bug since it
@@ -1291,7 +1305,7 @@ static void sab_process_sub(struct sab *sabp)
                    the entry just scanned, do nothing further and continue
                    with the next */
                 ce = get_entry(prev);
-                if (ce->direntry == infop->fatfile.e.entry)
+                if (dc_get_direntry(ce) == infop->fatfile.e.entry)
                 {
                     compp->prevp = &ce->next;
                     continue; /* already there */
@@ -1319,12 +1333,12 @@ static void sab_process_sub(struct sab *sabp)
             compp->prevp = &ce->next;
 
             if (!(fatentp->attr & ATTR_DIRECTORY))
-                ce->filesize = fatentp->filesize;
+                dc_set_filesize(ce, fatentp->filesize);
             else if (!is_dotdir_name(fatentp->name))
                 ce->frontier = FRONTIER_NEW; /* this needs scanning */
 
             /* copy remaining FS info */
-            ce->direntry     = infop->fatfile.e.entry;
+            dc_set_direntry(ce, infop->fatfile.e.entry);
             ce->direntries   = infop->fatfile.e.entries;
             ce->attr         = fatentp->attr;
             ce->firstcluster = fatentp->firstcluster;
@@ -1378,7 +1392,7 @@ static void sab_process_sub(struct sab *sabp)
          * IF_MV: "volume" was set when scan began */
         infop->fatfile.firstcluster = ce->firstcluster;
         infop->fatfile.dircluster   = dircluster;
-        infop->fatfile.e.entry      = ce->direntry;
+        infop->fatfile.e.entry      = dc_get_direntry(ce);
         infop->fatfile.e.entries    = ce->direntries;
         infop->dcfile.idx           = idx;
         infop->dcfile.serialnum     = ce->serialnum;
@@ -1503,7 +1517,7 @@ int dircache_readdir_dirent(struct filestr_base *stream,
             return 0; /* end of dir */
         }
 
-        if (ce->direntry > direntry || direntry == FAT_DIRSCAN_RW_VAL)
+        if (dc_get_direntry(ce) > direntry || direntry == FAT_DIRSCAN_RW_VAL)
             break; /* cache reader is caught up to FS scan */
 
         idx = ce->next;
@@ -1512,12 +1526,12 @@ int dircache_readdir_dirent(struct filestr_base *stream,
     /* basic dirent information */
     entry_name_copy(entry->d_name, ce);
     entry->info.attr    = ce->attr;
-    entry->info.size    = (ce->attr & ATTR_DIRECTORY) ? 0 : ce->filesize;
+    entry->info.size    = (ce->attr & ATTR_DIRECTORY) ? 0 : dc_get_filesize(ce);
     entry->info.wrtdate = ce->wrtdate;
     entry->info.wrttime = ce->wrttime;
 
     /* FS scan information */
-    scanp->fatscan.entry    = ce->direntry;
+    scanp->fatscan.entry    = dc_get_direntry(ce);
     scanp->fatscan.entries  = ce->direntries;
 
     /* dircache scan information */
@@ -1591,7 +1605,7 @@ int dircache_readdir_internal(struct filestr_base *stream,
            information; otherwise return the uncached read result while
            maintaining the last index */
         int rc = uncached_readdir_internal(stream, infop, fatent);
-        if (rc <= 0 || !ce || ce->direntry > infop->fatfile.e.entry)
+        if (rc <= 0 || !ce || dc_get_direntry(ce) > infop->fatfile.e.entry)
             return rc;
 
         /* entry matches next one to read */
@@ -1607,11 +1621,11 @@ int dircache_readdir_internal(struct filestr_base *stream,
     fatent->shortname[0]     = '\0';
     fatent->attr             = ce->attr;
     /* file code file scanning does not need time information */
-    fatent->filesize         = (ce->attr & ATTR_DIRECTORY) ? 0 : ce->filesize;
+    fatent->filesize         = (ce->attr & ATTR_DIRECTORY) ? 0 : dc_get_filesize(ce);
     fatent->firstcluster     = ce->firstcluster;
 
     /* FS entry directory information */
-    infop->fatfile.e.entry   = ce->direntry;
+    infop->fatfile.e.entry   = dc_get_direntry(ce);
     infop->fatfile.e.entries = ce->direntries;
 
     /* dircache file binding information */
@@ -1925,7 +1939,7 @@ static int prepare_build(bool *realloced)
         /* we'll use the entire audiobuf to allocate the dircache */
         size = audio_buffer_available() + dircache_runinfo.bufsize;
         /* try to allocate at least the min and no more than the limit */
-        size = MAX(DIRCACHE_MIN, MIN(size, DIRCACHE_LIMIT));
+        size = MAX(DIRCACHE_MIN, MIN(size, DIRCACHE_LIMIT_NOW));
     }
     else
     {
@@ -2335,7 +2349,7 @@ void dircache_fileop_create(struct file_base_info *dirinfop,
 
 #ifdef DIRCACHE_NATIVE
     ce->firstcluster = infop->fatfile.firstcluster;
-    ce->direntry     = infop->fatfile.e.entry;
+    dc_set_direntry(ce, infop->fatfile.e.entry);
     ce->direntries   = infop->fatfile.e.entries;
     ce->wrtdate      = dinp->wrtdate;
     ce->wrttime      = dinp->wrttime;
@@ -2344,7 +2358,7 @@ void dircache_fileop_create(struct file_base_info *dirinfop,
 #endif
     ce->attr         = dinp->attr;
     if (!(dinp->attr & ATTR_DIRECTORY))
-        ce->filesize = dinp->size;
+        dc_set_filesize(ce, dinp->size);
 
     insert_file_entry(dirinfop, ce);
 
@@ -2415,7 +2429,7 @@ void dircache_fileop_rename(struct file_base_info *dirinfop,
 
 #ifdef DIRCACHE_NATIVE
     /* update other name-related information before inserting */
-    ce->direntry   = bindp->info.fatfile.e.entry;
+    dc_set_direntry(ce, bindp->info.fatfile.e.entry);
     ce->direntries = bindp->info.fatfile.e.entries;
 #endif
 
@@ -2467,7 +2481,7 @@ void dircache_fileop_sync(struct file_base_binding *bindp,
 #endif
     ce->attr         = dinp->attr;
     if (!(dinp->attr & ATTR_DIRECTORY))
-        ce->filesize = dinp->size;
+        dc_set_filesize(ce, dinp->size);
 }
 
 
@@ -2845,7 +2859,7 @@ void dircache_get_info(struct dircache_info *info)
     info->status     = status;
     info->statusdesc = status_descriptions[status];
     info->last_size  = dircache.last_size;
-    info->size_limit = DIRCACHE_LIMIT;
+    info->size_limit = DIRCACHE_LIMIT_NOW;
     info->reserve    = DIRCACHE_RESERVE;
 
     /* report usage only if there is something ready or being built */
@@ -2952,7 +2966,7 @@ void dircache_dump(void)
                      idx, ce->serialnum, data.serialhash,
                      buf, ce->frontier,
                      ce->attr, (ce->attr & ATTR_DIRECTORY) ?
-                                0ul : (unsigned long)ce->filesize,
+                                0ul : (unsigned long)dc_get_filesize(ce),
                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                      tm.tm_hour, tm.tm_min, tm.tm_sec);
         }
@@ -2991,7 +3005,7 @@ void dircache_dcfile_init(struct dircache_file *dcfilep)
 #endif
 
 /* dircache persistence file header magic */
-#define DIRCACHE_MAGIC  0x00d0c0a1
+#define DIRCACHE_MAGIC  0x00d0c0a2   /* bcm overlay v89: entry layout changed */
 
 /* dircache persistence file header */
 struct dircache_maindata
@@ -3261,7 +3275,7 @@ void dircache_init(size_t last_size)
 {
     queue_init(&dircache_queue, false);
 
-    dircache.last_size = MIN(last_size, DIRCACHE_LIMIT);
+    dircache.last_size = MIN(last_size, DIRCACHE_LIMIT_NOW);
 
     struct dircache_runinfo *dcrip = &dircache_runinfo;
     dcrip->suspended         = 1;

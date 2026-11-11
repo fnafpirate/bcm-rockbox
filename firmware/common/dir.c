@@ -330,6 +330,7 @@ struct dirinfo rbfs_dir_get_info(DIR *dirp, struct dirent *entry)
     if (entry->d_name[0] == '\0')
         FILE_ERROR(ENOENT, RC);
 
+#ifdef BOOTLOADER
     if ((file_size_t)entry->info.size > FILE_SIZE_MAX)
         FILE_ERROR(EOVERFLOW, RC);
 
@@ -337,6 +338,14 @@ struct dirinfo rbfs_dir_get_info(DIR *dirp, struct dirent *entry)
     {
         .attribute = entry->info.attr,
         .size      = entry->info.size,
+#else
+    /* bcm overlay v89: a file over 2 GiB is listed normally; the 32-bit size field gets 2 GiB - 1 (it used to
+       fail here, so callers saw such files without attributes) */
+    return (struct dirinfo)
+    {
+        .attribute = entry->info.attr,
+        .size      = (off_t)MIN(entry->info.size, (file_size_t)FILE_SIZE_MAX),
+#endif
         .mtime     = dostime_mktime(entry->info.wrtdate, entry->info.wrttime),
     };
 
