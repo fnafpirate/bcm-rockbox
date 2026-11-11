@@ -25,12 +25,12 @@ Command line (also used for testing on a disk image):
   ipod_exfat_setup.py                       -> window
   ipod_exfat_setup.py --list                -> show detected iPods
   ipod_exfat_setup.py --disk N|--image F --rockbox-zip Z --bootloader B
-                      [--keep-dir D] [--backup F] [--label L] [--cluster-kb 128]
+                      [--keep-dir D] [--backup F] [--label L] [--cluster-kb auto|32|128|...]
                       [--layout auto|partition|whole|ipod] --yes
   --layout: auto (default) = a normal exFAT partition up to 2.2 TB, the whole
             disk as exFAT above that (any size); "ipod" = old iPod-only units
   ipod_exfat_setup.py --new [--model 5.5g|5g] (--disk N|--image F) --rockbox-zip Z --bootloader B
-                      [--keep-dir SAVED_ROCKBOX_FOLDER] [--label L] [--cluster-kb 128] --yes
+                      [--keep-dir SAVED_ROCKBOX_FOLDER] [--label L] [--cluster-kb auto|32|128|...] --yes
   ipod_exfat_setup.py --restore BACKUP (--disk N|--image F) --yes
   ipod_exfat_setup.py --disks               -> all disks a new layout could go on
   ipod_exfat_setup.py --migrate (--from N|--from-image F) (--disk M|--image G) [--rockbox-zip Z]
@@ -47,11 +47,38 @@ Command line (also used for testing on a disk image):
 
 Clock sync (1.5-1.6) is gone: bcm overlay v85 uses Rockbox's own USB code.  1.7 removes the old helper from Windows
 start-up if it was installed.
+
+1.8: the cluster size is chosen from the size of the card unless you pick one (--cluster-kb auto, the default):
+up to 300 MB 4 KB, up to 34 GB 32 KB, up to 550 GB 128 KB, up to 2.2 TB 256 KB, up to 4.4 TB 512 KB, above 1 MB.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.7'
+VERSION = '1.8'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
+
+
+def auto_cluster(nbytes):
+    """1.8: the cluster size for an exFAT volume of nbytes.  Up to 2 TB this is what the SD Association's
+    formatter uses for SD / SDHC / SDXC cards (32 KB up to 32 GB, 128 KB up to 512 GB, 256 KB up to 2 TB; the
+    limits have some slack because a "32 GB" card holds a little less or more), 4 KB for tiny volumes.  Above
+    2 TB it keeps growing so the allocation bitmap Rockbox reads after start-up stays near 1 MB (8 million
+    clusters); small files waste at most one cluster each, under 0.1 % of a card that size."""
+    MB, GB, TB = 10 ** 6, 10 ** 9, 10 ** 12
+    for limit, kb in ((300 * MB, 4), (34 * GB, 32), (550 * GB, 128), (2200 * GB, 256), (4400 * GB, 512)):
+        if nbytes <= limit:
+            return kb * 1024
+    return 1024 * 1024
+
+
+def cluster_arg(v):
+    """--cluster-kb / the window's choice: 'auto' (or empty) -> None (chosen from the size), else bytes"""
+    v = (v or 'auto').strip().lower().split()[0]
+    if v in ('auto', 'automatic'):
+        return None
+    kb = int(v)
+    if kb < 4 or kb > 32768 or kb & (kb - 1):
+        raise SetupError('cluster size must be a power of two from 4 to 32768 KB (or auto)')
+    return kb * 1024
 CHUNK = 4 << 20
 
 # --------------------------------------------------------------------------
@@ -697,7 +724,7 @@ def create_blank(disk, unit, boot, log=print):
     log('writing a new partition table and firmware partition (%d-byte units)' % unit)
     write_fw_partition(disk, unit, FW_SIZE, (bytes(fw[pos:pos + CHUNK]) for pos in range(0, FW_SIZE, CHUNK)), log)
 
-def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', cluster=128 * 1024,
+def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', cluster=None,
               log=print, progress=lambda f: None, layout='auto', ipsw=None):
     boot = load_bootloader(bootloader)
     if len(boot) > OSOS_ROOM:
@@ -1425,7 +1452,7 @@ def keep_source(disk, log):
     return None
 
 def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, label='IPOD',
-          cluster=128 * 1024, log=print, progress=lambda f: None, layout='auto', tree=None, ipsw=None):
+          cluster=None, log=print, progress=lambda f: None, layout='auto', tree=None, ipsw=None):
     """layout
       'partition': exFAT partition in normal 512-byte units with 512-byte
                    sectors -- any PC / card reader; max 2.2 TB
@@ -1505,6 +1532,9 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
     mbr = bytearray(ipod.mbr_sector)
     for k in (1, 2, 3):
         mbr[0x1be + 16 * k: 0x1be + 16 * (k + 1)] = bytes(16)
+    if not cluster:
+        cluster = max(auto_cluster(part_len), ss)
+        log('cluster size: %d KB (chosen automatically for %s)' % (cluster // 1024, human(part_len)))
     if layout == 'whole':
         plan = ExfatPlan(0, part_len, 512, cluster, label, up_raw, up,
                          fatoff_bytes=align_up(fw_end, ALIGN), mbr_tail=bytes(mbr[440:510])).layout(tree)
@@ -1775,7 +1805,7 @@ class SrcVolume:
                 runs = self.runs(c, size, contig)
                 yield p, False, size, (lambda r=runs, s=size, v=valid: _RunReader(self, r, s, v)), stamp, utc
 
-def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, cluster=128 * 1024,
+def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, cluster=None,
             log=print, progress=lambda f: None, layout='auto', ipsw=None):
     """storage migration: the old card's firmware partition, Rockbox and every file onto a new (bigger) card in
     the right iPod layout, exFAT filling all of it; file dates kept; every file read back and compared (CRC-32)
@@ -1821,6 +1851,9 @@ def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, 
         raise SetupError('the new card is for a different iPod model than the old one: choose the bootloader '
                          'file, a new firmware partition is made for it')
     fw_size = ipod.fw_size if copy_fw else FW_SIZE
+    if not cluster:
+        cluster = max(auto_cluster(dst.size), 512)   # setup() below gets the same choice for the partition
+        log('cluster size: %d KB (chosen automatically for %s)' % (cluster // 1024, human(dst.size)))
     # room: every file rounded up to clusters, the folders, the FAT and some slack
     need = sum(align_up(n.size, cluster) for _, n in t.walk() if not n.is_dir)
     need += (vol.dirs + 2) * cluster + 64 * (1 << 20)
@@ -2019,8 +2052,8 @@ def gui():
     label_var = tk.StringVar(value='IPOD')
     ttk.Entry(opt, textvariable=label_var, width=12).pack(side='left')
     ttk.Label(opt, text='   Cluster:').pack(side='left')
-    cl_var = tk.StringVar(value='128 KB')
-    ttk.Combobox(opt, textvariable=cl_var, values=['32 KB', '64 KB', '128 KB', '256 KB'], width=8,
+    cl_var = tk.StringVar(value='Auto')    # 1.8: chosen from the card's size
+    ttk.Combobox(opt, textvariable=cl_var, values=['Auto', '32 KB', '64 KB', '128 KB', '256 KB', '512 KB'], width=8,
                  state='readonly').pack(side='left')
 
     to_lbl = ttk.Label(frm, text='To:')
@@ -2240,7 +2273,7 @@ def gui():
             messagebox.showwarning(TITLE, 'Nothing selected.'); return
         if not files_ok():
             return
-        cl = int(cl_var.get().split()[0]) * 1024
+        cl = cluster_arg(cl_var.get())
         label = label_var.get() or 'IPOD'
         n, it = st['items'][i]
         if mode.get() == 'move':
@@ -2469,7 +2502,7 @@ def main2():
         try:
             model = opt('--model')
             migrate(src, dst, unit=MODELS[model.lower()] if model else None, rockbox_zip=opt('--rockbox-zip'),
-                    bootloader=opt('--bootloader'), label=opt('--label'), cluster=int(opt('--cluster-kb', '128')) * 1024,
+                    bootloader=opt('--bootloader'), label=opt('--label'), cluster=cluster_arg(opt('--cluster-kb', 'auto')),
                     layout=opt('--layout', 'auto'), ipsw=opt('--ipsw'))
         except SetupError as ex:
             sys.exit('ERROR: %s' % ex)
@@ -2499,7 +2532,7 @@ def main2():
             if model not in MODELS:
                 sys.exit('--model must be 5.5g or 5g')
             new_drive(disk, MODELS[model], opt('--rockbox-zip'), opt('--bootloader'), keep_dir=opt('--keep-dir'),
-                      label=opt('--label', 'IPOD'), cluster=int(opt('--cluster-kb', '128')) * 1024,
+                      label=opt('--label', 'IPOD'), cluster=cluster_arg(opt('--cluster-kb', 'auto')),
                       layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'), ipsw=opt('--ipsw'))
             return
         if '--yes' not in a:
@@ -2507,7 +2540,7 @@ def main2():
         setup(disk, opt('--rockbox-zip'), opt('--bootloader'),
               opt('--backup', 'ipod_backup_%s.bin' % time.strftime('%Y%m%d_%H%M%S')),
               keep='--no-keep' not in a, keep_dir=opt('--keep-dir'), label=opt('--label', 'IPOD'),
-              cluster=int(opt('--cluster-kb', '128')) * 1024,
+              cluster=cluster_arg(opt('--cluster-kb', 'auto')),
               progress=(lambda f: None), layout=opt('--layout', 'ipod' if '--ipod-only' in a else 'auto'),
               ipsw=opt('--ipsw'))
     except SetupError as ex:

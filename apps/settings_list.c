@@ -95,7 +95,7 @@
 #endif
 
 #ifdef HAVE_BATTERY_SMOOTH_API
-static void battery_reading_cb(int v) { battery_set_smooth(v == 0); }
+static void battery_reading_cb(int v) { battery_set_reading(v); }
 #endif
 
 #define NODEFAULT INT(0)
@@ -1360,8 +1360,6 @@ const struct settings_list settings[] = {
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
                    ID2P(LANG_TV_LETTERBOX), ID2P(LANG_TV_FILL)),
     OFFON_SETTING(0, bcm_tv_wide, LANG_TV_WIDESCREEN, false, "tv widescreen", NULL),
-    CHOICE_SETTING(0, bcm_tv_crt, LANG_TV_CRT, 0, "tv retro crt", "off,soft,strong", NULL, 3,   /* v88, v89 */
-                   ID2P(LANG_OFF), ID2P(LANG_TV_CRT_SOFT), ID2P(LANG_TV_CRT_STRONG)),
     OFFON_SETTING(0, bcm_debug_log, LANG_BCM_DEBUG_LOG, false, "bcm debug log", NULL),   /* v89 */
     /* bcm overlay v73: soft subtitles (SRT / WebVTT / ASS next to the video, MP4 timed text) */
     OFFON_SETTING(0, bcm_subs, LANG_SUBTITLES, true, "subtitles", NULL),
@@ -1404,8 +1402,10 @@ const struct settings_list settings[] = {
                    bcm_piezo_setting_cb, 3, ID2P(LANG_PIEZO_MODE_CUSTOM), ID2P(LANG_PIEZO_MAX), ID2P(LANG_PIEZO_BEST)),
     OFFON_SETTING(0, bcm_piezo_charged, LANG_PIEZO_CHARGED, true, "charging complete alert", bcm_piezo_bool_cb),   /* v88 */
 #ifdef HAVE_BATTERY_SMOOTH_API
-    CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "smooth,exact", battery_reading_cb, 2,
-                   ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),
+    /* bcm overlay v92: + balanced (the default): Rockbox's reading, both ways, with spike filtering and smoothing */
+    CHOICE_SETTING(0, battery_reading, LANG_BATTERY_READING, 0, "battery reading", "balanced,smooth,exact",
+                   battery_reading_cb, 3,
+                   ID2P(LANG_BATTERY_BALANCED), ID2P(LANG_BATTERY_SMOOTH), ID2P(LANG_BATTERY_EXACT)),
 #endif
 #endif
     /* display */

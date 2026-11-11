@@ -22,6 +22,14 @@
  *     and holds the value for 2 minutes after the charger is unplugged.
  * Low-battery protection is untouched: it still uses the raw voltage.
  *
+ * bcm overlay v92: "balanced" (the default) is a mix of the two: it follows
+ * the battery both ways like Rockbox's own reading, at about stock speed,
+ * but every sample first goes through a spike filter (median of the last 5,
+ * so a disk spin-up, the VideoCore starting or a contact bounce never gets
+ * in), the learned load compensation stays, and the shown number only moves
+ * once the estimate has been clearly past it for a little while (10 s down,
+ * 30 s up), 1 % per 2 s when it is far off.  "smooth" is the v58 behaviour.
+ *
  * Pure C, no Rockbox dependencies: also compiled by the host simulation in
  * tools/bcm/test/battery_smooth_test.c.
  *
@@ -49,6 +57,9 @@ enum { BSM_BACKLIGHT = 0, BSM_BOOST, BSM_AUDIO, BSM_VIDEO, BSM_NCLS };
 
 struct bsm {
     bool    inited;
+    bool    balanced;     /* v92: the mixed mode (set by the caller) */
+    int16_t med[5];       /* v92: the last raw samples (spike filter) */
+    uint8_t med_n, med_i;
     int32_t vfast;        /* measured mV, EMA tau ~4 s, x256 */
     int32_t vslow;        /* compensated mV, EMA tau ~45 s, x256 */
     int16_t sag[BSM_NCLS];         /* in use (mV) */
@@ -101,9 +112,26 @@ static inline void bsm_update_sags(struct bsm *s)
         s->sag[k] = s->learned[k] >= (k == BSM_VIDEO ? 1 : 3) ? s->meas[k] : (int16_t)(s->r_mohm * ma[k] / 1000);
 }
 
+/* v92: median of the last 5 raw samples -- one or two wild samples (a spin-up, a load switching mid-reading) never
+   reach the filters */
+static inline int bsm_median(struct bsm *s, int mv)
+{
+    int a[5], n, i, j;
+    s->med[s->med_i] = (int16_t)mv;
+    s->med_i = (uint8_t)((s->med_i + 1) % 5);
+    if (s->med_n < 5) s->med_n++;
+    n = s->med_n;
+    for (i = 0; i < n; i++) a[i] = s->med[i];
+    for (i = 1; i < n; i++)
+        for (j = i; j > 0 && a[j - 1] > a[j]; j--) { int x = a[j]; a[j] = a[j - 1]; a[j - 1] = x; }
+    return a[n / 2];
+}
+
 static inline void bsm_init(struct bsm *s, int mv, unsigned cls, const unsigned short *t)
 {
     int k;
+    s->med_n = 0; s->med_i = 0;
+    bsm_median(s, mv);
     for (k = 0; k < BSM_NCLS; k++) { s->meas[k] = 0; s->learned[k] = 0; }
     s->r_mohm = BSM_R_DEFAULT; s->r_n = 0;
     bsm_update_sags(s);
@@ -144,6 +172,8 @@ static inline int bsm_step(struct bsm *s, int mv, int32_t dt_ms, unsigned cls,
 
     if (!s->inited) { bsm_init(s, mv, cls, t); return s->display; }
     if (dt_ms <= 0) dt_ms = 1;
+    if (dt_ms > 20000) s->med_n = 0;                   /* a long gap (sleep): old samples say nothing */
+    mv = bsm_median(s, mv);
 
     /* --- learn the voltage step of a single load turning on/off (on battery only) --- */
     if (dt_ms > 2000 || mode != 0) s->pend_bit = -1;   /* gap in the samples / charging: no learning */
@@ -224,7 +254,7 @@ static inline int bsm_step(struct bsm *s, int mv, int32_t dt_ms, unsigned cls,
     }
 
     /* --- compensated, slow estimate --- */
-    s->vslow = bsm_ema(s->vslow, (int32_t)bsm_comp(s, s->vfast) << 8, dt_ms, 45000);
+    s->vslow = bsm_ema(s->vslow, (int32_t)bsm_comp(s, s->vfast) << 8, dt_ms, s->balanced ? 20000 : 45000);
     s->target_pm = bsm_pm((int)(s->vslow >> 8), t);
     s->raw_pm = bsm_pm((int)(s->vfast >> 8), t);
     target10 = s->target_pm;
@@ -232,7 +262,7 @@ static inline int bsm_step(struct bsm *s, int mv, int32_t dt_ms, unsigned cls,
     /* --- mode changes --- */
     if (mode != s->mode)
     {
-        if (s->mode != 0 && mode == 0) s->hold_ms = 120000;   /* unplugged: let the voltage settle */
+        if (s->mode != 0 && mode == 0) s->hold_ms = s->balanced ? 60000 : 120000;   /* unplugged: let the voltage settle */
         s->below_ms = s->above_ms = 0;
         s->mode = mode;
     }
@@ -272,7 +302,25 @@ static inline int bsm_step(struct bsm *s, int mv, int32_t dt_ms, unsigned cls,
     if (s->hold_ms > 0) { s->hold_ms -= dt_ms; return s->display; }
 
     gap = s->display * 10 - target10;                 /* > 0: estimate below what is shown */
-    if (gap > 5)
+    if (s->balanced)
+    {   /* v92: both ways, like stock, with a dead band (0.8 % down, 1.5 % up) and a short wait; far off: 1 % per 2 s */
+        if (gap >= 8)
+        {
+            int32_t need = gap >= 30 ? 2000 : 10000;
+            s->above_ms = 0;
+            s->below_ms += dt_ms;
+            if (s->below_ms >= need && s->display > 0) { s->display--; s->below_ms = 0; }
+        }
+        else if (gap <= -15)
+        {
+            int32_t need = gap <= -30 ? 2000 : 30000;
+            s->below_ms = 0;
+            s->above_ms += dt_ms;
+            if (s->above_ms >= need && s->display < 100) { s->display++; s->above_ms = 0; }
+        }
+        else s->below_ms = s->above_ms = 0;
+    }
+    else if (gap > 5)
     {
         int32_t need = gap < 30 ? 40000 : gap < 100 ? 15000 : 5000;
         s->above_ms = 0;

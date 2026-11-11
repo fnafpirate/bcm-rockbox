@@ -1078,7 +1078,7 @@ static bool view_battery(void)
                 {   /* bcm overlay v58: the smoothed reading */
                     struct battery_smooth_info bi;
                     battery_smooth_info(&bi);
-                    lcd_putsf(0, 11, "Reading: %s  shown %d %%", bi.enabled ? "smooth" : "exact", battery_level());
+                    lcd_putsf(0, 11, "Reading: %s  shown %d %%", !bi.enabled ? "exact" : bi.balanced ? "balanced" : "smooth", battery_level());
                     lcd_putsf(0, 12, "Exact %d %%  compensated %d.%d %%", bi.raw_percent,
                               bi.est_permille / 10, bi.est_permille % 10);
                     lcd_putsf(0, 13, "Battery resistance: %d mOhm", bi.resistance_mohm);
@@ -3917,12 +3917,12 @@ static int cfg_av_ready = 8;                       /* v52: PCM chunks buffered b
 static int cfg_prep = 1;                                                            /* v78: start-up helper thread */
 static int cfg_hang_s = 12;                      /* v87: seconds without a frame request while playing = the VC has stopped */
 static int cfg_ff_resume = 1;                    /* v78: FF/REW release: 1 = resume where the VC is, 0 = seek to the shown frame */
-/* v88: movie quiz (apps/plugins/movie_quiz.c through bcm_video_quiz) and the TV's retro CRT layer */
+/* v88: movie quiz (apps/plugins/movie_quiz.c through bcm_video_quiz) */
 static bool qz_on, qz_ran;
 static int qz_permille, qz_state;
 static long qz_t, qz_since;
 static uint32_t qz_k;
-static int cfg_crt_alpha = 0x5c, cfg_crt_edge = 0x70, cfg_crt_layer = 0;   /* v89: 0 = over everything (osd_layer + 5) */
+static int cfg_subs_tv_lcd = 0;   /* v90: 1 = with the picture on the TV, the subtitles go on the iPod's own screen */
 static int cfg_fast = 1, cfg_trickprobe = 0, cfg_probe_ms = 2400, cfg_jump_tick = 1000, cfg_osd_argb = 1;       /* v46 */
 static int cfg_fast_ref(void);
 static int cfg_quiet_ref(void) { return cfg_quiet; }
@@ -4009,9 +4009,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "play_secs")) cfg_play_secs = v;
         else if (!strcmp(p, "osd"))      cfg_osd = v;
         else if (!strcmp(p, "osd_layer")) cfg_osd_layer = v;
-        else if (!strcmp(p, "crt_alpha")) cfg_crt_alpha = v < 0 ? 0 : v > 255 ? 255 : v;   /* v88 */
-        else if (!strcmp(p, "crt_edge"))  cfg_crt_edge = v < 0 ? 0 : v > 255 ? 255 : v;
-        else if (!strcmp(p, "crt_layer")) cfg_crt_layer = v;
+        else if (!strcmp(p, "subs_tv_lcd")) cfg_subs_tv_lcd = v;   /* v90 */
         else if (!strcmp(p, "subs"))     cfg_subs = v;
         else if (!strcmp(p, "subs_layer")) cfg_subs_layer = v;
         else if (!strcmp(p, "subs_sync")) cfg_subs_sync = v < 200 ? 200 : v;
@@ -4424,7 +4422,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v89 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v93 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5092,6 +5090,13 @@ static uint32_t *st_cv;                  /* ARGB canvas st_w x st_h */
 static uint8_t *st_wk;                   /* alpha work buffer */
 static int16_t *st_ext;                  /* [2][st_h][2]: per image and row the columns that are not transparent */
 static int st_w, st_h, st_tvmode;
+/* v90: on the TV the subtitles follow the stock firmware's own TV overlay (the video status icons: the same kind of
+   image windowed on display 2 at layer 100) and stay small -- one 640 x 128 image (v73-v89: two 704 x 176 ARGB
+   images, ~1 MB of VideoCore memory, more than the TV setup has free).  st_type 15 = ARGB (text over the picture);
+   1 = RGB565 when ARGB is refused (the text on a dark box, cropped to the text rows); if that is refused too, or
+   with cfg subs_tv_lcd=1, the subtitles go on the iPod's own screen. */
+static int st_type = 15, st_by0, st_bh;
+static bool st_force_lcd;
 static uint32_t st_img[2], st_addr[2], st_win;
 static int st_nimg, st_front = -1;
 static int st_font = -1;                 /* font slot loaded for the subtitles (-1 = none: the UI font) */
@@ -5432,8 +5437,11 @@ static void st_end(void)
     st_font = -1;
     st_ok = 0; st_win = 0; st_front = -1; st_nimg = 0; st_nshown = 0; st_shown_any = false; st_shown_msgv = -1;
     st_msg_until = 0; st_sel_down = false;
+    st_type = 15; st_force_lcd = false; st_by0 = 0; st_bh = 0;   /* v90 */
 }
 static void st_write(int im);
+/* v90: TV = layer 100, the stock firmware's TV overlay layer (v73-v89: 99 everywhere) */
+static int st_layer(void) { return cfg_subs_layer ? cfg_subs_layer : st_tvmode ? cfg_osd_layer : cfg_osd_layer - 1; }
 static int st_setup(void)
 {
     static const int lcd_px[3] = { 15, 21, 27 }, tv_px[3] = { 27, 35, 35 };
@@ -5442,9 +5450,9 @@ static int st_setup(void)
     if (st_ok) return st_ok;
     st_ok = -1;
     if (sz < 0 || sz > 2) sz = 1;
-    st_tvmode = bcm_tv;
-    st_w = st_tvmode ? 704 : 320;
-    st_h = st_tvmode ? 176 : 144;
+    st_tvmode = bcm_tv && !cfg_subs_tv_lcd && !st_force_lcd;
+    st_w = st_tvmode ? 640 : 320;                         /* v90: 704 x 176 -> 640 x 128 on the TV (3 lines at 35 px) */
+    st_h = st_tvmode ? 128 : 144;
     st_font_open(st_tvmode ? tv_px[sz] : lcd_px[sz]);
     if (st_font_h * 2 + 12 > st_h) st_h = (st_font_h * 2 + 12 + 15) & ~15;
     need = (size_t)st_w * st_h * 5 + (size_t)st_h * 2 * 2 * sizeof(int16_t) + 64;
@@ -5456,10 +5464,24 @@ static int st_setup(void)
     st_ext = (int16_t *)(((uintptr_t)(st_wk + st_w * st_h) + 3) & ~(uintptr_t)3);
     for (k = 0; k < 2; k++)                               /* a new image's contents are unknown: all of it gets written once */
         for (y = 0; y < st_h; y++) { st_ext[(k * st_h + y) * 2] = 0; st_ext[(k * st_h + y) * 2 + 1] = (int16_t)(st_w - 1); }
-    st_nimg = 0;
-    for (k = 0; k < 2; k++)
+    st_nimg = 0; st_type = 15;
+    for (k = 0; k < (st_tvmode ? 1 : 2); k++)             /* v90: one image on the TV (written while on screen) */
         if (osd_alloc(15, st_w, st_h, &st_img[k], &st_addr[k]) == 0) st_nimg++;
         else break;
+    if (!st_nimg && st_tvmode && osd_alloc(1, st_w, st_h, &st_img[0], &st_addr[0]) == 0)
+    {
+        st_nimg = 1; st_type = 1;
+        BLOG("subtitles: the VideoCore refused a %dx%d ARGB image on the TV -- RGB565: the text on a dark box", st_w, st_h);
+    }
+    if (!st_nimg && st_tvmode)
+    {   /* v90: no image for the TV at all -- the subtitles go on the iPod's own screen instead of nowhere */
+        BLOG("subtitles: the VideoCore refused the TV images -- showing them on the iPod's screen");
+        core_unpin(st_cv_h); core_free(st_cv_h); st_cv_h = -1; st_cv = NULL;
+        if (st_font >= 0) font_unload(st_font);
+        st_font = -1;
+        st_force_lcd = true; st_ok = 0;
+        return st_setup();
+    }
     if (!st_nimg) { BLOG("subtitles: the VideoCore refused a %dx%d ARGB image -- no subtitles", st_w, st_h); return -1; }
     st_style.scale = 1;
     st_style.box = global_settings.bcm_sub_style == 1;
@@ -5468,10 +5490,11 @@ static int st_setup(void)
     st_style.margin = st_tvmode ? 28 : 6;
     st_win = 0; st_front = -1;
     memset(st_cv, 0, (size_t)st_w * st_h * 4);
-    for (k = 0; k < st_nimg; k++) st_write(k);            /* clear: a new image's contents are unknown (before the picture runs) */
+    if (st_type == 15)
+        for (k = 0; k < st_nimg; k++) st_write(k);        /* clear: a new image's contents are unknown (before the picture runs) */
     st_ok = 1;
-    BLOG("subtitles: %s window %dx%d, %d image(s), layer %d, %s", st_tvmode ? "TV" : "LCD", st_w, st_h, st_nimg,
-         cfg_subs_layer ? cfg_subs_layer : cfg_osd_layer - 1, st_style.box ? "box" : "outline");
+    BLOG("subtitles: %s window %dx%d, %d image(s) type %d, layer %d, %s", st_tvmode ? "TV" : bcm_tv ? "iPod screen (picture on the TV)" : "LCD",
+         st_w, st_h, st_nimg, st_type, st_layer(), st_style.box ? "box" : "outline");
     return 1;
 }
 static void st_rm_win(uint32_t w)
@@ -5518,10 +5541,11 @@ static void st_place(int im, bool top, bool raised)
     bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
     memset(pl, 0, sizeof pl);
     pl[0] = st_tvmode ? 2 : 0;
-    pl[1] = (uint32_t)(cfg_subs_layer ? cfg_subs_layer : cfg_osd_layer - 1);
+    pl[1] = (uint32_t)st_layer();
     pl[3] = st_img[im];
+    if (st_type == 1) y += st_by0;                        /* v90: the dark box covers the text rows only */
     ((uint16_t *)pl)[8] = (uint16_t)x; ((uint16_t *)pl)[9] = (uint16_t)y;
-    ((uint16_t *)pl)[12] = (uint16_t)st_w; ((uint16_t *)pl)[13] = (uint16_t)st_h;
+    ((uint16_t *)pl)[12] = (uint16_t)st_w; ((uint16_t *)pl)[13] = (uint16_t)(st_type == 1 ? st_bh : st_h);
     st_win = bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0 ? (o[0] ? o[0] : 0xffffffffu) : 0;
     if (old) st_rm_win(old);
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
@@ -5531,6 +5555,23 @@ static void st_place(int im, bool top, bool raised)
 static void st_write(int im)
 {
     int y, x;
+    if (st_type == 1)
+    {   /* v90: RGB565 -- composite the text block's rows over a dark box, into the image from its top row */
+        static uint16_t r[720];
+        for (y = 0; y < st_bh; y++)
+        {
+            const uint32_t *row = st_cv + (st_by0 + y) * st_w;
+            for (x = 0; x < st_w; x++)
+            {
+                uint32_t p = row[x], a = p >> 24, rr = ((p >> 16) & 255) * a / 255 + 16 * (255 - a) / 255,
+                         g = ((p >> 8) & 255) * a / 255 + 16 * (255 - a) / 255, b = (p & 255) * a / 255 + 16 * (255 - a) / 255;
+                r[x] = (uint16_t)(((rr >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+            bcm_io_lock(); bcm_io_write(st_addr[im] + (unsigned)y * st_w * 2, r, (unsigned)st_w * 2); bcm_io_unlock();
+            if ((y & 15) == 15) bcm_host_service();
+        }
+        return;
+    }
     for (y = 0; y < st_h; y++)
     {
         const uint32_t *row = st_cv + y * st_w;
@@ -5595,14 +5636,20 @@ static void st_tick(void)
     if (!st_shown_any || (msg ? st_shown_msgv != st_msgv : (st_shown_msgv >= 0 || n != st_nshown || memcmp(c, st_shown, n * sizeof c[0]))))
     {   /* new content: draw, write the back image, swap */
         struct subs_font f;
-        int y0, y1, im = st_nimg == 2 ? (st_front == 0 ? 1 : 0) : 0, fid = st_pick_font(c, n, msg ? st_msg : NULL);
+        int y0 = 0, y1 = 0, im = st_nimg == 2 ? (st_front == 0 ? 1 : 0) : 0, fid = st_pick_font(c, n, msg ? st_msg : NULL);
         struct font *pf = font_get(fid);
         unsigned long t0 = USEC_TIMER;
         f.height = pf->height; f.ascent = pf->ascent; f.depth = pf->depth;
         f.width = st_fw; f.bits = st_fb; f.ctx = (void *)(intptr_t)fid;
         subs_render(st_cv, st_wk, st_w, st_h, &f, &st_style, c, n, msg ? st_msg : NULL, 2, st_h - 2, &y0, &y1);
+        if (st_type == 1)
+        {   /* v90: the box = the text rows + 4 */
+            st_by0 = y0 - 4 < 0 ? 0 : y0 - 4;
+            st_bh = (y1 + 4 > st_h ? st_h : y1 + 4) - st_by0;
+            if (st_bh < 2) st_bh = 2;
+        }
         st_write(im);
-        if (st_nimg == 2 || !st_win || st_win_top != top || st_win_raised != raised) st_place(im, top, raised);
+        if (st_nimg == 2 || st_type == 1 || !st_win || st_win_top != top || st_win_raised != raised) st_place(im, top, raised);
         st_shown_any = true; st_nshown = msg ? 0 : n; st_shown_msgv = msg ? st_msgv : -1;
         if (!msg) memcpy(st_shown, c, (size_t)n * sizeof c[0]);
         if (st_msgv < 3 || msg) BLOG("  subtitles: %s at %u ms, %d cue(s), rows %d-%d, %lu us", msg ? st_msg : "cue",
@@ -6490,7 +6537,8 @@ static void av_boost_tick(long run_t0)
 static int bcm_hw_model(int log);
 /* v88: full-screen layers made of one image W x 48 shown as a column of windows (the VideoCore cannot scale a window,
    and one 720 x 576 ARGB image would be 1.6 MB of its memory; a 48-line strip is 138 KB, written once over the bus).
-   Layer 0 = the TV's retro CRT look, 1 = the quiz cover (black, hides the film's opening until the random frame is up). */
+   Layer 1 = the quiz cover (black, hides the film's opening until the random frame is up); layer 0 was the TV's retro
+   CRT look (v88-v89, removed in v90: it never showed on the TV). */
 #define TL_H 24        /* v89: 48 -> 24 lines (an ARGB strip is 69 KB of VideoCore memory; at 138 KB the controls could
                           no longer get their ARGB images: "type 15 refused" in the v88 TV log) */
 #define TL_MAXW 32
@@ -6507,11 +6555,6 @@ static uint32_t tl_add_h(int disp, int layer, uint32_t img, int y, int w, int h)
     return bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0 ? (o[0] ? o[0] : 0xffffffffu) : 0;
 }
 static uint32_t tl_add(int disp, int layer, uint32_t img, int y, int w) { return tl_add_h(disp, layer, img, y, w, TL_H); }
-/* v89: the "strong" CRT look: solid black 2-line windows (one tiny 720 x 2 RGB565 image) over every other line pair --
-   needs no transparency from the VideoCore */
-#define CRT_MAXW 160
-static uint32_t crt_img, crt_addr, crt_win[CRT_MAXW];
-static int crt_n;
 static void tl_off(int k)
 {
     uint32_t o[4];
@@ -6548,67 +6591,6 @@ static int tl_on(int k, int type, int disp, int layer, int w, int h)
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     BLOG("  layer %d: %d window(s) of %dx%d on display %d, layer %d", k, tl_n[k], w, TL_H, disp, layer);
     return tl_n[k] ? 0 : -1;
-}
-/* the retro CRT look on the TV: 240-line scanlines (2 lines lit, 2 darkened -- the same in both fields, so an
-   interlaced set does not flicker).  v89: Settings > Video > Video Out > Retro CRT Filter (TV) = Soft: a see-through
-   ARGB layer (the darkened lines + the left / right edges shaded like a curved tube); Strong: solid black line pairs
-   (no transparency needed).  Both now lie OVER the picture, the subtitles and the controls (v88 put the layer at 98,
-   under them, and on the TV it did not show) -- layer cfg_osd_layer + 5, below the quiz cover (+10). */
-static void crt_strong(int layer, int th)
-{
-    static uint16_t zero[720 * 2];
-    uint32_t o[4];
-    int y;
-    if (!crt_img)
-    {
-        if (osd_alloc(1, 720, 2, &crt_img, &crt_addr) != 0) { crt_img = 0; BLOG("  CRT: the VideoCore refused a 720x2 image"); return; }
-        bcm_io_lock(); bcm_io_write(crt_addr, zero, sizeof zero); bcm_io_unlock();
-    }
-    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    for (y = 2; y + 2 <= th && crt_n < CRT_MAXW; y += 4)
-    {
-        uint32_t wn = tl_add_h(2, layer, crt_img, y, 720, 2);
-        if (!wn) break;
-        crt_win[crt_n++] = wn;
-        if ((crt_n & 15) == 0) bcm_host_service();
-    }
-    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
-    BLOG("  CRT strong: %d black line pair(s) of %d on display 2, layer %d", crt_n, th / 4, layer);
-}
-static void crt_off(void)
-{
-    uint32_t o[4];
-    int i;
-    tl_off(0);
-    if (!crt_n) return;
-    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
-    for (i = 0; i < crt_n; i++) st_rm_win(crt_win[i]);
-    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
-    crt_n = 0;
-}
-static void osd_init(void);
-static void crt_on(void)
-{
-    int x, th = global_settings.bcm_tv_signal ? 576 : 480, edge = 72, mode = global_settings.bcm_tv_crt;
-    int layer = cfg_crt_layer ? cfg_crt_layer : cfg_osd_layer + 5;
-    uint32_t *a = (uint32_t *)tl_row[0], *b = (uint32_t *)tl_row[1];
-    if (!bcm_tv || !mode || tl_n[0] || crt_n) return;
-    if (osd_ok < 0) osd_init();                  /* v89: the controls take their (ARGB) images first */
-    if (mode == 1)
-    {
-        for (x = 0; x < 720; x++)
-        {
-            int d = x < 720 - 1 - x ? x : 720 - 1 - x, e = d < edge ? cfg_crt_edge * (edge - d) * (edge - d) / (edge * edge) : 0;
-            int dark = 255 - (255 - cfg_crt_alpha) * (255 - e) / 255;
-            a[x] = (uint32_t)e << 24;                       /* black, alpha only */
-            b[x] = (uint32_t)dark << 24;
-        }
-        tl_img[0] = tl_img[0] && tl_disp[0] == 720 ? tl_img[0] : 0;
-        if (tl_on(0, 15, 2, layer, 720, th) == 0 && tl_n[0] * TL_H >= th) return;
-        tl_off(0);
-        BLOG("  CRT soft: the see-through layer did not go up -- using the strong (solid lines) look instead");
-    }
-    crt_strong(layer, th);
 }
 static void qz_cover_on(void)
 {
@@ -6722,7 +6704,6 @@ static void bcm_video_run(int secs)
         qz_state = 1; qz_t = current_tick;
         qz_cover_on();
     }
-    crt_on();                                          /* v88: TV + Settings > Video Out > Retro CRT Filter */
     bool av_checked = false;
     uint32_t rate_e0 = 0; long rate_t0 = 0; int rate_seeks = 0;   /* v54: VC clock speed vs real time */
     if (v_sound == 2 && cfg_vcvol >= 0)
@@ -7212,7 +7193,7 @@ static void bcm_out_switch(void)
     st_ok = 0; st_win = 0; st_front = -1; st_nimg = 0; st_nshown = 0; st_shown_any = false; st_shown_msgv = -1;
     if (bcm_tv)
     {
-        crt_off();                                     /* v88; v89: both CRT looks */
+        tl_off(0);
         bcm_tv_enable(false);
         bcm_region("hold MENU: to the iPod screen");
         bcm_tv = false;
@@ -7226,7 +7207,6 @@ static void bcm_out_switch(void)
         bcm_tv_enable(true);
     }
     iap_dock_remember_tv(bcm_tv);
-    if (bcm_tv) crt_on();                              /* v88: the CRT layer is for the TV only */
     st_toast(bcm_tv ? "TV" : "iPod");
     osd_show_for(3000);
 }
@@ -7600,7 +7580,6 @@ static void bcm_reset_run_state(void)
     av_have = false; av_state = 0; av_vol_until = 0;
     m4c_miss = m4d_miss = 0;
     tl_n[0] = tl_n[1] = 0; tl_img[0] = tl_img[1] = 0;  /* v88: the VideoCore rebooted: its images are gone */
-    crt_n = 0; crt_img = 0;                            /* v89 */
     qz_state = 0;
 }
 static bool bcm_run(const char *play_path);
@@ -7669,7 +7648,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v89, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v93, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -7680,7 +7659,7 @@ static bool bcm_run(const char *play_path)
         struct battery_smooth_info bi;
         battery_smooth_info(&bi);
         BLOG("battery reading: %s, exact %d %%, compensated %d.%d %%, R %d mOhm, drops %d/%d/%d/%d mV (measured %d/%d/%d/%d)",
-             bi.enabled ? "smooth" : "exact", bi.raw_percent, bi.est_permille / 10, bi.est_permille % 10, bi.resistance_mohm,
+             !bi.enabled ? "exact" : bi.balanced ? "balanced" : "smooth", bi.raw_percent, bi.est_permille / 10, bi.est_permille % 10, bi.resistance_mohm,
              bi.sag_mv[0], bi.sag_mv[1], bi.sag_mv[2], bi.sag_mv[3], bi.measured[0], bi.measured[1], bi.measured[2], bi.measured[3]);
         BLOG("battery curve: %s (Apple table %d, hw %08x); Apple-mode ADC %d, scale %s%d mV + %d.%03d mV/count after %d pairs; "
              "curve mV %d %d %d %d %d %d %d %d %d %d %d", bi.apple_curve ? "Apple" : "Rockbox", bi.apple_table, bi.hw_rev,

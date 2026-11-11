@@ -155,7 +155,7 @@ static unsigned bsm_hints;          /* loads reported by the apps (the video pla
 static long bsm_tick;
 static int bsm_sample = -1;         /* latest raw voltage sample */
 static int percent_raw = -1;        /* Rockbox's own number, for the debug screen */
-void battery_set_smooth(bool on) { bsm_on = on; }
+void battery_set_reading(int mode) { bsm_on = mode != 2; bsm.balanced = mode == 0; }   /* v92 */
 void powermgmt_set_load_hint(int load, bool on)
 {
     if (on) bsm_hints |= 1u << load; else bsm_hints &= ~(1u << load);
@@ -242,6 +242,7 @@ void battery_smooth_info(struct battery_smooth_info *i)
     i->hw_rev = (unsigned)IPOD_HW_REVISION;
     for (k = 0; k < 11; k++) i->curve_mv[k] = apple_curve_ok ? apple_curve[k] : percent_to_volt_discharge[k];
     i->enabled = bsm_on;
+    i->balanced = bsm.balanced;
     i->raw_percent = percent_raw;
     i->est_permille = bsm.target_pm;
     i->resistance_mohm = bsm.r_mohm;

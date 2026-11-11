@@ -43,7 +43,12 @@
    the limiting factor is the scanning thread stack size, not the
    implementation -- tune the two together */
 #define DIRCACHE_MAX_DEPTH  15
+#ifdef IPOD_VIDEO
+/* bcm overlay v91: exFAT and 64-bit sizes need more room (was +0x400) */
+#define DIRCACHE_STACK_SIZE (DEFAULT_STACK_SIZE + 0xc00)
+#else
 #define DIRCACHE_STACK_SIZE (DEFAULT_STACK_SIZE + 0x400)
+#endif
 
 /* memory buffer constants that control allocation */
 #define DIRCACHE_RESERVE (1024*64)     /* 64 KB - new entry slack */

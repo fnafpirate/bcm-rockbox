@@ -155,6 +155,7 @@ static unsigned int write_chunk = 1024*24;
 #define ASC_NOT_READY               0x04
 #define ASC_INVALID_COMMAND         0x20
 #define ASC_WRITE_PROTECTED         0x27
+#define ASC_MEDIUM_MAY_HAVE_CHANGED 0x28   /* bcm overlay v93 */
 
 /* A drive whose driver can only read it is reported write protected */
 #ifdef HAVE_STORAGE_READONLY
@@ -348,6 +349,9 @@ static void fill_inquiry(IF_MD_NONVOID(int lun));
 static void send_and_read_next(void);
 static bool ejected[NUM_DRIVES];
 static bool locked[NUM_DRIVES];
+#ifdef IPOD_VIDEO
+static bool bcm_media_changed[NUM_DRIVES];   /* v93: report UNIT ATTENTION once the disk is ours */
+#endif
 
 static int usb_interface;
 
@@ -846,6 +850,32 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
     if(ejected[lun])
         lun_present = false;
+
+#ifdef IPOD_VIDEO
+    /* bcm overlay v93: until every Rockbox thread has let go of the disk (exclusive storage), the card is "not
+       present" for EVERY media command, not only TEST UNIT READY.  Stock Rockbox already answered reads and the
+       capacity in that window while TEST UNIT READY said "no medium"; Windows showed that as "You need to format
+       the disk" -> "USB Drive" (empty) -> the real drive (most likely it mounted the half-handed-over volume first).
+       When the disk is handed over, the next TEST UNIT READY reports "medium may have changed" (UNIT ATTENTION),
+       so the computer reads the card once, fresh. */
+    if(!usb_exclusive_storage()) {
+        lun_present = false;
+        bcm_media_changed[lun] = true;
+    }
+    else if(bcm_media_changed[lun] && lun_present &&
+            cbw->command_block[0] == SCSI_TEST_UNIT_READY) {
+        bcm_media_changed[lun] = false;
+        cur_cmd.data_residue = letoh32(cbw->data_transfer_length);
+        cur_cmd.tag = cbw->tag;
+        cur_cmd.lun = lun;
+        cur_cmd.cur_cmd = cbw->command_block[0];
+        send_csw(UMS_STATUS_FAIL);
+        cur_sense_data.sense_key=SENSE_UNIT_ATTENTION;
+        cur_sense_data.asc=ASC_MEDIUM_MAY_HAVE_CHANGED;
+        cur_sense_data.ascq=0;
+        return;
+    }
+#endif
 
     unsigned int block_size_mult = 1; /* Number of LOGICAL storage device blocks in each USB block */
 #ifdef MAX_VIRT_SECTOR_SIZE

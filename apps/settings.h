@@ -765,7 +765,7 @@ struct user_settings
     int bcm_tv_signal;   /* 0 NTSC, 1 PAL */
     int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
     bool bcm_tv_wide;    /* the TV is 16:9 (stock "Widescreen") */
-    int battery_reading; /* 0 smooth (stock-like), 1 exact (Rockbox) */
+    int battery_reading; /* v92: 0 balanced (default), 1 smooth (stock-like), 2 exact (Rockbox) */
     bool bcm_subs;       /* bcm overlay v73: video subtitles shown when the video has some */
     int bcm_sub_size;    /* 0 small, 1 medium, 2 large */
     int bcm_sub_style;   /* 0 outline, 1 box */
@@ -786,7 +786,6 @@ struct user_settings
     int bcm_piezo_clarity; /* v86: presence EQ 0 off, 1 +4 dB, 2 +10 dB */
     int bcm_piezo_max;       /* v80: Sound Mode: 0 custom, 1 Maximum Loudness, 2 Highest Quality */
     bool bcm_piezo_charged;  /* v88: charging-complete chime + message */
-    int  bcm_tv_crt;         /* v88: retro CRT scanlines over the TV picture; v89: 0 off, 1 soft, 2 strong */
     bool bcm_debug_log;      /* v89: write /bcm_host_log.txt (off: no log file at all) */
 #endif
 

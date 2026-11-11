@@ -99,6 +99,9 @@ void usb_set_mode(int mode)
 
 #ifdef USB_FULL_INIT
 /* Make sure there's enough stack space for screendump */
+#if !defined(USB_EXTRA_STACK) && defined(IPOD_VIDEO)
+#   define USB_EXTRA_STACK 0x800 /* bcm overlay v91: USB audio / iAP / disk events */
+#endif
 #ifndef USB_EXTRA_STACK
 #   define USB_EXTRA_STACK 0x0 /*Define in firmware/export/config/[target].h*/
 #endif

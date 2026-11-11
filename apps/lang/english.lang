@@ -18983,57 +18983,6 @@
   </voice>
 </phrase>
 <phrase>
-  id: LANG_TV_CRT
-  desc: bcm overlay v77
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Retro CRT Filter (TV)"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Retro CRT Filter (TV)"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Retro CRT Filter (TV)"
-  </voice>
-</phrase>
-<phrase>
-  id: LANG_TV_CRT_SOFT
-  desc: bcm overlay v77
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Soft"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Soft"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Soft"
-  </voice>
-</phrase>
-<phrase>
-  id: LANG_TV_CRT_STRONG
-  desc: bcm overlay v77
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Strong"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Strong"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Strong"
-  </voice>
-</phrase>
-<phrase>
   id: LANG_BCM_DEBUG_LOG
   desc: bcm overlay v77
   user: core
@@ -19048,5 +18997,22 @@
   <voice>
     *: none
     ipodvideo: "Debug Log (bcm_host_log.txt)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_BATTERY_BALANCED
+  desc: bcm overlay v92: battery display: Rockbox reading with spike filtering and load compensation
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Balanced (Rockbox + smoothing)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Balanced (Rockbox + smoothing)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Balanced"
   </voice>
 </phrase>

@@ -214,7 +214,13 @@ static void dc_init_filerefs(struct playlist_info *playlist,
 
 static struct event_queue playlist_queue;
 static struct queue_sender_list playlist_queue_sender_list;
+#ifdef IPOD_VIDEO
+/* bcm overlay v91: was + 0x800; the file system calls under it (codepage
+   load, create, exFAT) went past 3 KB */
+static long playlist_stack[(DEFAULT_STACK_SIZE + 0x1400)/sizeof(long)];
+#else
 static long playlist_stack[(DEFAULT_STACK_SIZE + 0x800)/sizeof(long)];
+#endif
 static const char dc_thread_playlist_name[] = "playlist cachectrl";
 #endif
 

@@ -1,5 +1,6 @@
 /* Host simulation of firmware/export/battery_smooth.h against Rockbox's plain filter.
-   gcc -O2 -I../../../firmware/export battery_smooth_test.c -lm && ./a.out */
+   gcc -O2 -I../../../firmware/export battery_smooth_test.c -lm && ./a.out [R_ohm [video]]
+   (BSM_SMOOTH=1 in the environment: the "smooth" mode instead of "balanced") */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -22,6 +23,7 @@ int main(int argc, char **argv)
     double cap = 600, soc = 0.9, t;
     const double dt = 0.5;
     struct bsm s = { 0 };
+    s.balanced = getenv("BSM_SMOOTH") == NULL;   /* v92: balanced by default, BSM_SMOOTH=1 for the v58 mode */
     long rb_avg = 0; int rb_now = 0, rb_pct = 0, inited = 0;
     int last_disp = -1, ups = 0, rb_ups = 0, rb_last = -1, disp_moves = 0, rb_moves = 0;
     double maxerr = 0, rb_maxerr = 0, polar = 0;
@@ -60,6 +62,7 @@ int main(int argc, char **argv)
             v = ocv(soc) - i * R - polar;
         }
         mv = (int)(v + gauss() * 4);
+        if (getenv("BSM_SPIKES") && rand() % 50 == 0) mv += rand() % 2 ? -300 : 200;   /* v92: single-sample spikes */
         if (soc < 0.02) break;
         /* Rockbox: no samples while the disk is active */
         if (!l.disk || charger)

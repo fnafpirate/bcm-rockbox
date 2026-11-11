@@ -982,7 +982,7 @@ void settings_apply(bool read_disk)
     ata_set_ssd_poweroff(global_settings.ssd_poweroff);
 #endif
 #ifdef HAVE_BATTERY_SMOOTH_API
-    battery_set_smooth(global_settings.battery_reading == 0);
+    battery_set_reading(global_settings.battery_reading);
 #endif
     set_poweroff_timeout(global_settings.poweroff);
     if (global_settings.sleeptimer_on_startup)

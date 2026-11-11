@@ -144,8 +144,9 @@
 #define BATTERY_CAPACITY_DEFAULT_THICK 600 /* default battery capacity for the
                                               60/80GB model */
 #define BATTERY_CAPACITY_MIN      300 /* min. capacity selectable */
-#define BATTERY_CAPACITY_MAX     3000 /* max. capacity selectable --
-                                         3rd party batteries go this high */
+#define BATTERY_CAPACITY_MAX     3800 /* max. capacity selectable --
+                                         3rd party batteries go this high
+                                         (bcm overlay v92: was 3000) */
 #define BATTERY_CAPACITY_INC       50 /* capacity increment */
 
 

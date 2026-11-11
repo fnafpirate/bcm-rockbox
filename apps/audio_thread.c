@@ -59,7 +59,13 @@ struct event_queue audio_queue SHAREDBSS_ATTR;
 static struct queue_sender_list audio_queue_sender_list SHAREDBSS_ATTR;
 
 /* Audio thread */
+#ifdef IPOD_VIDEO
+/* bcm overlay v91: was + 0x1000; create_and_play_dir -> rename on exFAT
+   went past it */
+static long audio_stack[(DEFAULT_STACK_SIZE + 0x1800)/sizeof(long)];
+#else
 static long audio_stack[(DEFAULT_STACK_SIZE + 0x1000)/sizeof(long)];
+#endif
 static const char audio_thread_name[] = "audio";
 unsigned int audio_thread_id = 0;
 

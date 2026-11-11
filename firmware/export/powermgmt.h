@@ -124,6 +124,7 @@ int battery_level(void); /* percent */
 #define HAVE_BATTERY_SMOOTH_API
 struct battery_smooth_info {
     bool enabled;
+    bool balanced;            /* v92 */
     int raw_percent;          /* Rockbox's plain number */
     int est_permille;         /* load-compensated estimate */
     int resistance_mohm;      /* learned battery resistance */
@@ -140,7 +141,7 @@ struct battery_smooth_info {
     unsigned hw_rev;
     unsigned short curve_mv[11];  /* curve in use: mV at 0, 10, ... 100 % */
 };
-void battery_set_smooth(bool on);
+void battery_set_reading(int mode);   /* v92: 0 balanced, 1 smooth, 2 exact */
 void powermgmt_set_load_hint(int load, bool on);   /* load 3 = the video decoder (BCM) */
 void battery_smooth_info(struct battery_smooth_info *i);
 #endif

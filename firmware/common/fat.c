@@ -2649,6 +2649,32 @@ static int exfat_read_entries(struct bpb *fat_bpb, struct fat_filestr *dirstr,
 
 #ifndef BOOTLOADER
 static uint8_t exfat_setio[3 * DC_CACHE_BUFSIZE] CACHEALIGN_ATTR;
+
+/* bcm overlay v91: the entry-set work buffers (608 bytes each, plus 512 for a
+   name) used to be locals.  Several of them nest (rename -> add_set ->
+   name_taken -> extend_dir -> update_entry), which ran the 1-3 KB thread
+   stacks of the playlist, audio and dircache threads past their ends on the
+   iPod.  They live here now, one per function, so nesting is fine; the
+   recursive mutex keeps two threads (readdir and ftruncate run under the
+   shared reader lock) from using the same one.  The bootloader keeps the
+   locals, so it builds byte for byte as before. */
+static struct mutex exfat_scratch_mtx SHAREDBSS_ATTR;
+static uint8_t exfat_rd_set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_upd_set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_shr_set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_nt_other[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_cr_set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_rn_old[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_rn_set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint8_t exfat_mt_set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+static uint16_t exfat_bs_ucs[256];
+#define EXFAT_SCRATCH(type, name, n, buf) type * const name = (buf)
+#define EXFAT_LOCKED(fn) fn##_unlocked
+#define EXFAT_LOCKED_SC  static
+#else
+#define EXFAT_SCRATCH(type, name, n, buf) type name[n]
+#define EXFAT_LOCKED(fn) fn
+#define EXFAT_LOCKED_SC
 #endif
 
 /* bcm overlay v67: put the (dirty, cached) sectors holding an entry set on
@@ -2846,7 +2872,7 @@ static int exfat_readdir(struct bpb *fat_bpb, struct fat_filestr *dirstr,
                          struct fat_dirscan_info *scan, struct filestr_cache *cachep,
                          struct fat_direntry *entry)
 {
-    uint8_t set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+    EXFAT_SCRATCH(uint8_t, set, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_rd_set);
     unsigned int need = 0, have = 0, setstart = 0;
     int rc = 0;
 
@@ -3082,7 +3108,7 @@ static int exfat_update_entry(struct bpb *fat_bpb, struct fat_file *file,
     if (count < 3 || count > EXFAT_MAX_SET)
         return -1;
 
-    uint8_t set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+    EXFAT_SCRATCH(uint8_t, set, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_upd_set);
     struct fat_file parent;
     struct fat_filestr parentstr;
     fat_open_internal(IF_MV(file->volume,) file->dircluster, &parent);
@@ -3143,7 +3169,7 @@ static int exfat_shrink_entry(struct bpb *fat_bpb, struct fat_file *file, uint64
     if (count < 3 || count > EXFAT_MAX_SET)
         return -1;
 
-    uint8_t set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+    EXFAT_SCRATCH(uint8_t, set, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_shr_set);
     struct fat_file parent;
     struct fat_filestr parentstr;
     fat_open_internal(IF_MV(file->volume,) file->dircluster, &parent);
@@ -3174,7 +3200,7 @@ static int exfat_shrink_entry(struct bpb *fat_bpb, struct fat_file *file, uint64
 /* build a new entry set for 'name'; returns the number of entries or < 0 */
 static int exfat_build_set(uint8_t *set, const char *name, uint8_t attr)
 {
-    uint16_t ucs[256];
+    EXFAT_SCRATCH(uint16_t, ucs, 256, exfat_bs_ucs);
     unsigned int len = 0;
     const unsigned char *p = (const unsigned char *)name;
 
@@ -3339,7 +3365,7 @@ static bool exfat_name_taken(struct bpb *fat_bpb, struct fat_filestr *dirstr,
     if (ascii)
         return false;   /* the upper layer already refused ASCII-case twins */
 
-    uint8_t other[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+    EXFAT_SCRATCH(uint8_t, other, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_nt_other);
     for (unsigned int entry = 0; entry < EXFAT_MAX_DIRENTRIES; entry++)
     {
         dc_lock_cache();
@@ -3735,7 +3761,7 @@ int fat_file_sector_size(IF_MV_NONVOID(const struct fat_file *file))
 }
 #endif
 
-int fat_create_file(struct fat_file *parent, const char *name,
+EXFAT_LOCKED_SC int EXFAT_LOCKED(fat_create_file)(struct fat_file *parent, const char *name,
                     uint8_t attr, struct fat_file *file,
                     struct fat_direntry *fatent)
 {
@@ -3754,7 +3780,7 @@ int fat_create_file(struct fat_file *parent, const char *name,
     if (fat_bpb->is_exfat)
     {
         /* bcm overlay v66 */
-        uint8_t set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+        EXFAT_SCRATCH(uint8_t, set, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_cr_set);
         rc = check_longname(name);
         if (rc < 0)
             FAT_ERROR(rc * 10 - 1);
@@ -3997,7 +4023,7 @@ fat_error:
     return rc;
 }
 
-int fat_rename(struct fat_file *parent, struct fat_file *file,
+EXFAT_LOCKED_SC int EXFAT_LOCKED(fat_rename)(struct fat_file *parent, struct fat_file *file,
                const unsigned char *newname)
 {
     struct bpb * const fat_bpb = FAT_BPB(parent->volume);
@@ -4043,7 +4069,8 @@ int fat_rename(struct fat_file *parent, struct fat_file *file,
     {
         /* bcm overlay v66: new set with the new name and the old file/stream
            data; then the old set goes.  No ".." to fix up on exFAT. */
-        uint8_t old[EXFAT_MAX_SET * DIR_ENTRY_SIZE], set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+        EXFAT_SCRATCH(uint8_t, old, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_rn_old);
+        EXFAT_SCRATCH(uint8_t, set, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_rn_set);
         unsigned int oldcount = file->e.entries;
         if (oldcount < 3 || oldcount > EXFAT_MAX_SET ||
             exfat_read_entries(fat_bpb, &dirstr, exfat_set_first(file), oldcount, old) < 0 ||
@@ -4180,7 +4207,7 @@ fat_error:
     return rc;
 }
 
-int fat_modtime(struct fat_file *parent, struct fat_file *file,
+EXFAT_LOCKED_SC int EXFAT_LOCKED(fat_modtime)(struct fat_file *parent, struct fat_file *file,
                 time_t modtime)
 {
     struct bpb * const fat_bpb = FAT_BPB(parent->volume);
@@ -4196,7 +4223,7 @@ int fat_modtime(struct fat_file *parent, struct fat_file *file,
     if (fat_bpb->is_exfat)
     {
         /* bcm overlay v66 */
-        uint8_t set[EXFAT_MAX_SET * DIR_ENTRY_SIZE];
+        EXFAT_SCRATCH(uint8_t, set, EXFAT_MAX_SET * DIR_ENTRY_SIZE, exfat_mt_set);
         unsigned int count = file->e.entries;
         unsigned int first = exfat_set_first(file);
         uint16_t date, time;
@@ -4255,7 +4282,7 @@ uint64_t fat_file_max_size(const struct fat_file *file)
 }
 #endif
 
-int fat_closewrite(struct fat_filestr *filestr, fat_size_t size,
+EXFAT_LOCKED_SC int EXFAT_LOCKED(fat_closewrite)(struct fat_filestr *filestr, fat_size_t size,
                    struct fat_direntry *fatentp)
 {
     DEBUGF("%s(size=%ld)\n", __func__, size);
@@ -4695,7 +4722,7 @@ fat_error:
     return rc;
 }
 
-int fat_truncate(const struct fat_filestr *filestr)
+EXFAT_LOCKED_SC int EXFAT_LOCKED(fat_truncate)(const struct fat_filestr *filestr)
 {
     DEBUGF("%s(): %lX\n", __func__, filestr->lastcluster);
 
@@ -4761,7 +4788,7 @@ fat_error:
 
 /** Directory stream functions **/
 
-int fat_readdir(struct fat_filestr *dirstr, struct fat_dirscan_info *scan,
+EXFAT_LOCKED_SC int EXFAT_LOCKED(fat_readdir)(struct fat_filestr *dirstr, struct fat_dirscan_info *scan,
                 struct filestr_cache *cachep, struct fat_direntry *entry)
 {
     int rc = 0;
@@ -5065,8 +5092,71 @@ void fat_empty_fat_direntry(struct fat_direntry *entry)
     entry->firstcluster = 0;
 }
 
+#ifndef BOOTLOADER
+/* bcm overlay v91: the entry points that reach the exFAT scratch buffers */
+static inline void exfat_scratch_lock(void)   { mutex_lock(&exfat_scratch_mtx); }
+static inline void exfat_scratch_unlock(void) { mutex_unlock(&exfat_scratch_mtx); }
+
+int fat_create_file(struct fat_file *parent, const char *name,
+                    uint8_t attr, struct fat_file *file,
+                    struct fat_direntry *fatent)
+{
+    exfat_scratch_lock();
+    int rc = fat_create_file_unlocked(parent, name, attr, file, fatent);
+    exfat_scratch_unlock();
+    return rc;
+}
+
+int fat_rename(struct fat_file *parent, struct fat_file *file,
+               const unsigned char *newname)
+{
+    exfat_scratch_lock();
+    int rc = fat_rename_unlocked(parent, file, newname);
+    exfat_scratch_unlock();
+    return rc;
+}
+
+int fat_modtime(struct fat_file *parent, struct fat_file *file,
+                time_t modtime)
+{
+    exfat_scratch_lock();
+    int rc = fat_modtime_unlocked(parent, file, modtime);
+    exfat_scratch_unlock();
+    return rc;
+}
+
+int fat_closewrite(struct fat_filestr *filestr, fat_size_t size,
+                   struct fat_direntry *fatentp)
+{
+    exfat_scratch_lock();
+    int rc = fat_closewrite_unlocked(filestr, size, fatentp);
+    exfat_scratch_unlock();
+    return rc;
+}
+
+int fat_truncate(const struct fat_filestr *filestr)
+{
+    exfat_scratch_lock();
+    int rc = fat_truncate_unlocked(filestr);
+    exfat_scratch_unlock();
+    return rc;
+}
+
+int fat_readdir(struct fat_filestr *dirstr, struct fat_dirscan_info *scan,
+                struct filestr_cache *cachep, struct fat_direntry *entry)
+{
+    exfat_scratch_lock();
+    int rc = fat_readdir_unlocked(dirstr, scan, cachep, entry);
+    exfat_scratch_unlock();
+    return rc;
+}
+#endif /* !BOOTLOADER */
+
 void fat_init(void)
 {
+#ifndef BOOTLOADER
+    mutex_init(&exfat_scratch_mtx);
+#endif
     dc_lock_cache();
 
     /* mark the possible volumes as not mounted */
