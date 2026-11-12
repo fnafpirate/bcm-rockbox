@@ -684,7 +684,9 @@ void lcd_update_rect(int x, int y, int width, int height)
    This must be called after all other LCD functions that change the display. */
 void lcd_update(void)
 {
-    if (bcm_lcd_frozen) return;
+    /* v97: no early return while frozen -- lcd_update_rect() drops the update itself, and calls the hosted-display
+       hook (v96 returned here first, so with Keep VideoCore Ready the browser's full-screen updates never reached the
+       keeper: the screen stayed on its first copy and the iPod looked stuck) */
     lcd_update_rect(0, 0, LCD_WIDTH, LCD_HEIGHT);
 }
 

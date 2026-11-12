@@ -4496,7 +4496,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v96 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v97 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -8122,6 +8122,15 @@ static int kp_push(void)
     kp_front = back; kp_pushes++;
     return 0;
 }
+/* v97: one line appended to the log from the keeper thread (the run's log is closed by then) */
+static void kp_log_line(const char *s)
+{
+    if (!global_settings.bcm_debug_log) return;
+    bcm_log_fd = open(BCM_LOG_PATH, O_WRONLY | O_APPEND);
+    if (bcm_log_fd < 0) return;
+    bcm_logline(s, (int)strlen(s));
+    bcm_log_close();
+}
 /* kp_mtx held */
 static void kp_release_locked(const char *why)
 {
@@ -8155,8 +8164,17 @@ static void kp_thread(void)
             else if (current_tick - kp_since > limit) why = "no video for a while";
             else if (kp_dirty && current_tick - kp_last_push >= HZ / 10)
             {
+                int pr;
                 kp_last_push = current_tick;
-                if (kp_push() != 0) why = "the VideoCore refused the screen image";
+                pr = kp_push();
+                if (pr != 0) why = "the VideoCore refused the screen image";
+                else if (kp_pushes == 1 || kp_pushes == 2 || kp_pushes % 500 == 0)
+                {   /* v97: proof in the log that the screen copies arrive */
+                    char l[120];
+                    snprintf(l, sizeof l, "keep ready: screen copy #%d shown (image %08lx @ VC %08lx, window %08lx)", kp_pushes,
+                             (unsigned long)kp_img[kp_front], (unsigned long)kp_addr[kp_front], (unsigned long)kp_win[kp_front]);
+                    kp_log_line(l);
+                }
             }
             if (why) kp_release_locked(why);
         }
@@ -8249,7 +8267,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v96, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v97, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
