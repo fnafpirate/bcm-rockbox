@@ -458,6 +458,13 @@ int ft_load(struct tree_context* c, const char* tempdir)
         path_append(global_status.browse_last_folder, c->currdir, PA_SEP_HARD,
                     sizeof(global_status.browse_last_folder));
     }
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    {   /* v99: Keep VideoCore Ready -- a video folder (Videos / TV Shows / Movies) starts the VideoCore on standby */
+        extern void bcm_video_folder_hint(const char *dir);
+        if (!tempdir && get_current_activity() == ACTIVITY_FILEBROWSER)
+            bcm_video_folder_hint(c->currdir);
+    }
+#endif
 
     return 0;
 }

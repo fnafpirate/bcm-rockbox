@@ -884,12 +884,13 @@ MAKE_MENU(subtitles_menu, ID2P(LANG_SUBTITLES), 0, Icon_Display_menu,
 /* bcm overlay v74: Settings > General Settings > Video */
 MENUITEM_SETTING(bcm_video_buffer_item, &global_settings.bcm_video_buffer, NULL);
 MENUITEM_SETTING(bcm_video_resume_item, &global_settings.bcm_video_resume, NULL);   /* v96 */
+MENUITEM_SETTING(bcm_keep_vc_item, &global_settings.bcm_keep_vc, NULL);             /* v99 */
 MENUITEM_SETTING(bcm_tv_autoplay_item, &global_settings.bcm_tv_autoplay, NULL);
 MENUITEM_SETTING(bcm_tv_countdown_item, &global_settings.bcm_tv_countdown, NULL);   /* v76 */
 MENUITEM_SETTING(bcm_dock_profile_item, &global_settings.bcm_dock_profile, NULL);   /* v76 */
 MENUITEM_SETTING(bcm_dock_notify_item, &global_settings.bcm_dock_notify, NULL);
 MAKE_MENU(bcm_video_menu, ID2P(LANG_VIDEO_SETTINGS), 0, Icon_Display_menu,
-          &video_out_menu, &subtitles_menu, &bcm_video_buffer_item, &bcm_video_resume_item,
+          &video_out_menu, &subtitles_menu, &bcm_video_buffer_item, &bcm_video_resume_item, &bcm_keep_vc_item,
           &bcm_tv_autoplay_item, &bcm_tv_countdown_item,
           &bcm_dock_notify_item, &bcm_dock_profile_item);
 #endif

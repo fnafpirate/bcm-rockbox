@@ -19084,3 +19084,37 @@
     ipodvideo: "Resume from"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_KEEP_VC
+  desc: bcm overlay v99
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Keep VideoCore Ready"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Keep VideoCore Ready"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Keep VideoCore Ready"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_KEEP_VC_FOLDER
+  desc: bcm overlay v99
+  user: core
+  <source>
+    *: none
+    ipodvideo: "In Video Folders"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "In Video Folders"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "In Video Folders"
+  </voice>
+</phrase>

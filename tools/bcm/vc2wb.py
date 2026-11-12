@@ -40,9 +40,9 @@ def sx(v, b):
 
 class Image:
     """an ELF .vll or a raw image; .code = bytes of the executable part, .base = its address"""
-    def __init__(self, path):
+    def __init__(self, path, data=None):
         self.path = path
-        self.d = open(path, 'rb').read()
+        self.d = data if data is not None else open(path, 'rb').read()
         self.elf = self.d[:4] == b'\x7fELF'
         self.syms, self.rel, self.secs = [], [], []
         if self.elf:
@@ -100,6 +100,8 @@ class Image:
         typ, nm, add, si = rl
         if si and si < len(self.syms):
             n, v, sz, info, shn = self.syms[si]
+            if shn and (info & 0xf) == 3:              # section symbol: this linker puts the full address in the addend
+                return add, self.name_of(add) or self.section_of(add) or ''
             if shn: return v + add, n
             return None, n
         return add, self.name_of(add) or self.section_of(add) or ''
@@ -516,7 +518,13 @@ def describe(img, f, callers=None, dot=None):
             rl = reloc_in(img, i)
             r = '   <reloc %d %s%+d>' % rl[:3] if rl else ''
             n = f.notes.get(i.a, '')
-            L.append('  %06x: %-18s %-42s %s%s' % (i.a, raw, i.text, n, r))
+            t = i.text
+            if rl and i.op == 'lea':                    # the relocated operand, not the placeholder bytes
+                tg, nm = lea_target(img, i)
+                t = 'lea    r%d, %s' % (i.rd, nm if tg is None else '0x%x' % tg)
+            elif rl and i.kind == 'call' and rl[1] not in ('?', ''):
+                t = 'bl     %s' % rl[1]
+            L.append('  %06x: %-18s %-42s %s%s' % (i.a, raw, t, n, r))
     L.append('')
     L.append('-- memory accesses')
     if not f.mem: L.append('  none')

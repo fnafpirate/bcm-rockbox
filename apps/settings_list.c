@@ -1373,6 +1373,8 @@ const struct settings_list settings[] = {
                    ID2P(LANG_BUFFER_ADAPTIVE)),                                                              /* v96: adaptive */
     CHOICE_SETTING(0, bcm_video_resume, LANG_VIDEO_RESUME, 1, "resume videos", "off,ask,always",
                    NULL, 3, ID2P(LANG_OFF), ID2P(LANG_VIDEO_RESUME_ASK), ID2P(LANG_ALWAYS)),                 /* v96 */
+    CHOICE_SETTING(0, bcm_keep_vc, LANG_KEEP_VC, 1, "keep videocore ready", "off,in video folders",
+                   NULL, 2, ID2P(LANG_OFF), ID2P(LANG_KEEP_VC_FOLDER)),                                      /* v99 */
     OFFON_SETTING(0, bcm_tv_autoplay, LANG_TVS_AUTOPLAY, true, "autoplay next episode", NULL),
     OFFON_SETTING(0, bcm_dock_notify, LANG_DOCK_NOTICES, true, "dock notifications", NULL),
     INT_SETTING_NOWRAP(0, bcm_tv_countdown, LANG_TVS_COUNTDOWN, 5, "next episode countdown", UNIT_SEC, 5, 10, 1,
