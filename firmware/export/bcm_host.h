@@ -55,6 +55,13 @@ int  bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls);
  * Typical use: bcm_gencmd_start(cmd); then loop calling bcm_gencmd_poll() with your own sleep and
  * progress logging between calls until it returns something other than -3. */
 int  bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls); /* v34: graphics channel */
+/* v96: images (op 8) and windows (op 3) made through bcm_gfx_rpc() are recorded until op 9 / op 4 frees them.
+ * bcm_gfx_release_all() frees everything recorded (returns the number of unanswered requests); bcm_gfx_tracked()
+ * returns the number of images (and windows / handles that did not fit the record); bcm_gfx_forget() empties the
+ * record without telling the VideoCore (after a reboot).  Lets a VideoCore that stays up between videos start clean. */
+int  bcm_gfx_release_all(void);
+int  bcm_gfx_tracked(int *windows, int *lost);
+void bcm_gfx_forget(void);
 int  bcm_gencmd_start(const char *cmd);
 int  bcm_gencmd_poll(char *resp, size_t resp_sz);
 

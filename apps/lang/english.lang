@@ -19016,3 +19016,156 @@
     ipodvideo: "Balanced"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_BUFFER_ADAPTIVE
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Adaptive"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Adaptive"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Adaptive"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_POWER
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Video Power"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Video Power"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Video Power"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_POWER_SAVER
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Battery Saver"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Battery Saver"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Battery Saver"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_RESUME
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Resume Videos"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Resume Videos"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Resume Videos"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_RESUME_ASK
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Ask"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Ask"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Ask"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_VIDEO_RESUME_Q
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Resume from"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Resume from"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Resume from"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_KEEP_VC
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Keep VideoCore Ready"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Keep VideoCore Ready"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Keep VideoCore Ready"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_KEEP_VC_BETWEEN
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Between Videos"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Between Videos"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Between Videos"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_KEEP_VC_ALWAYS
+  desc: bcm overlay v96
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Always (Experimental)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Always (Experimental)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Always (Experimental)"
+  </voice>
+</phrase>

@@ -1368,8 +1368,15 @@ const struct settings_list settings[] = {
     CHOICE_SETTING(0, bcm_sub_style, LANG_SUBTITLE_STYLE, 0, "subtitle style", "outline,box", NULL, 2,
                    ID2P(LANG_SUBTITLE_OUTLINE), ID2P(LANG_SUBTITLE_BOX)),
     /* bcm overlay v74 */
-    CHOICE_SETTING(0, bcm_video_buffer, LANG_VIDEO_BUFFERING, 1, "video buffering", "low-power,balanced,performance",
-                   NULL, 3, ID2P(LANG_BUFFER_LOW_POWER), ID2P(LANG_BUFFER_BALANCED), ID2P(LANG_BUFFER_PERFORMANCE)),
+    CHOICE_SETTING(0, bcm_video_buffer, LANG_VIDEO_BUFFERING, 3, "video buffering", "low-power,balanced,performance,adaptive",
+                   NULL, 4, ID2P(LANG_BUFFER_LOW_POWER), ID2P(LANG_BUFFER_BALANCED), ID2P(LANG_BUFFER_PERFORMANCE),
+                   ID2P(LANG_BUFFER_ADAPTIVE)),                                                              /* v96: adaptive */
+    CHOICE_SETTING(0, bcm_video_power, LANG_VIDEO_POWER, 1, "video power", "battery saver,balanced,performance",
+                   NULL, 3, ID2P(LANG_POWER_SAVER), ID2P(LANG_BUFFER_BALANCED), ID2P(LANG_BUFFER_PERFORMANCE)),   /* v96 */
+    CHOICE_SETTING(0, bcm_video_resume, LANG_VIDEO_RESUME, 1, "resume videos", "off,ask,always",
+                   NULL, 3, ID2P(LANG_OFF), ID2P(LANG_VIDEO_RESUME_ASK), ID2P(LANG_ALWAYS)),                 /* v96 */
+    CHOICE_SETTING(0, bcm_keep_vc, LANG_KEEP_VC, 0, "keep videocore ready", "off,between videos,always",
+                   NULL, 3, ID2P(LANG_OFF), ID2P(LANG_KEEP_VC_BETWEEN), ID2P(LANG_KEEP_VC_ALWAYS)),          /* v96 */
     OFFON_SETTING(0, bcm_tv_autoplay, LANG_TVS_AUTOPLAY, true, "autoplay next episode", NULL),
     OFFON_SETTING(0, bcm_dock_notify, LANG_DOCK_NOTICES, true, "dock notifications", NULL),
     INT_SETTING_NOWRAP(0, bcm_tv_countdown, LANG_TVS_COUNTDOWN, 5, "next episode countdown", UNIT_SEC, 5, 10, 1,

@@ -670,6 +670,73 @@ static void test_high_directory(void)
     vc_init();
 }
 
+/* v96: a frame bigger than the VC's buffer goes out in buffer-sized pieces, flags first / middle... / last, like Apple's
+   rt 0x288c14 -- the player now sends frames up to 512 KB through a 64 KB buffer A */
+static void test_big_frame(void)
+{
+    static const struct bcm_pds_ops ops = { on_start, on_getf, on_seek, on_stop };
+    const uint32_t A = 0x100000, B = 0x300000, CAP = 0x10000, LEN = 200000;
+    uint32_t seq = 0x80000200u, sent = 0;
+    int pieces = 0;
+    idle_hook = drain_idle;
+    bcm_pds_set_ops(&ops);
+    pds_req(0x41, seq++, 0, A, CAP, B, 0x4000, "0");
+    pds_req(0x42, seq, 0, 0, 0, 0, 0, NULL);
+    uint8_t *frame = malloc(LEN);
+    for (uint32_t i = 0; i < LEN; i++) frame[i] = (uint8_t)(i * 13 + (i >> 9));
+    struct bcm_pds_frame f = { .stream_id = 0, .f2 = 1, .f4 = 40, .length = LEN, .meta = { 9, 8, 7, 6 }, .data = frame };
+    int getf0 = pd.getf;
+    CHECK(bcm_pds_send_frame(&f) == 0, "big frame accepted");
+    while (sent < LEN && pieces < 10) {
+        uint32_t n = LEN - sent < CAP ? LEN - sent : CAP;
+        uint32_t flag = sent == 0 ? PDS_FLAG_FIRST : (sent + n == LEN ? PDS_FLAG_LAST : PDS_FLAG_MIDDLE);
+        expect_frame_reply(seq, n, flag, A, frame + sent, 0, f.meta);
+        sent += n; pieces++;
+        if (sent < LEN) pds_req(0x42, ++seq, 0, 0, 0, 0, 0, NULL);   /* the VC asks for the next piece */
+    }
+    CHECK(pieces == 4 && sent == LEN, "200000 bytes in %d pieces (want 4: 3 x 64 KB + 3392)", pieces);
+    CHECK(pd.getf == getf0, "the pieces never reached the player's get_frame");
+    pds_req(0x42, ++seq, 0, 0, 0, 0, 0, NULL);
+    CHECK(pd.getf == getf0 + 1, "after the last piece the next 0x42 asks the player again");
+    free(frame);
+}
+
+/* v96: image / window record for a VideoCore that stays up between videos */
+static int gt_img, gt_win, gt_freed, gt_removed;
+static void gfx_track_idle(void)
+{
+    struct rmsg m;
+    if (vc_recv(1, &m)) {
+        uint32_t pl[4] = { 0, 0, 0, 0 }, a;
+        memcpy(&a, m.payload, 4);
+        if (m.op == 8) { pl[0] = 0x100 + (uint32_t)++gt_img; pl[1] = 0x00120000u + 0x10000u * (uint32_t)gt_img; }
+        else if (m.op == 3) pl[0] = 0x500 + (uint32_t)++gt_win;
+        else if (m.op == 4) { CHECK(a >= 0x501 && a <= 0x500 + (uint32_t)gt_win, "op 4 names a window (%x)", a); gt_removed++; }
+        else if (m.op == 9) { CHECK(a >= 0x101 && a <= 0x100 + (uint32_t)gt_img, "op 9 names an image (%x)", a); gt_freed++; }
+        vc_send(1, 0, m.seq, pl, 16);
+    }
+}
+static void test_gfx_track(void)
+{
+    uint32_t o[4], in[8] = { 0 }, w4[4] = { 0 };
+    int wins = -1, lost = -1;
+    idle_hook = gfx_track_idle;
+    bcm_gfx_forget();
+    ((uint8_t *)in)[4] = 1; in[2] = 320; in[3] = 240; in[4] = 640;
+    for (int i = 0; i < 3; i++) bcm_gfx_rpc(8, in, 0x20, o, NULL, 100);
+    memset(in, 0, sizeof in); in[3] = 0x101;
+    for (int i = 0; i < 3; i++) bcm_gfx_rpc(3, in, 0x20, o, NULL, 100);
+    w4[0] = 0x502; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 100);           /* one window removed by the player itself */
+    w4[0] = 0x103; bcm_gfx_rpc(9, w4, 0x10, o, NULL, 100);           /* one image freed by the player itself */
+    CHECK(bcm_gfx_tracked(&wins, &lost) == 2 && wins == 2 && lost == 0, "record: 2 images, 2 windows (got %d, %d)",
+          bcm_gfx_tracked(NULL, NULL), wins);
+    gt_removed = gt_freed = 0;
+    CHECK(bcm_gfx_release_all() == 0, "release_all answered");
+    CHECK(gt_removed == 2 && gt_freed == 2, "release_all removed %d windows, freed %d images (want 2, 2)", gt_removed, gt_freed);
+    CHECK(bcm_gfx_tracked(&wins, NULL) == 0 && wins == 0, "record empty afterwards");
+    idle_hook = NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *file = argc > 1 ? argv[1] : "/mnt/user-data/uploads/passthruhandler.vll";
@@ -688,6 +755,8 @@ int main(int argc, char **argv)
     printf("[resync after stray bytes]\n"); fflush(stdout); test_resync_after_stray_bytes();
     printf("[vchr]\n"); fflush(stdout); test_vchr_reply();
     printf("[gfx]\n"); fflush(stdout); test_gfx();
+    printf("[v96 big frame in pieces]\n"); fflush(stdout); test_big_frame();
+    printf("[v96 gfx record]\n"); fflush(stdout); test_gfx_track();
     const struct bcm_host_stats *st = bcm_host_get_stats();
     printf("stats: rx=%u tx=%u vcfs=%u pds=%u bad_magic=%u unknown=%u\n",
            st->rx_msgs, st->tx_msgs, st->vcfs_ops, st->pds_ops, st->bad_magic, st->unknown_ops);

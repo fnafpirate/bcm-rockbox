@@ -177,6 +177,7 @@ void bcm_host_detach(void)
 int bcm_host_attach(void)
 {
     uint32_t w[4];
+    bcm_gfx_forget();                                  /* v96: a fresh boot has no images of ours */
     memset(&hi.st, 0, sizeof hi.st);
     memset(&diag, 0, sizeof diag);
     hi.attached = false;
@@ -465,7 +466,75 @@ static void gencmd_rx(const struct hi_msg *m)
 /* v34: the stock display class (rt 0x164450..0x165160) talks to a dispman-like service on the type-2 channel with
  * rt 0x28861c(chan, op, len, payload): ops 1 (update start), 2 (update end), 3 (add window), 4 (remove window),
  * 8 (create image: reply = handle, VC address), 9 (free image), 0x10 (image touch).  Replies: header op + 16 payload bytes. */
+/* v96: a record of the graphics-layer images (op 8) and windows (op 3) the host created, so that a VideoCore that keeps
+ * running between videos can be given all of them back (op 4 for windows, op 9 for images) -- before v96 the BCM was
+ * powered off after every video and nothing had to be freed.  Handles freed by op 4 / op 9 leave the record. */
+#define GFX_TRACK_N 96
+static struct { uint32_t h; uint8_t win; } gfx_track[GFX_TRACK_N];
+static int gfx_track_n, gfx_track_lost;
+static void gfx_track_add(uint32_t h, bool win)
+{
+    if (!h || h == 0xffffffffu) return;
+    if (gfx_track_n >= GFX_TRACK_N) { gfx_track_lost++; return; }
+    gfx_track[gfx_track_n].h = h; gfx_track[gfx_track_n].win = win;
+    gfx_track_n++;
+}
+static void gfx_track_del(uint32_t h, bool win)
+{
+    for (int i = 0; i < gfx_track_n; i++)
+        if (gfx_track[i].h == h && gfx_track[i].win == win) {
+            gfx_track[i] = gfx_track[--gfx_track_n];
+            return;
+        }
+}
+static int gfx_rpc_raw(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls);
 int bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls)
+{
+    uint32_t o[4] = { 0, 0, 0, 0 }, first = 0;
+    if (in && inlen >= 4) memcpy(&first, in, 4);
+    int r = gfx_rpc_raw(op, in, inlen, o, res_op, max_polls);
+    if (out) memcpy(out, o, sizeof o);
+    if (r == 0) {
+        if (op == 8) gfx_track_add(o[0], false);
+        else if (op == 3) gfx_track_add(o[0], true);
+        else if (op == 4) gfx_track_del(first, true);
+        else if (op == 9) gfx_track_del(first, false);
+    }
+    return r;
+}
+int bcm_gfx_tracked(int *windows, int *lost)
+{
+    int w = 0;
+    for (int i = 0; i < gfx_track_n; i++) w += gfx_track[i].win;
+    if (windows) *windows = w;
+    if (lost) *lost = gfx_track_lost;
+    return gfx_track_n - w;
+}
+/* removes every recorded window (op 1, op 4..., op 2), then frees every recorded image (op 9); returns how many
+ * handles the VideoCore did not answer for (they are dropped from the record either way) */
+int bcm_gfx_release_all(void)
+{
+    uint32_t o[4], a[4];
+    int fails = 0;
+    if (!hi.attached) { gfx_track_n = 0; gfx_track_lost = 0; return 0; }
+    gfx_rpc_raw(1, NULL, 0, o, NULL, 300);
+    for (int i = gfx_track_n - 1; i >= 0; i--)
+        if (gfx_track[i].win) {
+            memset(a, 0, sizeof a); a[0] = gfx_track[i].h;
+            if (gfx_rpc_raw(4, a, 0x10, o, NULL, 300) != 0) fails++;
+        }
+    gfx_rpc_raw(2, NULL, 0, o, NULL, 300);
+    for (int i = gfx_track_n - 1; i >= 0; i--)
+        if (!gfx_track[i].win) {
+            memset(a, 0, sizeof a); a[0] = gfx_track[i].h;
+            if (gfx_rpc_raw(9, a, 0x10, o, NULL, 300) != 0) fails++;
+        }
+    gfx_track_n = 0; gfx_track_lost = 0;
+    return fails;
+}
+void bcm_gfx_forget(void) { gfx_track_n = 0; gfx_track_lost = 0; }   /* the VideoCore rebooted: its handles are gone */
+
+static int gfx_rpc_raw(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls)
 {
     struct hi_chan *c = chan_by_type(CH_GRAPHICS);
     if (!hi.attached || !c) return -1;

@@ -213,6 +213,17 @@ static void continue_lcd_awake(void)
    and no BCM_CONTROL=0x31 doorbells, no lcd_update*). The stock firmware never uses that mailbox with this VC image. */
 static volatile bool bcm_lcd_frozen;
 void bcm_lcd_freeze(bool on) { bcm_lcd_frozen = on; }
+/* v96: "hosted" display -- the stock vmcs.bin stays running after a video (Settings > Video > Keep VideoCore Ready) and
+   Rockbox's screen is shown through one of its graphics-layer images.  While frozen, an update only tells the hook which
+   rectangle changed (the player's keeper thread copies the frame buffer to the VideoCore), and lcd_sleep() asks the hook
+   to give the display back to Rockbox's own firmware instead of sending mailbox commands the stock image does not know. */
+static void (*bcm_lcd_upd_hook)(int x, int y, int w, int h);
+static void (*bcm_lcd_sleep_hook)(void);
+void bcm_lcd_set_hosted(void (*upd)(int, int, int, int), void (*slp)(void))
+{
+    bcm_lcd_upd_hook = upd;
+    bcm_lcd_sleep_hook = slp;
+}
 
 #ifndef BOOTLOADER
 static void lcd_tick(void)
@@ -454,6 +465,36 @@ int bcm_use_vmcs_image(const void *img, unsigned len)
     return (bcm_boot_count != before) ? 0 : -2;
 }
 
+/* v96: VideoCore recovery.  Power-cycle the BCM (the stock shutdown's GPIO order, as in bcm_restore_rom_vmcs()) and boot
+   `img` again, whatever state the running image is in -- bcm_use_vmcs_image() cannot be used for that: its lcd_sleep()
+   returns at once while a video owns the BCM (frozen), and on a hung image its mailbox wait would never end.
+   Returns 0 when the BCM booted again (the caller checks VC[0x1F8] / VC[0x1FC] with bcm_get_boot_info()), -1 without a
+   NOR vmcs section, -2 when bcm_init() did not run or did not get an answer.  The display is left unfrozen. */
+int bcm_vc_reboot(const void *img, unsigned len)
+{
+    unsigned before = bcm_boot_count;
+    if (flash_vmcs_length == 0)
+        return -1;
+    BCM_IO_LOCK();
+    tick_remove_task(&lcd_tick);
+    lcd_state.display_on = false;
+    lcd_state.waking = false;
+    GPO32_VAL &= ~0x8000;                              /* GPIO 0x77 low, then GPIO 0x76 (BCM power) low */
+    GPO32_VAL &= ~0x4000;
+    BCM_IO_UNLOCK();
+    lcd_state.update_timeout = current_tick;
+    sleep(HZ / 10);                                    /* >= 50 ms off */
+    bcm_io_bad = 0;
+    bcm_lcd_frozen = false;
+    flash_vmcs_offset = (const fb_data *)img;
+    flash_vmcs_length = ((len + 3) >> 1) & ~1;
+    lcd_state.blocked = false;
+    lcd_state.state = LCD_INITIAL;
+    lcd_awake();                                       /* bcm_init() uploads the image and starts it */
+    if (bcm_init_failed) return -2;
+    return (bcm_boot_count != before) ? 0 : -2;
+}
+
 /* v47: back to Rockbox's own display firmware after a video.  The VC runs the stock vmcs.bin, which does not answer
    the legacy BCMA_COMMAND mailbox, so lcd_sleep()'s bcm_powerdown() would wait forever: cut the BCM power directly,
    point bcm_init() at the NOR image again and wake the LCD (bootstrap, upload, first LCD update). */
@@ -585,7 +626,12 @@ void lcd_init_device(void)
 /* Update a fraction of the display. */
 void lcd_update_rect(int x, int y, int width, int height)
 {
-    if (bcm_lcd_frozen) return;
+    if (bcm_lcd_frozen)
+    {
+        void (*h)(int, int, int, int) = bcm_lcd_upd_hook;
+        if (h) h(x, y, width, height);                 /* v96: hosted display */
+        return;
+    }
     const fb_data *addr;
     unsigned bcmaddr;
 
@@ -657,6 +703,8 @@ void lcd_blit_yuv(unsigned char * const src[3],
     off_t z;
     unsigned char const * yuv_src[3];
 
+    if (bcm_lcd_frozen)
+        return;     /* v96: the stock vmcs.bin owns the BCM: writes to 0xE0000 would land in its memory */
 #ifdef HAVE_LCD_SLEEP
     if (!lcd_state.display_on)
         return;
@@ -858,7 +906,11 @@ void lcd_awake(void)
 void lcd_sleep(void)
 {
     if (bcm_lcd_frozen)
-        return;     /* v50: bcm_powerdown()'s mailbox commands would wait forever on the stock vmcs.bin */
+    {   /* v50: bcm_powerdown()'s mailbox commands would wait forever on the stock vmcs.bin */
+        void (*h)(void) = bcm_lcd_sleep_hook;
+        if (h) h();                                    /* v96: hosted display: the keeper hands the display back, then sleeps it */
+        return;
+    }
     if (lcd_state.display_on && flash_vmcs_length != 0)
     {
         lcd_state.display_on = false;
