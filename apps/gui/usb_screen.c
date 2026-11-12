@@ -278,6 +278,12 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
     usb_screens_draw(usb_screen_vps_ar);
     handle_usb_events(title);
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    {   /* bcm overlay v101: save the USB trace (what the computer asked for while connected) to /usb_trace.txt */
+        extern void usb_storage_trace_save(void);
+        usb_storage_trace_save();
+    }
+#endif
 
 #if defined(USB_ENABLE_HID)
     if (global_settings.usb_hid)

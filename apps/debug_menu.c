@@ -3138,6 +3138,9 @@ static int m4_big_h = -1;
 static int cfg_big_frames = 1;
 static int cfg_recover = 2;                       /* v96: VideoCore recovery attempts per video */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
+static bool bcm_warm_run;                         /* v100: this run started on a VideoCore that was kept ready */
+static bool bcm_stop_ok;                          /* v100: the run's mp_stop was answered */
+static int bcm_mp_task = -1;                      /* v100: mplayer.vll's task number (load_application's "task=") */
 static uint32_t m4_big_seen, m4_big_max;          /* frames over 64 KB this file, and the largest */
 static uint32_t m4_frame_max;                     /* v96: the largest video frame read so far (adaptive buffering) */
 static void m4_big_free(void)
@@ -4489,7 +4492,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v99 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v101 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -7033,12 +7036,23 @@ static void bcm_video_run(int secs)
         qz_tick(run_t0);                               /* v88 */
         if (st_cur >= 0 && st_ok == 0 && current_tick - run_t0 > HZ && !sc_active)
             st_setup();                                /* v78: subtitle images made after the start (not before mp_selectplay) */
+        if (bcm_warm_run && !rc_n && v_sound != 2 && !av_checked && current_tick - run_t0 > 8 * HZ && !pl_paused && !sc_active)
+        {   /* v100: the same check for a warm start with Rockbox's sound route */
+            uint32_t e = av_vc_elapsed();
+            av_checked = true;
+            if (e != 0xffffffffu && e < 1000) { rc_arm("warm start: the VideoCore takes frames but does not play them"); break; }
+        }
         if (v_sound == 2 && !av_checked && current_tick - run_t0 > cfg_av_stall * HZ && !pl_paused && !sc_active)
         {   /* v53: does the stock route run?  The VC's clock follows its sound output: no sound output = no clock = no picture */
             uint32_t e = av_vc_elapsed();
             av_checked = true;
             BLOG("  audio check (stock route) %d s in: VC elapsed %u ms, AAC frames sent %d (asked %d, %d B, last ts %u ms)", cfg_av_stall,
                  (unsigned)e, a_frames, a_req, a_bytes, (unsigned)a_last_ts);
+            if (e != 0xffffffffu && e < 1000 && bcm_warm_run && rc_n < cfg_recover)
+            {   /* v100: the v99 log: a kept VideoCore took every frame and decoded none (total_bytes_decoded=0, elapsed 0) */
+                rc_arm("warm start: the VideoCore takes frames but does not play them");
+                break;
+            }
             if (e != 0xffffffffu && e < 1000 && ra_fsize > 0x7fffffffu)
                 BLOG("  audio: the picture does not move with the VC's sound, but the movie is over 2 GiB: Rockbox's own "
                      "sound route cannot read it -- staying");
@@ -7813,6 +7827,7 @@ again:
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched("mp_stop", resp, sizeof resp, 3);
     bcm_log_text("mp_stop", r, resp);
+    bcm_stop_ok = r >= 0;                              /* v100: a VideoCore that did not stop is never kept */
     bcm_tv_enable(false);                              /* v55 */
 }
 
@@ -8022,7 +8037,11 @@ static void bcm_handback(void)
    the stock image is on standby only while the browser is in a video folder: any folder named Videos, TV Shows or Movies
    (anywhere in the path) and everything below it.  Entering one boots vmcs.bin and loads mplayer.vll right away
    (bcm_video_folder_hint from ft_load -> bcm_run in standby mode: the normal start-up without a video); after a video
-   from such a folder the BCM is not powered off either.  Meanwhile every image and window of the start-up / the video is
+   from such a folder the BCM is not powered off either.  v100, as stock: no application while on standby -- mplayer.vll
+   is loaded when a video starts and ended ("audio_enable 0", "end_application <task>") when it is over (the v99 log: a
+   VideoCore whose mplayer.vll had been loaded at standby took every frame and decoded none).  A warm start that still
+   does not play by the 7 s audio check is rebooted cold (the recovery path), and a VideoCore that missed any command is
+   never kept.  Meanwhile every image and window of the start-up / the video is
    freed (bcm_gfx_release_all), the legacy LCD driver stays frozen and its updates only mark the screen dirty
    (bcm_lcd_set_hosted, v97 fix), and a keeper thread copies Rockbox's frame buffer into a graphics-layer image at most 10
    times a second.  A video there then skips the boot, the attach and the mplayer.vll load (warm start).
@@ -8192,6 +8211,22 @@ static bool kp_enter(void)
         kp_thread_id = create_thread(kp_thread, kp_stack, sizeof kp_stack, 0, "bcm keep"
                                      IF_PRIO(, PRIORITY_BACKGROUND) IF_COP(, CPU));
     if (!kp_thread_id) { BLOG("keep ready: no thread -- normal hand-back"); return false; }
+    if (pl_fail_run || !bcm_stop_ok || rc_want)
+    {   /* v100: the v99 freeze: a VideoCore whose mp_stop timed out was kept, and freeing its images waited on it */
+        BLOG("keep ready: not kept -- the VideoCore did not answer every command this run");
+        return false;
+    }
+    if (bcm_mp_task > 0)
+    {   /* v100: the stock close (rt 0x1fa2f0): sound off, then the application ended -- the next video loads it fresh */
+        static char er[128];
+        char c[40];
+        int r1 = bcm_gencmd_watched("audio_enable 0", er, sizeof er, 2);
+        snprintf(c, sizeof c, "end_application %d", bcm_mp_task);
+        r1 = r1 < 0 ? r1 : bcm_gencmd_watched(c, er, sizeof er, 3);
+        bcm_log_text(c, r1, er);
+        bcm_mp_task = -1;
+        if (r1 < 0) { BLOG("keep ready: not kept -- end_application was not answered"); return false; }
+    }
     imgs = bcm_gfx_tracked(&wins, &lost);
     fails = bcm_gfx_release_all();
     BLOG("keep ready: freed %d image(s) and %d window(s) of the video (%d unanswered, %d not recorded)", imgs, wins, fails, lost);
@@ -8266,11 +8301,12 @@ static bool bcm_run(const char *play_path)
     power_cycle = warm && !bcm_player_mode;            /* the test mode always boots: from a kept VideoCore by power-cycling */
     if (!bcm_player_mode) warm = false;
     rc_n = 0; rc_want = false; pl_sys_event = 0;
+    bcm_warm_run = false; bcm_stop_ok = bcm_standby;
     bcm_reset_run_state();
     bcm_log_open();
     if (bcm_standby && bcm_log_fd >= 0) lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log */
     bcm_t_start = current_tick;
-    BLOG("bcm host test v99, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v101, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -8306,7 +8342,20 @@ static bool bcm_run(const char *play_path)
         bcm_cmd_t0 = current_tick;
         r = bcm_gencmd_watched("version", resp, sizeof resp, 2);
         BLOG("warm start: the VideoCore was kept ready -- version -> %d (%ld ms)", r, (current_tick - t0) * 1000 / HZ);
-        if (r >= 0 && !bcm_io_dead()) goto warm_start;
+        if (r >= 0 && !bcm_io_dead())
+        {   /* v100: like Apple's player (rt 0x1f9158): mplayer.vll is loaded for the video, ended when it is over */
+            t0 = current_tick;
+            bcm_cmd_t0 = current_tick;
+            r = bcm_gencmd_watched("load_application mplayer.vll", resp, sizeof resp, 10);
+            bcm_log_text("load_application mplayer.vll", r, resp);
+            if (r >= 0 && strstr(resp, "task="))
+            {
+                bcm_mp_task = atoi(strstr(resp, "task=") + 5);
+                BLOG("warm start: mplayer.vll loaded again (task %d, %ld ms)", bcm_mp_task, (current_tick - t0) * 1000 / HZ);
+                bcm_warm_run = true;
+                goto warm_start;
+            }
+        }
         BLOG("warm start: no answer -- power-cycling and booting it again");
         power_cycle = true;
     }
@@ -8436,10 +8485,13 @@ vc_boot:                                               /* v96: recovery comes ba
     for (i = 0; i < (int)(sizeof cmds / sizeof cmds[0]); i++)
     {
         if (cfg_fast && (!strcmp(cmds[i], "commands") || (i > 0 && !strcmp(cmds[i], "tasks")))) continue;   /* v46: diagnostics only */
+        if (bcm_standby && !strncmp(cmds[i], "load_application", 16)) continue;   /* v100: standby = no application (stock) */
         bcm_cmd_t0 = current_tick;
         /* v46 log: one VCFS read of mplayer.vll every 20 ms (two 10 ms poll sleeps each); the watched wait polls without sleeping */
         r = cfg_fast ? bcm_gencmd_watched(cmds[i], resp, sizeof resp, 10) : bcm_gencmd(cmds[i], resp, sizeof resp, 1000);
         bcm_log_text(cmds[i], r, resp);
+        if (!strncmp(cmds[i], "load_application", 16) && r >= 0 && strstr(resp, "task="))
+            bcm_mp_task = atoi(strstr(resp, "task=") + 5);   /* v100 */
     }
 
     {   /* listen for unsolicited traffic (VCFS/VCHR/VCPD requests) for 5 seconds */
@@ -8480,7 +8532,7 @@ warm_start:                                            /* v99: a kept VideoCore 
     if (bcm_standby)
     {   /* v99: no video: the start-up only, then kept (kp_enter at "out") */
         run_ok = !bcm_dead_seen && !bcm_io_dead() && !bcm_check_dead();
-        BLOG("standby: the VideoCore is up with mplayer.vll loaded (%s)", run_ok ? "ok" : "not answering");
+        BLOG("standby: the VideoCore is up, no application loaded (%s)", run_ok ? "ok" : "not answering");
         goto out;
     }
     bcm_playback_probe();
@@ -8491,7 +8543,7 @@ warm_start:                                            /* v99: a kept VideoCore 
         bcm_reset_run_state();
         bcm_resume_ms = rc_pos;
         bcm_wd_last = current_tick; bcm_wd_secs = 20;
-        power_cycle = true;
+        power_cycle = true; bcm_warm_run = false;
         BLOG("RECOVERY %d: rebooting the VideoCore, then back to %u ms", rc_n, (unsigned)rc_pos);
         goto vc_boot;
     }

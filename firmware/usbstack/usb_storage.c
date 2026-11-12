@@ -353,6 +353,150 @@ static bool locked[NUM_DRIVES];
 static bool bcm_media_changed[NUM_DRIVES];   /* v93: report UNIT ATTENTION once the disk is ours */
 #endif
 
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+/* bcm overlay v101: USB trace.  Records every SCSI command the computer sends after the cable goes in (time, command,
+   sector, whether the disk was handed over yet, the answer, the error code, the first bytes of each sector read) plus
+   the USB events around it (bus reset, configuration, hand-over).  Saved to /usb_trace.txt when the cable comes out,
+   to find out what Windows sees when it shows "You need to format the disk".  Diagnostic only: it changes no answer. */
+#include <stdio.h>
+#include "file.h"
+#include "kernel.h"
+#define UT_N 600
+struct ut_ent {
+    uint32_t t;          /* ticks since the first entry */
+    uint32_t a;          /* sector / capacity / marker value */
+    uint32_t d;          /* read: bytes 0-3 of the first sector; capacity: block size; marker value */
+    uint16_t n;          /* blocks */
+    uint8_t op, fl, st, sk, asc, ascq;
+    uint8_t d2[4];       /* read: bytes 3-6 of the first sector */
+    uint8_t sig[2];      /* read: bytes 510-511 */
+    int8_t res;          /* read: storage_read_sectors() result */
+};
+static struct ut_ent ut[UT_N];
+static int ut_cnt, ut_cur = -1;
+static unsigned ut_lost;
+static long ut_t0;
+
+static struct ut_ent *ut_new(int op)
+{
+    struct ut_ent *e = NULL;
+    int old = disable_irq_save();
+    if(ut_cnt == 0)
+        ut_t0 = current_tick;
+    if(ut_cnt < UT_N) {
+        e = &ut[ut_cnt++];
+        memset(e, 0, sizeof(*e));
+        e->t = current_tick - ut_t0;
+        e->op = op;
+        e->st = 0xff;
+    }
+    else
+        ut_lost++;
+    restore_irq(old);
+    return e;
+}
+
+/* markers: 0 storage connected, 1 storage disconnected, 2 disk handed over, 3 disk taken back, 4 bus reset,
+   5 set configuration, 6 hand-over starts (unmount), 7 drivers set up for state, 8 ack timeout check */
+void usb_storage_trace_mark(int what, uint32_t a, uint32_t d)
+{
+    struct ut_ent *e = ut_new(0xf0 + what);
+    if(e) {
+        e->a = a;
+        e->d = d;
+        e->fl = usb_exclusive_storage() ? 1 : 0;
+    }
+}
+
+static const char *ut_name(int op)
+{
+    switch(op) {
+        case 0x00: return "TEST UNIT READY";
+        case 0x03: return "REQUEST SENSE";
+        case 0x12: return "INQUIRY";
+        case 0x1a: return "MODE SENSE(6)";
+        case 0x1b: return "START STOP UNIT";
+        case 0x1e: return "PREVENT/ALLOW REMOVAL";
+        case 0x23: return "READ FORMAT CAPACITIES";
+        case 0x25: return "READ CAPACITY(10)";
+        case 0x28: return "READ(10)";
+        case 0x2a: return "WRITE(10)";
+        case 0x2f: return "VERIFY(10)";
+        case 0x35: return "SYNCHRONIZE CACHE";
+        case 0x4a: return "GET EVENT STATUS";
+        case 0x46: return "GET CONFIGURATION";
+        case 0x55: return "MODE SELECT(10)";
+        case 0x5a: return "MODE SENSE(10)";
+        case 0x88: return "READ(16)";
+        case 0x8a: return "WRITE(16)";
+        case 0x9e: return "READ CAPACITY(16)";
+        case 0xa0: return "REPORT LUNS";
+        case 0xa1: return "ATA PASS-THROUGH(12)";
+        case 0x85: return "ATA PASS-THROUGH(16)";
+        case 0xf0: return "** storage connected (sectors, size|mult<<16)";
+        case 0xf1: return "** storage disconnected";
+        case 0xf2: return "** DISK HANDED OVER to the computer";
+        case 0xf3: return "** disk taken back by the iPod";
+        case 0xf4: return "** USB bus reset (config was)";
+        case 0xf5: return "** USB set configuration";
+        case 0xf6: return "** hand-over starts: unmounting";
+        case 0xf7: return "** drivers set up for (1 charge only, 2 data)";
+        default:   return "?";
+    }
+}
+
+/* called from the USB screen after the cable is pulled (the disk is the iPod's again) */
+void usb_storage_trace_save(void)
+{
+    int n = ut_cnt;
+    if(n == 0)
+        return;
+    rename("/usb_trace.txt", "/usb_trace_prev.txt");
+    int fd = open("/usb_trace.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if(fd >= 0) {
+        fdprintf(fd, "bcm overlay v101 USB trace: %d entries (%u not kept), times in ms from the first event\n"
+                     "flags: X = disk handed over, P = medium present, E = ejected, C = media-change pending,"
+                     " U = 'medium may have changed' sent, mN = sector multiplier\n"
+                     "status: 0 good, 1 failed, - no reply; sense key/asc/ascq when failed\n\n", n, ut_lost);
+        for(int i = 0; i < n; i++) {
+            struct ut_ent *e = &ut[i];
+            unsigned ms = e->t * (1000 / HZ);
+            if(e->op >= 0xf0) {
+                fdprintf(fd, "%7u.%03u  %-40s %lu %lu (0x%lx)%s\n", ms / 1000, ms % 1000, ut_name(e->op),
+                         (unsigned long)e->a, (unsigned long)e->d, (unsigned long)e->d,
+                         e->fl ? "  [handed over]" : "");
+                continue;
+            }
+            char fl[16];
+            snprintf(fl, sizeof fl, "%c%c%c%c%c m%d", (e->fl & 1) ? 'X' : '.', (e->fl & 2) ? 'P' : '.',
+                     (e->fl & 4) ? 'E' : '.', (e->fl & 8) ? 'C' : '.', (e->fl & 16) ? 'U' : '.', e->fl >> 5);
+            char st[24];
+            if(e->st == 0xff)
+                strcpy(st, "-");
+            else if(e->st == 0)
+                strcpy(st, "0");
+            else
+                snprintf(st, sizeof st, "%d %x/%02x/%02x", e->st, e->sk, e->asc, e->ascq);
+            fdprintf(fd, "%7u.%03u  %02x %-22s %-10s %-12s", ms / 1000, ms % 1000, e->op, ut_name(e->op), fl, st);
+            if(e->op == 0x28 || e->op == 0x2a || e->op == 0x2f || e->op == 0x88 || e->op == 0x8a)
+                fdprintf(fd, " lba %lu n %u", (unsigned long)e->a, e->n);
+            else if(e->op == 0x25 || e->op == 0x23 || e->op == 0x9e)
+                fdprintf(fd, " blocks %lu size %lu", (unsigned long)e->a, (unsigned long)e->d);
+            else
+                fdprintf(fd, " cdb %08lx", (unsigned long)e->a);
+            if(e->op == 0x28 && (e->sig[0] | e->sig[1] | e->d | e->res))
+                fdprintf(fd, "  data %08lx %02x%02x%02x%02x ..%02x%02x res %d", (unsigned long)e->d,
+                         e->d2[0], e->d2[1], e->d2[2], e->d2[3], e->sig[0], e->sig[1], e->res);
+            fdprintf(fd, "\n");
+        }
+        close(fd);
+    }
+    ut_cnt = 0;
+    ut_cur = -1;
+    ut_lost = 0;
+}
+#endif
+
 static int usb_interface;
 
 static struct usb_class_driver_ep_allocation ep_allocs[2] = {
@@ -521,11 +665,25 @@ static int usb_storage_init_connection(void)
         ejected[i] = !check_disk_present(IF_MD(i));
         queue_broadcast(SYS_USB_LUN_LOCKED, (i<<16)+0);
     }
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    {
+        struct storage_info info;
+        storage_get_info(0, &info);
+        int mult = 1;
+#ifdef MAX_VIRT_SECTOR_SIZE
+        mult = disk_get_sector_multiplier(IF_MD(0));
+#endif
+        usb_storage_trace_mark(0, (uint32_t)info.num_sectors, info.sector_size | mult << 16 | (ejected[0] ? 1u << 31 : 0));
+    }
+#endif
     return 0;
 }
 
 void usb_storage_disconnect(void)
 {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    usb_storage_trace_mark(1, 0, 0);
+#endif
 #ifndef USB_STATIC_ALLOC
     usb_handle = core_free(usb_handle);
 #endif
@@ -851,6 +1009,29 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     if(ejected[lun])
         lun_present = false;
 
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    /* v101 trace: the previous command is finished; keep its error code, then start this one */
+    if(ut_cur >= 0) {
+        ut[ut_cur].sk = cur_sense_data.sense_key;
+        ut[ut_cur].asc = cur_sense_data.asc;
+        ut[ut_cur].ascq = cur_sense_data.ascq;
+    }
+    {
+        unsigned char *cb = cbw->command_block;
+        struct ut_ent *e = ut_new(cb[0]);
+        ut_cur = e ? (int)(e - ut) : -1;
+        if(e) {
+            if(cb[0] == SCSI_READ_10 || cb[0] == SCSI_WRITE_10 || cb[0] == 0x2f) {
+                e->a = cb[2] << 24 | cb[3] << 16 | cb[4] << 8 | cb[5];
+                e->n = cb[7] << 8 | cb[8];
+            }
+            else
+                e->a = cb[1] << 24 | cb[2] << 16 | cb[3] << 8 | cb[4];
+            e->fl = (usb_exclusive_storage() ? 1 : 0) | (ejected[lun] ? 4 : 0) | (bcm_media_changed[lun] ? 8 : 0);
+        }
+    }
+#endif
+
 #ifdef IPOD_VIDEO
     /* bcm overlay v93: until every Rockbox thread has let go of the disk (exclusive storage), the card is "not
        present" for EVERY media command, not only TEST UNIT READY.  Stock Rockbox already answered reads and the
@@ -873,6 +1054,10 @@ static void handle_scsi(struct command_block_wrapper* cbw)
         cur_sense_data.sense_key=SENSE_UNIT_ATTENTION;
         cur_sense_data.asc=ASC_MEDIUM_MAY_HAVE_CHANGED;
         cur_sense_data.ascq=0;
+#ifndef BOOTLOADER
+        if(ut_cur >= 0)
+            ut[ut_cur].fl |= 2 | 16;
+#endif
         return;
     }
 #endif
@@ -884,6 +1069,18 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 
     uint32_t bsize = block_size*block_size_mult;
     sector_t bcount = block_count/block_size_mult;
+
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    if(ut_cur >= 0) {
+        ut[ut_cur].fl |= (lun_present ? 2 : 0) | (block_size_mult & 7) << 5;
+        if(lun_present && (cbw->command_block[0] == SCSI_READ_CAPACITY_10 ||
+                           cbw->command_block[0] == USB_UFI_READ_FORMAT_CAPACITY ||
+                           cbw->command_block[0] == SCSI_READ_CAPACITY_16)) {
+            ut[ut_cur].a = (uint32_t)bcount;
+            ut[ut_cur].d = bsize;
+        }
+    }
+#endif
 
     cur_cmd.data_residue = letoh32(cbw->data_transfer_length);
     cur_cmd.tag = cbw->tag;
@@ -1259,6 +1456,19 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
 #endif
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                if(ut_cur >= 0 && ut[ut_cur].op == SCSI_READ_10) {
+                    const unsigned char *b = cur_cmd.data[cur_cmd.data_select];
+                    struct ut_ent *e = &ut[ut_cur];
+                    e->d = (uint32_t)b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
+                    memcpy(e->d2, b + 3, 4);
+                    if(bsize >= 512) {
+                        e->sig[0] = b[510];
+                        e->sig[1] = b[511];
+                    }
+                    e->res = (int8_t)cur_cmd.last_result;
+                }
+#endif
                 send_and_read_next();
             }
             break;
@@ -1541,6 +1751,10 @@ static void receive_block_data(void *data,int size)
 
 static void send_csw(int status)
 {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    if(ut_cur >= 0 && ut[ut_cur].st == 0xff)
+        ut[ut_cur].st = status;
+#endif
     tb.csw->signature = htole32(CSW_SIGNATURE);
     tb.csw->tag = cur_cmd.tag;
     tb.csw->data_residue = htole32(cur_cmd.data_residue);

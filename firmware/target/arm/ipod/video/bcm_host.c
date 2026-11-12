@@ -517,17 +517,17 @@ int bcm_gfx_release_all(void)
     uint32_t o[4], a[4];
     int fails = 0;
     if (!hi.attached) { gfx_track_n = 0; gfx_track_lost = 0; return 0; }
-    gfx_rpc_raw(1, NULL, 0, o, NULL, 300);
+    if (gfx_rpc_raw(1, NULL, 0, o, NULL, 100) != 0) { gfx_track_n = 0; gfx_track_lost = 0; return 99; }
     for (int i = gfx_track_n - 1; i >= 0; i--)
         if (gfx_track[i].win) {
             memset(a, 0, sizeof a); a[0] = gfx_track[i].h;
-            if (gfx_rpc_raw(4, a, 0x10, o, NULL, 300) != 0) fails++;
+            if (gfx_rpc_raw(4, a, 0x10, o, NULL, 100) != 0 && ++fails >= 2) break;   /* v100: do not wait on a sick VC */
         }
-    gfx_rpc_raw(2, NULL, 0, o, NULL, 300);
-    for (int i = gfx_track_n - 1; i >= 0; i--)
+    gfx_rpc_raw(2, NULL, 0, o, NULL, 100);
+    for (int i = gfx_track_n - 1; i >= 0 && fails < 2; i--)
         if (!gfx_track[i].win) {
             memset(a, 0, sizeof a); a[0] = gfx_track[i].h;
-            if (gfx_rpc_raw(9, a, 0x10, o, NULL, 300) != 0) fails++;
+            if (gfx_rpc_raw(9, a, 0x10, o, NULL, 100) != 0 && ++fails >= 2) break;
         }
     gfx_track_n = 0; gfx_track_lost = 0;
     return fails;
