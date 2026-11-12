@@ -19034,40 +19034,6 @@
   </voice>
 </phrase>
 <phrase>
-  id: LANG_VIDEO_POWER
-  desc: bcm overlay v96
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Video Power"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Video Power"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Video Power"
-  </voice>
-</phrase>
-<phrase>
-  id: LANG_POWER_SAVER
-  desc: bcm overlay v96
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Battery Saver"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Battery Saver"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Battery Saver"
-  </voice>
-</phrase>
-<phrase>
   id: LANG_VIDEO_RESUME
   desc: bcm overlay v96
   user: core
@@ -19116,56 +19082,5 @@
   <voice>
     *: none
     ipodvideo: "Resume from"
-  </voice>
-</phrase>
-<phrase>
-  id: LANG_KEEP_VC
-  desc: bcm overlay v96
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Keep VideoCore Ready"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Keep VideoCore Ready"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Keep VideoCore Ready"
-  </voice>
-</phrase>
-<phrase>
-  id: LANG_KEEP_VC_BETWEEN
-  desc: bcm overlay v96
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Between Videos"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Between Videos"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Between Videos"
-  </voice>
-</phrase>
-<phrase>
-  id: LANG_KEEP_VC_ALWAYS
-  desc: bcm overlay v96
-  user: core
-  <source>
-    *: none
-    ipodvideo: "Always (Experimental)"
-  </source>
-  <dest>
-    *: none
-    ipodvideo: "Always (Experimental)"
-  </dest>
-  <voice>
-    *: none
-    ipodvideo: "Always (Experimental)"
   </voice>
 </phrase>

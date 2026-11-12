@@ -566,7 +566,6 @@ int ft_assemble_path(char *buf, size_t bufsz, const char* currdir, const char* f
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
 extern bool bcm_video_play(const char *path);      /* apps/debug_menu.c */
 extern bool bcm_video_play_again(const char *path);
-extern void bcm_video_session(bool on);   /* v96: Keep VideoCore Ready between the videos of this loop */
 extern bool bcm_video_is_video(const char *path);
 extern int bcm_video_next_request;
 extern bool bcm_tvs_episode, bcm_tvs_stop_after, bcm_video_finished;   /* v74 */
@@ -708,7 +707,6 @@ int ft_enter(struct tree_context* c)
             /* v74: an episode of a TV show (".../TV Show/<show>/...") with Settings > Video > Autoplay Next Episode */
             bcm_tvs_stop_after = false;
             bcm_tvs_episode = global_settings.bcm_tv_autoplay && tvs_show_root(buf, root, sizeof root, NULL, 0);
-            bcm_video_session(true);
             bcm_video_play(buf);
             while (guard++ < 1000)
             {
@@ -729,7 +727,6 @@ int ft_enter(struct tree_context* c)
                 strlcpy(buf, nxt, sizeof buf);
                 bcm_video_play_again(buf);
             }
-            bcm_video_session(false);                   /* v96: the VideoCore kept for this loop goes (unless "Always") */
             bcm_video_next_request = 0;
             bcm_tvs_episode = false;
             if (strcmp(buf, first))

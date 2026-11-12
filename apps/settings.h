@@ -770,9 +770,7 @@ struct user_settings
     int bcm_sub_size;    /* 0 small, 1 medium, 2 large */
     int bcm_sub_style;   /* 0 outline, 1 box */
     int bcm_video_buffer;  /* v74: 0 low-power, 1 balanced, 2 performance; v96: 3 adaptive */
-    int bcm_video_power;   /* v96: 0 battery saver, 1 balanced, 2 performance */
     int bcm_video_resume;  /* v96: 0 off, 1 ask, 2 always */
-    int bcm_keep_vc;       /* v96: Keep VideoCore Ready: 0 off, 1 between videos, 2 always */
     bool bcm_tv_autoplay;  /* v74: TV show episodes: the next one follows (countdown) */
     bool bcm_dock_notify;  /* v74: notices for docks / power sources */
     int bcm_tv_countdown;  /* v76: TV shows: seconds before the next episode (5..10) */

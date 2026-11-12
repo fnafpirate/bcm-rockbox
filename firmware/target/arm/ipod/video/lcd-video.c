@@ -213,17 +213,7 @@ static void continue_lcd_awake(void)
    and no BCM_CONTROL=0x31 doorbells, no lcd_update*). The stock firmware never uses that mailbox with this VC image. */
 static volatile bool bcm_lcd_frozen;
 void bcm_lcd_freeze(bool on) { bcm_lcd_frozen = on; }
-/* v96: "hosted" display -- the stock vmcs.bin stays running after a video (Settings > Video > Keep VideoCore Ready) and
-   Rockbox's screen is shown through one of its graphics-layer images.  While frozen, an update only tells the hook which
-   rectangle changed (the player's keeper thread copies the frame buffer to the VideoCore), and lcd_sleep() asks the hook
-   to give the display back to Rockbox's own firmware instead of sending mailbox commands the stock image does not know. */
-static void (*bcm_lcd_upd_hook)(int x, int y, int w, int h);
-static void (*bcm_lcd_sleep_hook)(void);
-void bcm_lcd_set_hosted(void (*upd)(int, int, int, int), void (*slp)(void))
-{
-    bcm_lcd_upd_hook = upd;
-    bcm_lcd_sleep_hook = slp;
-}
+
 
 #ifndef BOOTLOADER
 static void lcd_tick(void)
@@ -626,12 +616,7 @@ void lcd_init_device(void)
 /* Update a fraction of the display. */
 void lcd_update_rect(int x, int y, int width, int height)
 {
-    if (bcm_lcd_frozen)
-    {
-        void (*h)(int, int, int, int) = bcm_lcd_upd_hook;
-        if (h) h(x, y, width, height);                 /* v96: hosted display */
-        return;
-    }
+    if (bcm_lcd_frozen) return;
     const fb_data *addr;
     unsigned bcmaddr;
 
@@ -684,9 +669,7 @@ void lcd_update_rect(int x, int y, int width, int height)
    This must be called after all other LCD functions that change the display. */
 void lcd_update(void)
 {
-    /* v97: no early return while frozen -- lcd_update_rect() drops the update itself, and calls the hosted-display
-       hook (v96 returned here first, so with Keep VideoCore Ready the browser's full-screen updates never reached the
-       keeper: the screen stayed on its first copy and the iPod looked stuck) */
+    if (bcm_lcd_frozen) return;
     lcd_update_rect(0, 0, LCD_WIDTH, LCD_HEIGHT);
 }
 
@@ -908,11 +891,7 @@ void lcd_awake(void)
 void lcd_sleep(void)
 {
     if (bcm_lcd_frozen)
-    {   /* v50: bcm_powerdown()'s mailbox commands would wait forever on the stock vmcs.bin */
-        void (*h)(void) = bcm_lcd_sleep_hook;
-        if (h) h();                                    /* v96: hosted display: the keeper hands the display back, then sleeps it */
-        return;
-    }
+        return;     /* v50: bcm_powerdown()'s mailbox commands would wait forever on the stock vmcs.bin */
     if (lcd_state.display_on && flash_vmcs_length != 0)
     {
         lcd_state.display_on = false;
