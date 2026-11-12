@@ -3139,6 +3139,9 @@ static int cfg_big_frames = 1;
 static int cfg_recover = 2;                       /* v96: VideoCore recovery attempts per video */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
 static bool bcm_warm_run;                         /* v100: this run started on a VideoCore that was kept ready */
+static bool warm_play_logged;                     /* v102: "the picture moves after N s" written for this warm start */
+static bool kp_warm_off;                          /* v102: a warm start failed: no standby again until the iPod restarts */
+static unsigned bcm_core_mhz(void);               /* v102 */
 static bool bcm_stop_ok;                          /* v100: the run's mp_stop was answered */
 static int bcm_mp_task = -1;                      /* v100: mplayer.vll's task number (load_application's "task=") */
 static uint32_t m4_big_seen, m4_big_max;          /* frames over 64 KB this file, and the largest */
@@ -4492,7 +4495,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v101 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v102 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5805,9 +5808,19 @@ static void mon_tick(void)
     if (rr < 0) return;
     el = pl_num(r, "elapsed="); bu = pl_num(r, "buffering=");
     if (el != 0xffffffffu) pl_el_ms = el;
-    BLOG("  mon +%ld.%lds: elapsed=%u buffering=%d paused=%s frames requested since=%d",
-         (current_tick - mon_t0) / HZ, (current_tick - mon_t0) % HZ / 10, (unsigned)el, bu == 0xffffffffu ? -1 : (int)bu,
-         strstr(r, "paused=yes") ? "yes" : "no", v_getframes - mon_req0);
+    {
+        char ck[24] = "";
+        if (bcm_warm_run) snprintf(ck, sizeof ck, " core=%u MHz", bcm_core_mhz());   /* v102: warm starts only */
+        BLOG("  mon +%ld.%lds: elapsed=%u buffering=%d paused=%s frames requested since=%d%s",
+             (current_tick - mon_t0) / HZ, (current_tick - mon_t0) % HZ / 10, (unsigned)el, bu == 0xffffffffu ? -1 : (int)bu,
+             strstr(r, "paused=yes") ? "yes" : "no", v_getframes - mon_req0, ck);
+    }
+    if (bcm_warm_run && !warm_play_logged && el != 0xffffffffu && el > 0)
+    {
+        warm_play_logged = true;
+        BLOG("  warm start: the picture moves %ld.%ld s after mp_play (a fresh start: about 2 s)",
+             (current_tick - mon_t0) / HZ, (current_tick - mon_t0) % HZ / 10);
+    }
 }
 
 /* ---- trick probe: measure which commands really move the picture (runs once, buttons ignored) */
@@ -7036,21 +7049,32 @@ static void bcm_video_run(int secs)
         qz_tick(run_t0);                               /* v88 */
         if (st_cur >= 0 && st_ok == 0 && current_tick - run_t0 > HZ && !sc_active)
             st_setup();                                /* v78: subtitle images made after the start (not before mp_selectplay) */
-        if (bcm_warm_run && !rc_n && v_sound != 2 && !av_checked && current_tick - run_t0 > 8 * HZ && !pl_paused && !sc_active)
-        {   /* v100: the same check for a warm start with Rockbox's sound route */
+        if (bcm_warm_run && !rc_n && v_sound != 2 && !av_checked && current_tick - run_t0 > 14 * HZ && !pl_paused && !sc_active)
+        {   /* v100: the same check for a warm start with Rockbox's sound route (v102: at 14 s, see below) */
             uint32_t e = av_vc_elapsed();
             av_checked = true;
-            if (e != 0xffffffffu && e < 1000) { rc_arm("warm start: the VideoCore takes frames but does not play them"); break; }
+            if (e != 0xffffffffu && e < 1000)
+            {
+                rc_arm("warm start: the VideoCore takes frames but does not play them");
+                rc_pos = 0; kp_warm_off = true;
+                break;
+            }
         }
-        if (v_sound == 2 && !av_checked && current_tick - run_t0 > cfg_av_stall * HZ && !pl_paused && !sc_active)
+        /* v102: a warm start is checked at 14 s, not 7: the v101 warm start began to play at 6.8 s and was restarted at 7 */
+        if (v_sound == 2 && !av_checked && current_tick - run_t0 > (bcm_warm_run && !rc_n ? 14 : cfg_av_stall) * HZ
+            && !pl_paused && !sc_active)
         {   /* v53: does the stock route run?  The VC's clock follows its sound output: no sound output = no clock = no picture */
             uint32_t e = av_vc_elapsed();
             av_checked = true;
-            BLOG("  audio check (stock route) %d s in: VC elapsed %u ms, AAC frames sent %d (asked %d, %d B, last ts %u ms)", cfg_av_stall,
+            BLOG("  audio check (stock route) %d s in: VC elapsed %u ms, AAC frames sent %d (asked %d, %d B, last ts %u ms)",
+                 (int)((current_tick - run_t0) / HZ),
                  (unsigned)e, a_frames, a_req, a_bytes, (unsigned)a_last_ts);
             if (e != 0xffffffffu && e < 1000 && bcm_warm_run && rc_n < cfg_recover)
             {   /* v100: the v99 log: a kept VideoCore took every frame and decoded none (total_bytes_decoded=0, elapsed 0) */
                 rc_arm("warm start: the VideoCore takes frames but does not play them");
+                rc_pos = 0;                            /* v102: nothing was seen: start from the beginning, not covered */
+                kp_warm_off = true;                    /* v102: and no more standby this session -- every video starts fresh */
+                BLOG("  keep ready: switched off until the iPod restarts (the warm start did not play)");
                 break;
             }
             if (e != 0xffffffffu && e < 1000 && ra_fsize > 0x7fffffffu)
@@ -7209,13 +7233,51 @@ static void bcm_video_run(int secs)
 
 /* v17: the stock firmware sends "pm_set_policy min" (rt 0x1b013c, called from the mp_selectplay builder at rt 0x1fa3f0
    and the mp_play builder at rt 0x1f8ea0, and from the TV-out code) right before those commands; v16 never did. */
+static const char *bcm_pm_pol = "min";           /* v102: a warm start may use "max" (see bcm_warm_clock) */
 static void bcm_pm_set(void)
 {
-    char resp[256]; int r;
+    char resp[256], c[32]; int r;
     if (!cfg_pm) return;
+    snprintf(c, sizeof c, "pm_set_policy %s", bcm_pm_pol);
     bcm_cmd_t0 = current_tick;
-    r = bcm_gencmd_watched("pm_set_policy min", resp, sizeof resp, 3);
-    bcm_log_text("pm_set_policy min", r, resp);
+    r = bcm_gencmd_watched(c, resp, sizeof resp, 3);
+    bcm_log_text(c, r, resp);
+}
+/* v102: the VideoCore's core clock in MHz from pm_get_status ("core=150000000 ..."), 0 = no answer */
+static unsigned bcm_core_mhz(void)
+{
+    static char r[200];
+    bcm_cmd_t0 = current_tick;
+    if (bcm_gencmd_watched("pm_get_status", r, sizeof r, 2) < 0) return 0;
+    const char *p = strstr(r, "core=");
+    return p ? (unsigned)(atoi(p + 5) / 1000000) : 0;
+}
+/* v102: both warm-start logs: the kept VideoCore ran slower than a fresh one (25 MHz in v99, 138 in v101, 150 fresh)
+   and sat at "buffering=0" for 4-7 s before the picture moved; a fresh one moves 0.5-1.5 s after buffering ends.
+   Experiment: if the clock is down, try "pm_set_policy max" and keep it for this video only if the clock goes up. */
+static void bcm_warm_clock(void)
+{
+    char resp[128];
+    unsigned c0 = bcm_core_mhz(), c1;
+    long t;
+    BLOG("warm start: VideoCore clock %u MHz (a fresh start runs at 150)", c0);
+    if (!c0 || c0 >= 150) return;
+    bcm_cmd_t0 = current_tick;
+    bcm_log_text("pm_set_policy max", bcm_gencmd_watched("pm_set_policy max", resp, sizeof resp, 2), resp);
+    t = current_tick + HZ * 3 / 10;
+    while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); yield(); }
+    c1 = bcm_core_mhz();
+    if (c1 > c0)
+    {
+        bcm_pm_pol = "max";
+        BLOG("warm start: clock %u -> %u MHz with policy max -- kept for this video", c0, c1);
+    }
+    else
+    {
+        bcm_cmd_t0 = current_tick;
+        bcm_log_text("pm_set_policy min", bcm_gencmd_watched("pm_set_policy min", resp, sizeof resp, 2), resp);
+        BLOG("warm start: clock %u -> %u MHz with policy max -- not higher, back to min", c0, c1);
+    }
 }
 /* v27: the stock mp_selectplay path starts with "audio_enable 1" (function 0x1f90f4, called at 0x1fa3dc), then pm_set_policy min, then mp_selectplay. */
 static void bcm_audio_enable(void)
@@ -8088,7 +8150,7 @@ static bool bcm_standby;                         /* bcm_run: start-up only, no v
 /* the run that is ending may leave the VideoCore up */
 static bool kp_wanted(void)
 {
-    if (!kp_setting() || !bcm_player_mode || !bcm_play_path || bcm_tv || qz_on) return false;
+    if (!kp_setting() || !bcm_player_mode || !bcm_play_path || bcm_tv || qz_on || kp_warm_off) return false;
     return kp_in_area(bcm_play_path, !bcm_standby);
 }
 static void kp_upd_hook(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; kp_dirty = true; }
@@ -8268,7 +8330,7 @@ void bcm_video_folder_hint(const char *dir)
 {
     char d[MAX_PATH];
     if (!kp_setting() || kp_hosted || bcm_video_running || bcm_play_path || !dir || !kp_in_area(dir, false)) return;
-    if (TIME_BEFORE(current_tick, kp_fail_until) || usb_inserted()) return;
+    if (TIME_BEFORE(current_tick, kp_fail_until) || usb_inserted() || kp_warm_off) return;
     if (battery_level() >= 0 && battery_level() < 10) return;      /* keep what is left for the iPod itself */
     strlcpy(d, dir, sizeof d);
     bcm_standby = true;
@@ -8301,12 +8363,13 @@ static bool bcm_run(const char *play_path)
     power_cycle = warm && !bcm_player_mode;            /* the test mode always boots: from a kept VideoCore by power-cycling */
     if (!bcm_player_mode) warm = false;
     rc_n = 0; rc_want = false; pl_sys_event = 0;
-    bcm_warm_run = false; bcm_stop_ok = bcm_standby;
+    bcm_warm_run = false; bcm_stop_ok = bcm_standby; bcm_pm_pol = "min"; warm_play_logged = false;
     bcm_reset_run_state();
     bcm_log_open();
-    if (bcm_standby && bcm_log_fd >= 0) lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log */
+    if ((bcm_standby || warm) && bcm_log_fd >= 0)
+        lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
-    BLOG("bcm host test v101, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v102, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -8353,6 +8416,7 @@ static bool bcm_run(const char *play_path)
                 bcm_mp_task = atoi(strstr(resp, "task=") + 5);
                 BLOG("warm start: mplayer.vll loaded again (task %d, %ld ms)", bcm_mp_task, (current_tick - t0) * 1000 / HZ);
                 bcm_warm_run = true;
+                bcm_warm_clock();                      /* v102 */
                 goto warm_start;
             }
         }
@@ -8361,6 +8425,8 @@ static bool bcm_run(const char *play_path)
     }
 
 vc_boot:                                               /* v96: recovery comes back here */
+    bcm_mp_task = -1;                                  /* v102: a fresh boot has no application (standby used to end a
+                                                          task number left over from the last video) */
 
     /* v56: /.rockbox/VideoCore/ (all files in one folder) first, else the old /.rockbox/vc/Resources/VideoCore/... tree.
        vmcs.bin stays in RAM after the first video (it is re-sent to the BCM for every boot) */
@@ -8532,7 +8598,8 @@ warm_start:                                            /* v99: a kept VideoCore 
     if (bcm_standby)
     {   /* v99: no video: the start-up only, then kept (kp_enter at "out") */
         run_ok = !bcm_dead_seen && !bcm_io_dead() && !bcm_check_dead();
-        BLOG("standby: the VideoCore is up, no application loaded (%s)", run_ok ? "ok" : "not answering");
+        BLOG("standby: the VideoCore is up, no application loaded (%s), clock %u MHz", run_ok ? "ok" : "not answering",
+             run_ok ? bcm_core_mhz() : 0);
         goto out;
     }
     bcm_playback_probe();

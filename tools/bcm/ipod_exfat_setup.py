@@ -50,10 +50,15 @@ start-up if it was installed.
 
 1.8: the cluster size is chosen from the size of the card unless you pick one (--cluster-kb auto, the default):
 up to 300 MB 4 KB, up to 34 GB 32 KB, up to 550 GB 128 KB, up to 2.2 TB 256 KB, up to 4.4 TB 512 KB, above 1 MB.
+
+1.9: no second (type 0xDA) entry for the firmware partition any more.  Windows gave it a drive letter and asked to
+format it ("You need to format the disk in drive E:"); formatting it would have erased the bootloader.  The firmware
+partition is now listed once, as type 0 in the iPod's own units, the way Apple's layout does it.  (bcm overlay v102
+also hides an existing 0xDA entry from the computer in the iPod's USB mode.)
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.8'
+VERSION = '1.9'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -671,7 +676,7 @@ class Ipod:
 # No "hibe" (the ROM would try to resume a hibernation image) and no "aupd".
 
 MODELS = {'5.5g': 2048, '5g': 512}
-PROTECT_TYPE = 0xDA          # "non-FS data": shows the firmware partition to PCs, nothing mounts it
+PROTECT_TYPE = 0xDA          # up to 1.8: a PC-unit copy of the firmware partition (Windows mounts it!): skipped when reading
 PC_LIMIT = 0xffffffff * 512  # a 512-unit partition table ends at 2.2 TB
 FW_START_UNITS = 63                  # where iTunes puts it
 FW_SIZE = 32 << 20
@@ -1558,11 +1563,8 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         pu = 512 if pc else unit
         mbr[0x1ce:0x1de] = struct.pack('<B3sB3sII', 0, b'\xfe\xff\xff', 0x07, b'\xfe\xff\xff',
                                        part_off // pu, part_len // pu)
-        if pc:
-            # the same bytes as the firmware partition, in PC units, as a partition
-            # no PC mounts or offers to format (the ROM ignores this type)
-            mbr[0x1de:0x1ee] = struct.pack('<B3sB3sII', 0, b'\xfe\xff\xff', PROTECT_TYPE, b'\xfe\xff\xff',
-                                           ipod.fw_start // 512, ipod.fw_size // 512)
+        # 1.9: no 0xDA copy of the firmware partition (entries 1-3 were cleared above): Windows mounted it as an
+        # unformatted drive and offered to format it
         disk.write(0, bytes(mbr))
     log('  partition table updated')
     # bootloader: replaces the OS image (Apple OS + old bootloader)

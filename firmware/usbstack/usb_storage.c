@@ -374,7 +374,7 @@ struct ut_ent {
 };
 static struct ut_ent ut[UT_N];
 static int ut_cnt, ut_cur = -1;
-static unsigned ut_lost;
+static unsigned ut_lost, ut_hidden;
 static long ut_t0;
 
 static struct ut_ent *ut_new(int op)
@@ -394,6 +394,26 @@ static struct ut_ent *ut_new(int op)
         ut_lost++;
     restore_irq(old);
     return e;
+}
+
+/* bcm overlay v102: the "You need to format the disk" prompt.  The v101 trace showed Windows mounting the exFAT
+   partition fine and then, again and again, probing sector 252 (the start of the firmware partition) and sector 316
+   (32 KB in: the UDF check) -- i.e. it had made a drive of the firmware partition, found no file system on it and
+   asked to format it.  That partition is in the partition table twice: entry 0 (iPod units, type 0, which Windows
+   skips) and entry 2 (type 0xDA, added by ipod_exfat_setup.py in PC units -- wrongly assumed to be ignored by PCs).
+   The computer is now shown type 0 (unused) for any 0xDA entry, so it gets no drive letter.  Only what is SENT changes;
+   the disk keeps its table, and Rockbox and the bootloader never use entry 2. */
+static void bcm_hide_fw_partition(unsigned char *b)
+{
+    if(b[510] != 0x55 || b[511] != 0xaa)
+        return;
+    for(int k = 0; k < 4; k++) {
+        unsigned char *e = b + 0x1be + 16 * k;
+        if(e[4] == 0xda) {
+            e[4] = 0;
+            ut_hidden++;
+        }
+    }
 }
 
 /* markers: 0 storage connected, 1 storage disconnected, 2 disk handed over, 3 disk taken back, 4 bus reset,
@@ -454,10 +474,11 @@ void usb_storage_trace_save(void)
     rename("/usb_trace.txt", "/usb_trace_prev.txt");
     int fd = open("/usb_trace.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if(fd >= 0) {
-        fdprintf(fd, "bcm overlay v101 USB trace: %d entries (%u not kept), times in ms from the first event\n"
-                     "flags: X = disk handed over, P = medium present, E = ejected, C = media-change pending,"
+        fdprintf(fd, "bcm overlay v102 USB trace: %d entries (%u not kept), times in ms from the first event; "
+                     "firmware partition hidden from the computer %u times\n", n, ut_lost, ut_hidden);
+        fdprintf(fd, "flags: X = disk handed over, P = medium present, E = ejected, C = media-change pending,"
                      " U = 'medium may have changed' sent, mN = sector multiplier\n"
-                     "status: 0 good, 1 failed, - no reply; sense key/asc/ascq when failed\n\n", n, ut_lost);
+                     "status: 0 good, 1 failed, - no reply; sense key/asc/ascq when failed\n\n");
         for(int i = 0; i < n; i++) {
             struct ut_ent *e = &ut[i];
             unsigned ms = e->t * (1000 / HZ);
@@ -494,6 +515,7 @@ void usb_storage_trace_save(void)
     ut_cnt = 0;
     ut_cur = -1;
     ut_lost = 0;
+    ut_hidden = 0;
 }
 #endif
 
@@ -1457,6 +1479,8 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         cur_cmd.data[cur_cmd.data_select]);
 #endif
 #if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                if(cur_cmd.sector == 0)
+                    bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 */
                 if(ut_cur >= 0 && ut[ut_cur].op == SCSI_READ_10) {
                     const unsigned char *b = cur_cmd.data[cur_cmd.data_select];
                     struct ut_ent *e = &ut[ut_cur];
@@ -1519,6 +1543,10 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+#endif
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                if(cur_cmd.sector == 0)
+                    bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 */
 #endif
                 send_and_read_next();
             }
