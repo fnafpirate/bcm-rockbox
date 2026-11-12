@@ -575,85 +575,12 @@ extern bool bcm_video_play(const char *path);      /* apps/debug_menu.c */
 extern bool bcm_video_play_again(const char *path);
 extern bool bcm_video_is_video(const char *path);
 extern int bcm_video_next_request;
-extern bool bcm_tvs_episode, bcm_tvs_stop_after, bcm_video_finished;   /* v74 */
+extern bool bcm_tvs_episode;   /* v74: the dock's next / previous follow episode order in a TV show */
 #include "bcm_tvshow.h"
 #include "font.h"
 #include "action.h"
 #include "backlight.h"
-/* v74: TV series autoplay -- "Up next" with a countdown; true = play it (SELECT / PLAY = now, MENU = stop) */
-static bool ft_tvs_countdown(const char *label)
-{   /* v76: "Play the next episode?  Yes / No" -- the wheel picks, SELECT / >> confirms, PLAY = yes, MENU / << = no;
-       when the countdown (Settings: 5..10 s) runs out the highlighted answer (Yes unless changed) is taken */
-    struct screen *d = &screens[SCREEN_MAIN];
-    int secs = global_settings.bcm_tv_countdown;
-    const int total = (secs < 5 ? 5 : secs > 10 ? 10 : secs) * HZ;
-    long end = current_tick + total;
-    char l1[80], l2[120];
-    int sel = 0;                                         /* 0 = Yes, 1 = No */
-    const char *nl = strchr(label, '\n');
-    if (nl)
-    {
-        snprintf(l1, sizeof l1, "%.*s", (int)(nl - label), label);
-        snprintf(l2, sizeof l2, "%s", nl + 1);
-    }
-    else { snprintf(l1, sizeof l1, "%s", label); l2[0] = 0; }
-    backlight_on();
-    while (1)
-    {
-        long left = end - current_tick;
-        int fh, w, h, y, a, k, bw = d->lcdwidth - 40, btw;
-        char t[64];
-        if (left <= 0) return sel == 0;
-        d->set_viewport(NULL);
-        d->setfont(FONT_UI);
-        d->clear_display();
-        fh = font_get(FONT_UI)->height;
-        y = d->lcdheight / 2 - fh * 4;
-#define FT_CENTER(s) do { d->getstringsize((const unsigned char *)(s), &w, &h); \
-                          d->putsxy((d->lcdwidth - w) / 2 > 0 ? (d->lcdwidth - w) / 2 : 0, y, (const unsigned char *)(s)); y += fh + 2; } while (0)
-        FT_CENTER(str(LANG_TVS_UP_NEXT));
-        y += fh / 2;
-        FT_CENTER(l1);
-        if (l2[0]) FT_CENTER(l2);
-        y += fh / 2;
-        FT_CENTER(str(LANG_TVS_PLAY_NEXT_Q));
-        y += 4;
-        /* the two answers */
-        btw = d->lcdwidth / 3;
-        for (k = 0; k < 2; k++)
-        {
-            const char *s = str(k == 0 ? LANG_SET_BOOL_YES : LANG_SET_BOOL_NO);
-            int bx = d->lcdwidth / 2 + (k == 0 ? -btw - 6 : 6);
-            d->getstringsize((const unsigned char *)s, &w, &h);
-            if (k == sel)
-            {
-                d->fillrect(bx, y, btw, fh + 6);
-                d->set_drawmode(DRMODE_COMPLEMENT);
-                d->putsxy(bx + (btw - w) / 2, y + 3, (const unsigned char *)s);
-                d->set_drawmode(DRMODE_SOLID);
-            }
-            else
-            {
-                d->drawrect(bx, y, btw, fh + 6);
-                d->putsxy(bx + (btw - w) / 2, y + 3, (const unsigned char *)s);
-            }
-        }
-        y += fh + 14;
-        snprintf(t, sizeof t, str(sel == 0 ? LANG_TVS_PLAYING_IN : LANG_TVS_STOPPING_IN), (int)((left + HZ - 1) / HZ));
-        FT_CENTER(t);
-        d->drawrect(20, y, bw, 8);
-        d->fillrect(20, y, (int)((long)bw * (total - left) / total), 8);
-#undef FT_CENTER
-        d->update();
-        a = get_action(CONTEXT_TREE, HZ / 10);
-        if (a == ACTION_STD_NEXT || a == ACTION_STD_PREV || a == ACTION_STD_NEXTREPEAT || a == ACTION_STD_PREVREPEAT)
-            sel = !sel;
-        else if (a == ACTION_STD_OK) return sel == 0;
-        else if (a == ACTION_TREE_WPS) return true;
-        else if (a == ACTION_STD_CANCEL || a == ACTION_STD_MENU) return false;
-        else if (IS_SYSEVENT(a) && default_event_handler(a) == SYS_USB_CONNECTED) return false;
-    }
-}
+/* v104: the next-episode countdown (v74-v103) is removed: a video ends in the browser */
 /* v63: a dock / remote asked for the next (+1) or previous (-1) video: the neighbouring video file of this folder
    (wrapping round), selected in the browser and played; 0 = none */
 static bool ft_video_neighbour(struct tree_context *c, int dir, char *buf, size_t n)
@@ -709,11 +636,10 @@ int ft_enter(struct tree_context* c)
         if (bcm_video_is_video(buf))
         {
             int guard = 0;
-            char first[MAX_PATH], nxt[MAX_PATH], label[160], root[MAX_PATH];
+            char first[MAX_PATH], nxt[MAX_PATH], root[MAX_PATH];
             strlcpy(first, buf, sizeof first);
-            /* v74: an episode of a TV show (".../TV Show/<show>/...") with Settings > Video > Autoplay Next Episode */
-            bcm_tvs_stop_after = false;
-            bcm_tvs_episode = global_settings.bcm_tv_autoplay && tvs_show_root(buf, root, sizeof root, NULL, 0);
+            /* v74: an episode of a TV show (".../TV Show/<show>/..."): the dock's next / previous go in episode order */
+            bcm_tvs_episode = tvs_show_root(buf, root, sizeof root, NULL, 0);
             bcm_video_play(buf);
             while (guard++ < 1000)
             {
@@ -721,12 +647,6 @@ int ft_enter(struct tree_context* c)
                 {   /* v63: the dock's next / previous video -- in episode order for a show */
                     if (bcm_tvs_episode ? !tvs_next(buf, bcm_video_next_request, nxt, sizeof nxt, NULL, 0)
                                         : !ft_video_neighbour(c, bcm_video_next_request, nxt, sizeof nxt))
-                        break;
-                }
-                else if (bcm_tvs_episode && bcm_video_finished && !bcm_tvs_stop_after
-                         && tvs_next(buf, 1, nxt, sizeof nxt, label, sizeof label))
-                {
-                    if (!ft_tvs_countdown(label))
                         break;
                 }
                 else

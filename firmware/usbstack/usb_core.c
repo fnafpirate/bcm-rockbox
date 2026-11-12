@@ -287,9 +287,6 @@ static struct usb_class_driver* drivers[USB_NUM_DRIVERS] =
 };
 
 static int usb_core_do_set_config(uint8_t new_config);
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-extern void usb_storage_trace_mark(int what, uint32_t a, uint32_t d);   /* bcm overlay v101: USB trace */
-#endif
 static void usb_core_control_request_handler(struct usb_ctrlrequest* req, uint8_t* reqdata, size_t reqdata_size);
 
 #define is_active(driver) ((driver)->enabled && !(driver)->error && (driver)->config == usb_config)
@@ -885,9 +882,6 @@ static int usb_core_do_set_config(uint8_t new_config)
         logf("usb_core: invalid config number");
         return -1;
     }
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-    usb_storage_trace_mark(5, new_config, usb_config);
-#endif
 
     /* deactivate old config */
     if(usb_config != 0) {
@@ -1181,9 +1175,6 @@ static void do_bus_reset(void) {
 void usb_core_bus_reset(void)
 {
     logf("usb_core: bus reset");
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-    usb_storage_trace_mark(4, usb_config, 0);
-#endif
     if(bus_reset_pending) {
         return;
     }

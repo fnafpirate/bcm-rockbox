@@ -114,12 +114,6 @@ static long usb_stack[(DEFAULT_STACK_SIZE*4 + DUMP_BMP_LINESIZE + IAP_EXTRA_STAC
 static const char usb_thread_name[] = "usb";
 static unsigned int usb_thread_entry = 0;
 static bool usb_monitor_enabled = false;
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER) && defined(HAVE_USBSTACK)
-extern void usb_storage_trace_mark(int what, uint32_t a, uint32_t d);   /* bcm overlay v101: USB trace */
-#define UT_MARK(w, a, d) usb_storage_trace_mark(w, a, d)
-#else
-#define UT_MARK(w, a, d) do { } while(0)
-#endif
 static bool exclusive_storage_enabled = false;
 static bool exclusive_storage_requested = false;
 static struct event_queue usb_queue SHAREDBSS_ATTR;
@@ -210,7 +204,6 @@ static inline void usb_handle_hotswap(long id)
 
 static inline void usb_configure_drivers(int for_state)
 {
-    UT_MARK(7, for_state == USB_POWERED ? 1 : for_state == USB_INSERTED ? 2 : for_state, 0);
 #ifdef USB_ENABLE_AUDIO
     // FIXME: doesn't seem to get set when loaded at boot...
     usb_audio = global_settings.usb_audio;
@@ -512,10 +505,8 @@ static void NORETURN_ATTR usb_thread(void)
 
             DEBUGF("usb: all threads have acknowledged the connect.\n");
             if(usb_host_present && exclusive_storage_requested) {
-                UT_MARK(6, 0, 0);
                 usb_slave_mode(true);
                 exclusive_storage_enabled = true;
-                UT_MARK(2, 0, 0);
             }
             break;
             /* SYS_USB_CONNECTED_ACK */
@@ -889,7 +880,6 @@ void usb_release_exclusive_storage(void)
     exclusive_storage_requested = false;
 
     if(exclusive_storage_enabled) {
-        UT_MARK(3, 0, 0);
         usb_slave_mode(false);
     }
     exclusive_storage_enabled = false;

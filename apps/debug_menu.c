@@ -4495,7 +4495,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v102 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v104 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4783,17 +4783,19 @@ static void cv_text(struct cv *c, int x, int y, const char *s)
 
 /* ---- windows */
 #define OSD_NS 4
-struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; uint32_t *shadow; uint32_t tvwin; };
+struct osd_strip { int x, y, w, h; uint32_t img[2], addr[2], win[2]; int front; uint32_t *cvp; uint32_t *shadow; uint32_t tvwin;
+                   uint32_t *shadow2; bool valid[2]; };   /* v103: second image + its own record (bottom panel) */
 static uint32_t osd_cv0[48 * 48], osd_cv1[112 * 24], osd_cv2[320 * 52], osd_cv3[96 * 80];
 /* v56: what each VC image holds now -- updates write only the pixels that changed, straight into the visible image */
 static uint32_t osd_sh0[48 * 48], osd_sh1[112 * 24], osd_sh2[320 * 52], osd_sh3[96 * 80];
+static uint32_t osd_sh2b[320 * 52];       /* v103: what the bottom panel's second image holds */
 static struct osd_strip osd_s[OSD_NS] = {
     /* status icon (stock box 33x33 at 15,15).  v47.1: 48x48 -- with a 40-pixel-wide image the icon came out sheared on the iPod:
        VC images evidently want widths in multiples of 16 pixels (the 80 and 320 wide windows were fine) */
-    { 8, 8, 48, 48, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0, osd_sh0, 0 },
-    { 200, 12, 112, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1, osd_sh1, 0 },     /* hold lock, charging bolt, battery %, top right (v50: 112 wide) */
-    { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2, osd_sh2, 0 },      /* stock bottom panel (y 192, h 43) */
-    { 112, 78, 96, 80, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv3, osd_sh3, 0 },     /* v55: TV pictogram in the middle of the LCD while the video is on the TV */
+    { 8, 8, 48, 48, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv0, osd_sh0, 0, NULL, { false, false } },
+    { 200, 12, 112, 24, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv1, osd_sh1, 0, NULL, { false, false } },     /* hold lock, charging bolt, battery %, top right (v50: 112 wide) */
+    { 0, 188, 320, 52, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv2, osd_sh2, 0, osd_sh2b, { false, false } },   /* stock bottom panel (y 192, h 43) */
+    { 112, 78, 96, 80, { 0, 0 }, { 0, 0 }, { 0, 0 }, -1, osd_cv3, osd_sh3, 0, NULL, { false, false } },     /* v55: TV pictogram in the middle of the LCD while the video is on the TV */
 };
 static int osd_ok = -1, osd_type = 15;
 static bool osd_visible, pl_paused;
@@ -5000,12 +5002,12 @@ static void osd_tv_xy(const struct osd_strip *s, int *x, int *y)
     if (*x < 0) *x = 0;
     if (*y < 0) *y = 0;
 }
-static void osd_write_span(struct osd_strip *s, int y, int x0, int x1)
+static void osd_write_span(struct osd_strip *s, int bi, int y, int x0, int x1)
 {
     const uint32_t *row = s->cvp + y * s->w;
     if (osd_type == 15)
     {
-        bcm_io_lock(); bcm_io_write(s->addr[0] + ((unsigned)y * s->w + x0) * 4, row + x0, (unsigned)(x1 - x0 + 1) * 4); bcm_io_unlock();
+        bcm_io_lock(); bcm_io_write(s->addr[bi] + ((unsigned)y * s->w + x0) * 4, row + x0, (unsigned)(x1 - x0 + 1) * 4); bcm_io_unlock();
     }
     else
     {   /* RGB565 fallback: composite over a dark panel colour; 32-bit aligned spans */
@@ -5017,18 +5019,20 @@ static void osd_write_span(struct osd_strip *s, int y, int x0, int x1)
                      g = ((p >> 8) & 255) * a / 255 + 20 * (255 - a) / 255, b = (p & 255) * a / 255 + 24 * (255 - a) / 255;
             osd_row[x - x0] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
         }
-        bcm_io_lock(); bcm_io_write(s->addr[0] + ((unsigned)y * s->w + x0) * 2, osd_row, (unsigned)(x1 - x0 + 1) * 2); bcm_io_unlock();
+        bcm_io_lock(); bcm_io_write(s->addr[bi] + ((unsigned)y * s->w + x0) * 2, osd_row, (unsigned)(x1 - x0 + 1) * 2); bcm_io_unlock();
     }
     osd_bytes += (unsigned)(x1 - x0 + 1) * (osd_type == 15 ? 4 : 2);
 }
-/* full = whole image (it is not on screen yet) */
-static void osd_update(struct osd_strip *s, bool full)
+/* full = whole image (it is not on screen yet); bi = which of the strip's images (1 only for the bottom panel) */
+static void osd_update(struct osd_strip *s, int bi, bool full)
 {
     int y;
+    if (!s->valid[bi]) full = true;                   /* v103: its record does not match the image yet */
+    s->valid[bi] = true;
     for (y = 0; y < s->h; y++)
     {
         const uint32_t *a = s->cvp + y * s->w;
-        uint32_t *b = s->shadow + y * s->w;
+        uint32_t *b = (bi ? s->shadow2 : s->shadow) + y * s->w;
         int x0 = 0, x1 = s->w - 1;
         if (!full)
         {
@@ -5036,7 +5040,7 @@ static void osd_update(struct osd_strip *s, bool full)
             if (x0 == s->w) continue;
             while (a[x1] == b[x1]) x1--;
         }
-        osd_write_span(s, y, x0, x1);
+        osd_write_span(s, bi, y, x0, x1);
         memcpy(b + x0, a + x0, (size_t)(x1 - x0 + 1) * 4);
         if (full && (y & 15) == 15) bcm_host_service();
     }
@@ -5055,18 +5059,41 @@ static void osd_present_mask(int mask)
     {
         struct osd_strip *s = &osd_s[k];
         if (!(mask & (1 << k))) continue;
-        osd_update(s, !s->win[0] && !s->tvwin);
+        if (s->front < 0) s->front = 0;
+        if (s->win[0] && !s->tvwin && s->img[1] && !bcm_tv)
+            osd_update(s, s->front ^ 1, false);        /* v103: into the hidden image, swapped in below */
+        else
+            osd_update(s, s->front, !s->win[0] && !s->tvwin);
     }
     for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
         bool tv = osd_tv_want(k) && ((mask & (1 << k)) || s->win[0]);
         if (!(mask & (1 << k)) && !(s->tvwin && !tv)) continue;
+        if ((mask & (1 << k)) && s->win[0] && !s->tvwin && s->img[1] && !bcm_tv)
+        {   /* v103: the bottom panel changed while on screen (time while FF / REW, volume): its other image now holds the
+               new picture -- put that up and take the old one down in the same update.  Before, the digits were written
+               into the image on screen, and the VideoCore could show the half-written numbers until the next picture
+               (your "numbers mixing" while scrubbing) */
+            int nb = s->front ^ 1;
+            if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
+            memset(pl, 0, sizeof pl);
+            pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[nb];
+            ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
+            if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0)
+            {
+                uint32_t nw = o[0] ? o[0] : 0xffffffffu;
+                memset(w4, 0, sizeof w4); w4[0] = s->win[0] == 0xffffffffu ? 0 : s->win[0]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+                s->win[0] = nw; s->front = nb;
+            }
+            else s->valid[nb] = false;                 /* not shown: write it whole next time */
+            continue;
+        }
         if ((mask & (1 << k)) && !s->win[0])
         {
             if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
             memset(pl, 0, sizeof pl);
-            pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[0];
+            pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[s->front < 0 ? 0 : s->front];
             ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
             if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->win[0] = o[0] ? o[0] : 0xffffffffu;   /* (0 is a valid handle) */
             adds++;
@@ -5077,7 +5104,7 @@ static void osd_present_mask(int mask)
             if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
             osd_tv_xy(s, &tx, &ty);
             memset(pl, 0, sizeof pl);
-            pl[0] = 2; pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[0];
+            pl[0] = 2; pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[s->front < 0 ? 0 : s->front];
             ((uint16_t *)pl)[8] = (uint16_t)tx; ((uint16_t *)pl)[9] = (uint16_t)ty; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
             if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0) s->tvwin = o[0] ? o[0] : 0xffffffffu;
             adds++;
@@ -5087,7 +5114,7 @@ static void osd_present_mask(int mask)
             if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
             memset(w4, 0, sizeof w4); w4[0] = s->tvwin == 0xffffffffu ? 0 : s->tvwin; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->tvwin = 0;
         }
-        s->front = 0;
+        if (s->front < 0) s->front = 0;
     }
     if (open) bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = true;
@@ -5124,9 +5151,12 @@ static void osd_init(void)
         for (k = 0; k < OSD_NS && ok; k++)
             ok = osd_alloc(1, osd_s[k].w, osd_s[k].h, &osd_s[k].img[0], &osd_s[k].addr[0]) == 0;
     }
+    for (k = 0; k < OSD_NS; k++) { osd_s[k].valid[0] = osd_s[k].valid[1] = false; osd_s[k].img[1] = osd_s[k].addr[1] = 0; }
+    if (ok && osd_alloc(osd_type, osd_s[2].w, osd_s[2].h, &osd_s[2].img[1], &osd_s[2].addr[1]) != 0)
+        osd_s[2].img[1] = osd_s[2].addr[1] = 0;        /* v103: no second image: written in place as before */
     osd_ok = ok;
-    BLOG("  OSD: %d strips, VC image type %d (%s), layer %d -> %s", OSD_NS, osd_type, osd_type == 15 ? "ARGB, drawn over the video" : "RGB565",
-         cfg_osd_layer, ok ? "ok" : "FAILED");
+    BLOG("  OSD: %d strips, VC image type %d (%s), layer %d -> %s%s", OSD_NS, osd_type, osd_type == 15 ? "ARGB, drawn over the video" : "RGB565",
+         cfg_osd_layer, ok ? "ok" : "FAILED", osd_s[2].img[1] ? ", bottom panel double-buffered" : "");
 }
 static void osd_show_for(int ms)
 {
@@ -6337,7 +6367,7 @@ static void bcm_out_switch(void);         /* v78 */
 int bcm_video_next_request;              /* read by apps/filetree.c: +1 / -1 = play the next / previous video */
 /* v74: TV series (apps/filetree.c): this video is an episode with autoplay on; "stop after this episode" (hold PLAY);
    the last video played to its end (not stopped) */
-bool bcm_tvs_episode, bcm_tvs_stop_after, bcm_video_finished;
+bool bcm_tvs_episode, bcm_video_finished;
 bool bcm_video_active(void) { return bcm_video_running; }
 int bcm_video_remote(int cmd, int arg)
 {
@@ -6546,22 +6576,6 @@ static int bcm_player_input(char *resp, size_t rn)
             if (!st_sel_done) { if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000); }
         }
         else if (!st_sel_done && current_tick - st_sel_t0 >= HZ * 6 / 10) { st_sel_done = true; st_cycle(); }
-        return 0;
-    }
-    if (base == BUTTON_PLAY && bcm_tvs_episode)
-    {   /* v74: a TV episode with autoplay: a short press = pause (on release), held 0.8 s = stop after this episode on/off */
-        static bool down, done;
-        static long t0;
-        if (!(b & (BUTTON_REL | BUTTON_REPEAT))) { down = true; done = false; t0 = current_tick; return 0; }
-        if (!down) return 0;
-        if (b & BUTTON_REL) { down = false; if (!done) pl_set_paused(!pl_paused, resp, rn); }
-        else if (!done && current_tick - t0 >= HZ * 8 / 10)
-        {
-            done = true;
-            bcm_tvs_stop_after = !bcm_tvs_stop_after;
-            st_toast(str(bcm_tvs_stop_after ? LANG_TVS_STOP_AFTER : LANG_TVS_PLAY_NEXT));
-            BLOG("  TV show: %s", bcm_tvs_stop_after ? "stop after this episode" : "the next episode follows");
-        }
         return 0;
     }
     if (base == BUTTON_MENU)
@@ -7060,8 +7074,10 @@ static void bcm_video_run(int secs)
                 break;
             }
         }
-        /* v102: a warm start is checked at 14 s, not 7: the v101 warm start began to play at 6.8 s and was restarted at 7 */
-        if (v_sound == 2 && !av_checked && current_tick - run_t0 > (bcm_warm_run && !rc_n ? 14 : cfg_av_stall) * HZ
+        /* v102: a warm start is checked at 14 s, not 7: the v101 warm start began to play at 6.8 s and was restarted at 7.
+           v104: every start: the v102 log shows a cold start (second video in a row) that also began at 6.7 s, was
+           "restarted with Rockbox's sound" at 7 s, and that restart never played */
+        if (v_sound == 2 && !av_checked && current_tick - run_t0 > (cfg_av_stall > 14 ? cfg_av_stall : 14) * HZ
             && !pl_paused && !sc_active)
         {   /* v53: does the stock route run?  The VC's clock follows its sound output: no sound output = no clock = no picture */
             uint32_t e = av_vc_elapsed();
@@ -7867,6 +7883,25 @@ again:
             v_fallback = false; v_sound = 1;
             bcm_cmd_t0 = current_tick; r = bcm_gencmd_watched("mp_stop", resp, sizeof resp, 3); bcm_log_text("mp_stop", r, resp);
             for (t = current_tick + HZ / 2; TIME_BEFORE(current_tick, t); ) { bcm_host_service(); yield(); }
+            {   /* v104: the v102 log: mp_selectplay right after mp_stop answered "busy" (substate=stopping) and the
+                   restart then waited for frames that never came, until MENU.  Wait up to 4 s for the stop to finish;
+                   a VideoCore that stays "stopping" is rebooted instead (recovery, from the start) */
+                long end = current_tick + 4 * HZ;
+                bool stopped = false;
+                while (TIME_BEFORE(current_tick, end))
+                {
+                    bcm_cmd_t0 = current_tick;
+                    if (bcm_gencmd_watched("mp_get_status", resp, sizeof resp, 2) >= 0 && !strstr(resp, "substate=stopping"))
+                    { stopped = true; break; }
+                    for (t = current_tick + HZ / 10; TIME_BEFORE(current_tick, t); ) { bcm_host_service(); yield(); }
+                }
+                if (!stopped)
+                {
+                    rc_arm("the VideoCore did not finish stopping for the restart");
+                    rc_pos = 0;
+                    if (rc_want) { st_end(); m4_close(); bcm_tv_dac = false; return; }
+                }
+            }
             m4_rewind(); m4.need_ps = true;
             v_stop = false; v_eos = 0; v_eos_tick = 0; v_frames = v_bytes = v_getframes = v_empty = v_seeks = v_skips = 0;
             pl_paused = false; tf_dir = 0;
@@ -8369,7 +8404,7 @@ static bool bcm_run(const char *play_path)
     if ((bcm_standby || warm) && bcm_log_fd >= 0)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
-    BLOG("bcm host test v102, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v104, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
