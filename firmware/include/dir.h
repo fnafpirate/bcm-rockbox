@@ -84,7 +84,7 @@ struct DIRENT
 struct dirinfo
 {
     unsigned int attribute; /* attribute bits of file */
-    file_size_t  size;      /* binary size of file (uint64_t with exFAT) */
+    off_t        size;      /* binary size of file */
     time_t       mtime;     /* local file time */
 };
 

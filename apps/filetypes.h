@@ -48,9 +48,6 @@
 #define FILE_ATTR_RFMS  0x1300 /* FM screen skin file */
 #define FILE_ATTR_OPX   0x1400 /* open plugins shortcut */
 #define FILE_ATTR_LOG   0x1500 /* log file */
-#ifdef HAVE_BCM_VIDEOCORE
-#define FILE_ATTR_VIDEO 0x1600 /* BCM hardware video file (.mp4/.m4v/.mov) */
-#endif
 #define FILE_ATTR_MASK  0xFF00 /* which bits tree.c uses for file types */
 
 long tree_get_filetype_voiceclip(int attr);

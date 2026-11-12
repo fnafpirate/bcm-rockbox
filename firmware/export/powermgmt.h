@@ -181,14 +181,6 @@ void battery_read_info(int *voltage, int *level);
 /* Tells if the battery level is safe for disk writes */
 bool battery_level_safe(void);
 
-#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
-/* bcm-rockbox: Apple ADC ch3 battery functions */
-int  ipod_batt_voltage_apple(void);        /* smoothed OCV in mV         */
-void ipod_batt_select_table(char table_id);/* 'A'..'F' calibration table */
-void ipod_batt_set_r_int(unsigned int r);  /* internal resistance in mΩ  */
-void ipod_batt_set_smooth_mode(int mode);  /* 0=smooth 1=balanced 2=exact */
-#endif
-
 void set_poweroff_timeout(int timeout);
 #if BATTERY_CAPACITY_INC > 0
 void set_battery_capacity(int capacity); /* set local battery capacity value */

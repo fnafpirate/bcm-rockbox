@@ -36,9 +36,6 @@
 #include "voice_thread.h"
 #include "talk.h"
 #include "settings.h"
-#ifdef HAVE_BCM_VIDEOCORE
-#include "bcm_host.h"
-#endif
 
 /* Macros to enable logf for queues
    logging on SYS_TIMEOUT can be disabled */
@@ -108,10 +105,6 @@ static void NORETURN_ATTR audio_thread(void)
         /* All return upon USB */
         case SYS_USB_CONNECTED:
             LOGFQUEUE("audio < SYS_USB_CONNECTED");
-#ifdef HAVE_BCM_VIDEOCORE
-            if (bcm_is_active())
-                bcm_video_quiz_stop();
-#endif
             voice_stop();
             usb_acknowledge(SYS_USB_CONNECTED_ACK, ev.data);
             usb_wait_for_disconnect(&audio_queue);

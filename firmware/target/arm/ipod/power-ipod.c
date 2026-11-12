@@ -31,9 +31,6 @@
 #ifdef HAVE_USB_CHARGING_ENABLE
 #include "usb_core.h"   /* for usb_charging_maxcurrent_change */
 #endif
-#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
-#include "powermgmt.h"  /* ipod_batt_* declarations */
-#endif
 
 void power_init(void)
 {
@@ -44,13 +41,6 @@ void power_init(void)
 #endif
 #ifndef IPOD_1G2G
     pcf50605_init();
-#endif
-#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
-    /* bcm-rockbox: Apple battery ADC defaults (overridden from settings later).
-     * Table E and r_int 150 mΩ are conservative safe defaults for a 5.5G cell. */
-    ipod_batt_select_table('E');
-    ipod_batt_set_r_int(150);
-    ipod_batt_set_smooth_mode(1); /* BATT_BALANCED */
 #endif
 }
 

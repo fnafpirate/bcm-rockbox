@@ -92,9 +92,7 @@ static const struct button_mapping button_context_wps[]  = {
     { ACTION_WPS_HOTKEY,        BUTTON_SELECT|BUTTON_PLAY,      BUTTON_NONE },
     { ACTION_WPS_MENU,          BUTTON_MENU|BUTTON_REL,         BUTTON_MENU },
     { ACTION_WPS_QUICKSCREEN,   BUTTON_MENU|BUTTON_REPEAT,      BUTTON_MENU },
-#ifdef HAVE_BCM_VIDEOCORE
-    { ACTION_WPS_VIEW_PLUGIN,   BUTTON_MENU|BUTTON_PLAY,        BUTTON_NONE },
-#endif
+
     LAST_ITEM_IN_LIST,
 }; /* button_context_wps */
 

@@ -123,11 +123,8 @@
 #include "m5636.h"
 #endif
 
-#if defined(HAVE_HARDWARE_CLICK) || defined(HAVE_BCM_VIDEOCORE)
+#ifdef HAVE_HARDWARE_CLICK
 #include "piezo.h"
-#endif
-#ifdef HAVE_BCM_VIDEOCORE
-#include "bcm_host.h"
 #endif
 
 #if (CONFIG_PLATFORM & PLATFORM_NATIVE)
@@ -797,11 +794,6 @@ static void init(void)
 #endif
 #ifdef IPOD_ACCESSORY_PROTOCOL
     iap_setup(global_settings.serial_bitrate);
-#endif
-#ifdef HAVE_BCM_VIDEOCORE
-    bcm_host_init();
-    if (global_settings.bcm_pcm_speaker)
-        piezo_register_pcm_sink();
 #endif
 #ifdef HAVE_ACCESSORY_SUPPLY
     accessory_supply_set(global_settings.accessory_supply);

@@ -2695,60 +2695,6 @@ const struct settings_list settings[] = {
 #if defined(HAVE_GENERAL_PURPOSE_LED)
     OFFON_SETTING(0, use_led_indicators, LANG_USE_LED_INDICATORS, false, "LED indicators", NULL),
 #endif
-
-    /* ---- bcm-rockbox v94 settings ---- */
-#ifdef HAVE_BCM_VIDEOCORE
-    INT_SETTING(0, bcm_video_brightness, LANG_BRIGHTNESS, 50,
-                "bcm video brightness", UNIT_INT, 0, 100, 1,
-                NULL, NULL, NULL),
-    INT_SETTING(0, bcm_video_contrast, LANG_CONTRAST, 50,
-                "bcm video contrast", UNIT_INT, 0, 100, 1,
-                NULL, NULL, NULL),
-    INT_SETTING(0, bcm_video_saturation, LANG_SETTINGS, 50,
-                "bcm video saturation", UNIT_INT, 0, 100, 1,
-                NULL, NULL, NULL),
-    INT_SETTING(0, bcm_video_tint, LANG_SETTINGS, 0,
-                "bcm video tint", UNIT_INT, -50, 50, 1,
-                NULL, NULL, NULL),
-    OFFON_SETTING(0, bcm_video_tvout, LANG_SETTINGS, false,
-                  "bcm video tvout", NULL),
-    OFFON_SETTING(0, bcm_video_subtitles, LANG_SETTINGS, true,
-                  "bcm video subtitles", NULL),
-    CHOICE_SETTING(0, bcm_video_aspect, LANG_SETTINGS, 0,
-                   "bcm video aspect", "original,fullscreen,4:3,16:9",
-                   NULL, 4,
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS),
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS)),
-    CHOICE_SETTING(0, bcm_video_deinterlace, LANG_SETTINGS, 1,
-                   "bcm video deinterlace", "off,auto,forced",
-                   NULL, 3,
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS),
-                   ID2P(LANG_SETTINGS)),
-    INT_SETTING(0, bcm_video_skip_seconds, LANG_SETTINGS, 10,
-                "bcm video skip seconds", UNIT_SEC, 1, 60, 1,
-                NULL, NULL, NULL),
-    OFFON_SETTING(0, bcm_video_resume, LANG_SETTINGS, true,
-                  "bcm video resume", NULL),
-    OFFON_SETTING(0, bcm_pcm_speaker, LANG_SETTINGS, false,
-                  "bcm pcm speaker", NULL),
-#endif /* HAVE_BCM_VIDEOCORE */
-
-#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
-    CHOICE_SETTING(0, batt_smooth_mode, LANG_SETTINGS, 1,
-                   "battery smooth mode", "smooth,balanced,exact",
-                   NULL, 3,
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS),
-                   ID2P(LANG_SETTINGS)),
-    INT_SETTING(0, batt_r_int_mohm, LANG_SETTINGS, 120,
-                "battery r int mohm", UNIT_INT, 0, 400, 5,
-                NULL, NULL, NULL),
-    CHOICE_SETTING(0, batt_table_id, LANG_SETTINGS, 0,
-                   "battery table", "A,B,C,D,E,F",
-                   NULL, 6,
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS),
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS),
-                   ID2P(LANG_SETTINGS), ID2P(LANG_SETTINGS)),
-#endif /* IPOD_VIDEO && ADC_APPLE_BATT */
 };
 
 const int nb_settings = sizeof(settings)/sizeof(*settings);

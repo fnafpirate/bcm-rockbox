@@ -80,12 +80,6 @@ iap/iap-lingo4.c
 iap/iap-lingo7.c
 #endif
 #endif
-#ifdef HAVE_BCM_VIDEOCORE
-bcm_tvshow.c
-bcm_subs.c
-bcm_piezo.c
-bcm_piezo_voice_data.c
-#endif /* HAVE_BCM_VIDEOCORE */
 screen_access.c
 gui/icon.c
 gui/list.c

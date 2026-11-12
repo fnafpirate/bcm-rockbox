@@ -98,11 +98,6 @@ static bool ata_led_on = false;
 
 static long sleep_timeout = 5*HZ;
 
-#ifdef HAVE_BCM_VIDEOCORE
-/* bcm-rockbox: inhibit flag set during H.264 playback to suppress ATA spinup */
-static volatile bool bcm_spinup_inhibit = false;
-#endif
-
 static long last_disk_activity = -1;
 #ifdef HAVE_ATA_POWER_OFF
 static long power_off_tick = 0;
@@ -708,21 +703,8 @@ void ata_sleepnow(void)
 
 void ata_spin(void)
 {
-#ifdef HAVE_BCM_VIDEOCORE
-    if (bcm_spinup_inhibit)
-        return; /* silently drop spinup during H.264 video playback */
-#endif
     keep_ata_active();
 }
-
-#ifdef HAVE_BCM_VIDEOCORE
-/* bcm-rockbox: set by bcm_video_quiz_start/stop to suppress ATA spinup
- * interference during H.264 decode (disk seek noise → audio glitch). */
-void ata_set_bcm_spinup_inhibit(bool inhibit)
-{
-    bcm_spinup_inhibit = inhibit;
-}
-#endif
 
 /* Hardware reset protocol as specified in chapter 9.1, ATA spec draft v5 */
 #ifdef HAVE_ATA_POWER_OFF

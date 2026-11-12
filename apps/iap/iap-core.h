@@ -284,39 +284,4 @@ uint32_t iap_get_trackpos(void);
 uint32_t iap_get_trackindex(void);
 void iap_get_trackinfo(const unsigned int track, struct mp3entry* id3);
 
-/* ---- bcm-rockbox v94: dock connector / Apple identity extensions ---- */
-
-/* Apple device identity returned by GetAccessoryInfo type 0x05 */
-struct iap_apple_id {
-    uint32_t vendor_id;      /* 0x05AC for Apple */
-    uint32_t product_id;     /* e.g. 0x1209 iPod 5G */
-    char     serial[32];     /* null-terminated serial number */
-    char     firmware[16];   /* firmware version string */
-    char     hardware[16];   /* hardware version string */
-    char     model[32];      /* model identifier string */
-};
-
-/* Dock connector physical state */
-enum dock_state {
-    DOCK_ABSENT  = 0,  /* Nothing connected */
-    DOCK_PRESENT = 1,  /* Dock connector powered, IAP not yet negotiated */
-    DOCK_IAP     = 2,  /* IAP protocol active */
-    DOCK_CHARGING = 3, /* Charge-only (no data) */
-};
-
-extern enum dock_state iap_dock_state;
-extern struct iap_apple_id iap_apple_id;
-
-/* Retrieve current dock state; updated by iap-lingo0.c */
-enum dock_state iap_get_dock_state(void);
-
-/* Populate iap_apple_id from the last GetAccessoryInfo exchange */
-void iap_update_apple_id(void);
-
-/* Returns true if an Apple accessory with IAP support is connected */
-bool iap_accessory_connected(void);
-
-/* Send the Apple FireWire authentication identity packet (lingo 0x00) */
-void iap_send_identity(void);
-
 #endif

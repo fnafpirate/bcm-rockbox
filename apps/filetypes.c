@@ -81,11 +81,6 @@ static const struct filetype_inbuilt inbuilt_filetypes[] = {
     { "fmr",  FILE_ATTR_FMR },
     { "fms",  FILE_ATTR_FMS },
 #endif
-#ifdef HAVE_BCM_VIDEOCORE
-    { "mp4",  FILE_ATTR_VIDEO },
-    { "m4v",  FILE_ATTR_VIDEO },
-    { "mov",  FILE_ATTR_VIDEO },
-#endif
     { "log",  FILE_ATTR_LOG   },
     { "lng",  FILE_ATTR_LNG   },
     { "rock", FILE_ATTR_ROCK  },

@@ -529,17 +529,6 @@ void usb_storage_disconnect(void)
 #ifndef USB_STATIC_ALLOC
     usb_handle = core_free(usb_handle);
 #endif
-
-    /* bcm-rockbox v93: USB hand-over fix.
-     * After a USB session ends the iPod's data partition is typically
-     * unmounted.  The BCM VideoCore retains a reference to the FAT
-     * cache, so a silent remount is needed before we resume playback.
-     * We trigger a disk mount broadcast so that the main thread picks
-     * it up and remounts; fat_mount() will re-detect exFAT vs FAT32. */
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-    /* Kick a disk-detect cycle so the data volume gets remounted after USB */
-    queue_broadcast(SYS_HOTSWAP_INSERTED, 0);
-#endif
 }
 
 /* called by usb_core_transfer_complete() */

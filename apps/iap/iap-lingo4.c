@@ -25,9 +25,6 @@
 #include "wps.h"
 #include "playback.h"
 #include "string-extra.h"
-#ifdef HAVE_BCM_VIDEOCORE
-#include "bcm_host.h"
-#endif
 
 /*
  * This macro is meant to be used inside an IAP mode message handler.
@@ -629,13 +626,8 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
                         case 0x00:
                         {
                             /* Track Capabilities 10Bytes Data */
-                            uint32_t caps = 0;
-#ifdef HAVE_BCM_VIDEOCORE
-                            /* Bit 7: contains video; Bit 8: play as video */
-                            if (bcm_is_active())
-                                caps |= (1UL << 7) | (1UL << 8);
-#endif
-                            IAP_TX_PUT_U32(caps);
+                            IAP_TX_PUT_U32(0);   /* Track Capabilities. */
+                                                 /* Currently None Supported*/
                             IAP_TX_PUT_U32(id3->length); /* Track Length */
                             IAP_TX_PUT_U16(0x00);        /* Chapter Count */
                             break;

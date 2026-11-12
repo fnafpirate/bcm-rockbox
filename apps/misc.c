@@ -106,11 +106,8 @@
 #include "core_alloc.h" /*core_load_bmp()*/
 #endif
 
-#if defined(HAVE_HARDWARE_CLICK) || defined(HAVE_BCM_VIDEOCORE)
+#ifdef HAVE_HARDWARE_CLICK
 #include "piezo.h"
-#endif
-#ifdef HAVE_BCM_VIDEOCORE
-#include "bcm_host.h"
 #endif
 
 /* units used with output_dyn_value */
@@ -675,11 +672,6 @@ long default_event_handler_ex(long event, void (*callback)(void *), void *parame
             intptr_t seqnum = button_get_data();
             if (callback != NULL)
                 callback(parameter);
-#ifdef HAVE_BCM_VIDEOCORE
-            /* Stop BCM video before handing the bus to the host */
-            if (bcm_is_active())
-                bcm_video_quiz_stop();
-#endif
             system_flush();
 #ifdef BOOTFILE
 #if !defined(USB_NONE) && !defined(USB_HANDLED_BY_OF)
@@ -693,11 +685,6 @@ long default_event_handler_ex(long event, void (*callback)(void *), void *parame
 #endif
 #endif
             system_restore();
-#ifdef HAVE_BCM_VIDEOCORE
-            /* Re-register PCM speaker sink if it was active before USB */
-            if (global_settings.bcm_pcm_speaker)
-                piezo_register_pcm_sink();
-#endif
             return SYS_USB_CONNECTED;
         }
 

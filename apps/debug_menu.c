@@ -152,16 +152,6 @@
 #include <sys/sysinfo.h>
 #endif
 
-#ifdef HAVE_BCM_VIDEOCORE
-#include "bcm_host.h"
-#include "piezo.h"
-#include "fat.h"
-#ifndef ROCKBOX_DIR
-#include "rbpaths.h"
-#endif
-#include <string.h>
-#endif
-
 #define SCREEN_MAX_CHARS (LCD_WIDTH / SYSFONT_WIDTH)
 
 static const char* threads_getname(int selected_item, void *data,
@@ -4305,25 +4295,6 @@ static void bcm_vc_dump(const char *tag, uint32_t start, uint32_t len)
     BLOG("dump %s: VC 0x%08x..0x%08x -> %s (%u ms)", tag, (unsigned)start, (unsigned)a, path, (unsigned)((current_tick - t0) * 1000 / HZ));
 }
 
-/* v32: where is the rest of VC memory?  Read single words at candidate bases (aliases first; an unmapped read may time out and
-   kill the bus, so this runs at the very end of the run).  VC[0x200] is compared with the aliases. */
-static void bcm_map_probe(void)
-{
-    static const uint32_t cand[] = { 0x00000200, 0xFE000200, 0xC0000200, 0x80000200, 0x40000200, 0x013FFFFC, 0x00200000, 0x003FFFFC, 0x00400000, 0x007FFFFC, 0x00800000 };
-    unsigned i;
-    if (!cfg_dump || 1) return;   /* v33: map known (SDRAM at 0xC0000000, mirrored every 2 MB below) */
-    BLOG("---- VC address map probe");
-    for (i = 0; i < sizeof cand / sizeof cand[0]; i++)
-    {
-        uint32_t w = 0;
-        BLOG("  reading VC 0x%08x ...", (unsigned)cand[i]);
-        bcm_io_lock(); bcm_io_read(cand[i], &w, 4); bcm_io_unlock();
-        if (bcm_io_dead()) { BLOG("  bus died on that read -- stop"); break; }
-        BLOG("  VC[0x%08x] = %08x", (unsigned)cand[i], (unsigned)w);
-    }
-    BLOG("---- end of map probe");
-}
-
 /* v32: display_control power/model is all the stock ARM code ever sends, but vmcs.bin also registers vmcs_display_clear and
    vmcs_display_enable (never sent by the stock ARM image).  Variants 1/2 try them. */
 static void bcm_vde(void)
@@ -4432,7 +4403,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v93 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v95 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6916,7 +6887,6 @@ static void bcm_video_run(int secs)
     powermgmt_set_load_hint(3, false);
 #endif
     backlight_set_on_button_hold(global_settings.backlight_on_button_hold);
-    bcm_map_probe();
 }
 
 /* v17: the stock firmware sends "pm_set_policy min" (rt 0x1b013c, called from the mp_selectplay builder at rt 0x1fa3f0
@@ -7658,7 +7628,7 @@ static bool bcm_run(const char *play_path)
     bcm_reset_run_state();
     bcm_log_open();
     bcm_t_start = current_tick;
-    BLOG("bcm host test v93, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v95, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -7795,7 +7765,6 @@ static bool bcm_run(const char *play_path)
                  (unsigned)dg->rx_start[i], (unsigned)dg->rx_end[i]);
     if (dg->w1fc)
         bcm_dump("host-interface block (VC[1FC])", dg->w1fc, 64);
-    bcm_dump("VC[0x200] (address used by the QEMU model)", 0x200, 64);
     if (r != 0)
         goto out;
 
@@ -8108,388 +8077,6 @@ static bool dbg_flash_dump(void)
 #endif
 
 /****** The menu *********/
-/*---------------------------------------------------------------------------
- * BCM VideoCore II debug / feature-test functions
- *--------------------------------------------------------------------------*/
-#ifdef HAVE_BCM_VIDEOCORE
-
-/* Log file path - written to /.rockbox/log.txt on the iPod */
-#define BCM_LOG_PATH  ROCKBOX_DIR "/log.txt"
-
-/* Maximum log lines kept in memory for the feature-test screen */
-#define BCM_LOG_LINES 64
-#define BCM_LOG_WIDTH 72
-
-static char bcm_log[BCM_LOG_LINES][BCM_LOG_WIDTH];
-static int  bcm_log_count = 0;
-
-static void bcm_log_clear(void)
-{
-    bcm_log_count = 0;
-    memset(bcm_log, 0, sizeof(bcm_log));
-}
-
-/* Add a formatted line to the in-memory log ring */
-static void bcm_log_add(const char *fmt, ...)
-{
-    if (bcm_log_count >= BCM_LOG_LINES)
-    {
-        /* Scroll: drop the first line and shift everything up */
-        memmove(bcm_log[0], bcm_log[1],
-                sizeof(bcm_log[0]) * (BCM_LOG_LINES - 1));
-        bcm_log_count = BCM_LOG_LINES - 1;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(bcm_log[bcm_log_count], BCM_LOG_WIDTH, fmt, ap);
-    va_end(ap);
-    bcm_log_count++;
-}
-
-/* Build a timestamp prefix "YYYY-MM-DD HH:MM:SS " using the RTC ---------- */
-static void bcm_log_timestamp(char *buf, size_t bufsz)
-{
-#if CONFIG_RTC
-    struct tm *t = get_time();
-    if (t)
-    {
-        snprintf(buf, bufsz, "%04d-%02d-%02d %02d:%02d:%02d ",
-                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                 t->tm_hour, t->tm_min, t->tm_sec);
-        return;
-    }
-#endif
-    snprintf(buf, bufsz, "                    "); /* 20-char blank */
-}
-
-/*
- * Flush the in-memory log to BCM_LOG_PATH.
- * mode: O_TRUNC to start fresh, O_APPEND to add to an existing file.
- */
-static bool bcm_log_flush(int open_flags)
-{
-    int fd = open(BCM_LOG_PATH, O_WRONLY | O_CREAT | open_flags, 0644);
-    if (fd < 0)
-        return false;
-    for (int i = 0; i < bcm_log_count; i++)
-    {
-        write(fd, bcm_log[i], strlen(bcm_log[i]));
-        write(fd, "\n", 1);
-    }
-    close(fd);
-    return true;
-}
-
-/* Render the scrollable log list ----------------------------------------- */
-static const char *bcm_log_getname(int selected_item, void *data,
-                                    char *buffer, size_t buffer_len)
-{
-    (void)data;
-    if (selected_item < bcm_log_count)
-    {
-        strlcpy(buffer, bcm_log[selected_item], buffer_len);
-        return buffer;
-    }
-    return "";
-}
-
-static void bcm_show_log(void)
-{
-    struct simplelist_info info;
-    simplelist_info_init(&info, "BCM Test Log", bcm_log_count, NULL);
-    info.get_name = bcm_log_getname;
-    simplelist_show_list(&info);
-}
-
-/* -------------------------------------------------------------------------
- * Individual feature tests
- * Each returns true on pass, false on fail.
- * They also append a line to bcm_log[].
- * -------------------------------------------------------------------------*/
-
-/* Test 1: BCM active? */
-static bool bcm_test_active(void)
-{
-    bool ok = bcm_is_active();
-    bcm_log_add("%s BCM active",          ok ? "PASS" : "FAIL");
-    return ok;
-}
-
-/* Test 2: gencmd version query */
-static bool bcm_test_gencmd_version(void)
-{
-    char reply[64];
-    int rc = bcm_gencmd("version", reply, sizeof(reply));
-    bool ok = (rc == 0 && reply[0] != '\0');
-    bcm_log_add("%s gencmd version: %.30s", ok ? "PASS" : "FAIL",
-                ok ? reply : "(no reply)");
-    return ok;
-}
-
-/* Test 3: gencmd get_mem gpu */
-static bool bcm_test_gencmd_mem(void)
-{
-    char reply[64];
-    int rc = bcm_gencmd("get_mem gpu", reply, sizeof(reply));
-    bool ok = (rc == 0 && reply[0] != '\0');
-    bcm_log_add("%s gencmd get_mem: %.30s", ok ? "PASS" : "FAIL",
-                ok ? reply : "(error)");
-    return ok;
-}
-
-/* Test 4: LCD freeze/unfreeze round-trip */
-static bool bcm_test_lcd_freeze(void)
-{
-    bcm_lcd_freeze();
-    sleep(HZ / 10);
-    bcm_lcd_unfreeze();
-    bcm_log_add("PASS lcd freeze/unfreeze");
-    return true;
-}
-
-/* Test 5: VMCS image swap (NULL = factory restore, should not crash) */
-static bool bcm_test_vmcs_null(void)
-{
-    bcm_use_vmcs_image(NULL, 0);  /* restore factory */
-    bcm_log_add("PASS vmcs image NULL (factory restore)");
-    return true;
-}
-
-/* Test 6: video quiz register (register dummy, unregister via NULL) */
-static int  _dummy_start(const char *f, int ms) { (void)f; (void)ms; return 0; }
-static void _dummy_stop(void)                   {}
-static int  _dummy_pos(void)                    { return 0; }
-
-static bool bcm_test_quiz_register(void)
-{
-    bcm_video_quiz_register(_dummy_start, _dummy_stop, _dummy_pos);
-    int rc = bcm_video_quiz_start("/dummy.mp4", 0);
-    bool ok = (rc == 0);
-    bcm_video_quiz_stop();
-    bcm_video_quiz_register(NULL, NULL, NULL);  /* unregister */
-    bcm_log_add("%s quiz register/start/stop", ok ? "PASS" : "FAIL");
-    return ok;
-}
-
-/* Test 7: click speaker PCM sink registration */
-static bool bcm_test_pcm_speaker(void)
-{
-    piezo_register_pcm_sink();
-    piezo_unregister_pcm_sink();
-    bcm_log_add("PASS pcm speaker sink register");
-    return true;
-}
-
-/* Test 8: Apple battery ADC channel readable */
-static bool bcm_test_apple_batt_adc(void)
-{
-#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
-    int raw = adc_read(ADC_APPLE_BATT);
-    bool ok = (raw > 0 && raw < 0xFFF);
-    bcm_log_add("%s apple batt ADC raw=%d", ok ? "PASS" : "FAIL", raw);
-    return ok;
-#else
-    bcm_log_add("SKIP apple batt ADC (not compiled)");
-    return true;
-#endif
-}
-
-/* Test 9: exFAT detection on current volume */
-static bool bcm_test_exfat(void)
-{
-#ifdef HAVE_EXFAT
-    bool is_exfat = fat_is_exfat(IF_MV_NONVOID(0));
-    bcm_log_add("INFO volume 0 exFAT=%s", is_exfat ? "yes" : "no");
-    return true;
-#else
-    bcm_log_add("SKIP exFAT (not compiled)");
-    return true;
-#endif
-}
-
-/* Test 10: USB hotswap broadcast (simulate) */
-static bool bcm_test_usb_hotswap(void)
-{
-    /* Just verify the event constant exists; actual USB send is not safe
-     * in a debug context, so we only confirm it compiles and logs. */
-    int evt = SYS_HOTSWAP_INSERTED;
-    bool ok = (evt != 0);
-    bcm_log_add("%s usb hotswap event defined (0x%08x)",
-                ok ? "PASS" : "FAIL", evt);
-    return ok;
-}
-
-/* -------------------------------------------------------------------------
- * Master feature-test runner
- * -------------------------------------------------------------------------*/
-typedef struct {
-    const char *name;
-    bool (*fn)(void);
-} bcm_test_entry_t;
-
-static const bcm_test_entry_t bcm_tests[] = {
-    { "BCM active",          bcm_test_active          },
-    { "gencmd version",      bcm_test_gencmd_version  },
-    { "gencmd get_mem",      bcm_test_gencmd_mem      },
-    { "LCD freeze/unfreeze", bcm_test_lcd_freeze      },
-    { "VMCS factory restore",bcm_test_vmcs_null       },
-    { "quiz register",       bcm_test_quiz_register   },
-    { "PCM speaker sink",    bcm_test_pcm_speaker     },
-    { "Apple batt ADC",      bcm_test_apple_batt_adc  },
-    { "exFAT detect",        bcm_test_exfat           },
-    { "USB hotswap event",   bcm_test_usb_hotswap     },
-};
-#define BCM_NUM_TESTS ARRAYLEN(bcm_tests)
-
-/* -------------------------------------------------------------------------
- * Run all tests and write /.rockbox/log.txt
- * -------------------------------------------------------------------------*/
-static bool dbg_bcm_feature_test(void)
-{
-    int pass = 0, fail = 0;
-    char header[56];
-    char ts[24];
-
-    splash(0, "Running BCM tests...");
-    bcm_log_clear();
-
-    bcm_log_timestamp(ts, sizeof(ts));
-    bcm_log_add("%s=== BCM Feature Test ===", ts);
-
-    for (unsigned i = 0; i < BCM_NUM_TESTS; i++)
-    {
-        snprintf(header, sizeof(header), "[%u/%u] %s",
-                 i + 1, (unsigned)BCM_NUM_TESTS, bcm_tests[i].name);
-        splash(0, header);
-
-        bcm_log_timestamp(ts, sizeof(ts));
-        bool ok = bcm_tests[i].fn();   /* appends its own PASS/FAIL line */
-        /* Prepend timestamp to the line just added */
-        (void)ts; /* timestamp already written inside each test via bcm_log_add */
-        if (ok) pass++; else fail++;
-        sleep(HZ / 20);
-    }
-
-    bcm_log_timestamp(ts, sizeof(ts));
-    bcm_log_add("%s--- %d/%d PASSED ---", ts, pass, (int)BCM_NUM_TESTS);
-
-    /* Flush to /.rockbox/log.txt (overwrite each full run) */
-    if (bcm_log_flush(O_TRUNC))
-        bcm_log_add("Saved: " BCM_LOG_PATH);
-    else
-        bcm_log_add("WARN: could not write " BCM_LOG_PATH);
-
-    splashf(HZ * 2, "BCM: %d/%d passed  log.txt written",
-            pass, (int)BCM_NUM_TESTS);
-    bcm_show_log();
-    return false;
-}
-
-/* -------------------------------------------------------------------------
- * Run a single test chosen from a list, append result to log.txt
- * -------------------------------------------------------------------------*/
-static const char *bcm_test_getname(int selected_item, void *data,
-                                     char *buffer, size_t buffer_len)
-{
-    (void)data;
-    if ((unsigned)selected_item < BCM_NUM_TESTS)
-    {
-        strlcpy(buffer, bcm_tests[selected_item].name, buffer_len);
-        return buffer;
-    }
-    return "";
-}
-
-static bool dbg_bcm_single_test(void)
-{
-    struct simplelist_info info;
-    simplelist_info_init(&info, "BCM: pick test",
-                         (int)BCM_NUM_TESTS, NULL);
-    info.get_name  = bcm_test_getname;
-    info.selection = 0;
-
-    /* Show picker; SELECT runs the highlighted test */
-    while (true)
-    {
-        int rc = simplelist_show_list(&info);
-        if (rc < 0 || rc >= (int)BCM_NUM_TESTS)
-            break;   /* MENU / back pressed */
-
-        /* Run the selected test */
-        char ts[24];
-        bcm_log_clear();
-        bcm_log_timestamp(ts, sizeof(ts));
-        bcm_log_add("%sTest: %s", ts, bcm_tests[rc].name);
-
-        splash(0, bcm_tests[rc].name);
-        bool ok = bcm_tests[rc].fn();
-        sleep(HZ / 10);
-
-        bcm_log_timestamp(ts, sizeof(ts));
-        bcm_log_add("%sResult: %s", ts, ok ? "PASS" : "FAIL");
-
-        /* Append this single-test result to log.txt */
-        bcm_log_flush(O_APPEND);
-
-        splashf(HZ * 2, "%s: %s  (appended to log.txt)",
-                bcm_tests[rc].name, ok ? "PASS" : "FAIL");
-        bcm_show_log();
-    }
-    return false;
-}
-
-/* -------------------------------------------------------------------------
- * Interactive gencmd console
- * -------------------------------------------------------------------------*/
-static bool dbg_bcm_gencmd(void)
-{
-    char cmd[80]   = "version";
-    char reply[256] = "";
-    bool done = false;
-
-    while (!done)
-    {
-        lcd_clear_display();
-        lcd_puts(0, 0, "BCM gencmd console");
-        lcd_puts(0, 1, "SELECT=run MENU=exit");
-        lcd_putsf(0, 2, "cmd: %s", cmd);
-
-        if (reply[0])
-        {
-            /* word-wrap the reply across rows 4-7 */
-            int len = strlen(reply);
-            for (int row = 0; row < 4 && row * SCREEN_MAX_CHARS < len; row++)
-            {
-                char line[SCREEN_MAX_CHARS + 1];
-                strlcpy(line, reply + row * SCREEN_MAX_CHARS, sizeof(line));
-                lcd_puts(0, 4 + row, line);
-            }
-        }
-        lcd_update();
-
-        int btn = get_action(CONTEXT_STD, HZ * 10);
-        switch (btn)
-        {
-        case ACTION_STD_OK:
-        {
-            int rc = bcm_gencmd(cmd, reply, sizeof(reply));
-            if (rc != 0)
-                snprintf(reply, sizeof(reply), "(error %d)", rc);
-            break;
-        }
-        case ACTION_STD_CANCEL:
-        case ACTION_STD_MENU:
-            done = true;
-            break;
-        default:
-            break;
-        }
-    }
-    return false;
-}
-
-#endif /* HAVE_BCM_VIDEOCORE */
-
 static const struct {
     unsigned char *desc; /* string or ID */
     bool (*function) (void); /* return true if USB was connected */
@@ -8618,11 +8205,6 @@ static const struct {
 #if defined(IPOD_6G) && !defined(SIMULATOR)
         {"View SysCfg", dbg_syscfg },
         {"Dump bootflash to file", dbg_bootflash_dump },
-#endif
-#ifdef HAVE_BCM_VIDEOCORE
-        {"BCM feature test", dbg_bcm_feature_test },
-        {"BCM single test",  dbg_bcm_single_test  },
-        {"BCM gencmd", dbg_bcm_gencmd },
 #endif
 };
 

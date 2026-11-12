@@ -33,9 +33,6 @@
 #include "wmcodec.h"
 #include "audiohw.h"
 #include "sound.h"
-#ifdef HAVE_BCM_VIDEOCORE
-#include "piezo.h"
-#endif
 
 /* shadow registers */
 static unsigned short eq1_reg = EQ1_EQ3DMODE | EQ_GAIN_VALUE(0);
@@ -172,12 +169,6 @@ void audiohw_set_volume(int vol_l, int vol_r)
     /* set headphone amp OUT1 */
     wmcodec_write(LOUT1VOL, amp_l | LOUT1VOL_LOUT1ZC);
     wmcodec_write(ROUT1VOL, amp_r | ROUT1VOL_ROUT1ZC | ROUT1VOL_OUT1VU);
-
-#ifdef HAVE_BCM_VIDEOCORE
-    /* Notify click speaker PCM sink of the new volume so it can scale its
-     * output amplitude accordingly (vol_l is in tenths of dB, 0 = max). */
-    piezo_set_volume(vol_l, vol_r);
-#endif
 }
 
 void audiohw_set_lineout_volume(int vol_l, int vol_r)
