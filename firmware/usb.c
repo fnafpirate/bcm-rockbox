@@ -525,6 +525,11 @@ static void NORETURN_ATTR usb_thread(void)
             usb_state = USB_EXTRACTED;
 #ifndef BOOTLOADER
             send_event(SYS_EVENT_USB_EXTRACTED, NULL);
+#ifdef HAVE_BCM_VIDEOCORE
+            /* bcm-rockbox: trigger hotswap-inserted so dircache rescans
+               the data partition (exFAT) after the USB host disconnects */
+            queue_broadcast(SYS_HOTSWAP_INSERTED, 0);
+#endif
 #endif
             usb_set_host_present(false);
             break;

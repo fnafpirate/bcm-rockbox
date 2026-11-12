@@ -432,6 +432,11 @@ sub buildzip {
         glob_mkdir("$temp_dir/libertas");
         glob_copy("$ROOT/firmware/drivers/libertas/firmware/*", "$temp_dir/libertas/");
     }
+    # create VideoCore stub directories for bcm-rockbox iPod Video
+    if ($modelname =~ /ipodvideo/) {
+        glob_mkdir("$temp_dir/VideoCore");
+        glob_mkdir("$temp_dir/subs");
+    }
     # add hbmenu shortcut's icon and 3dsx executable
     if ($modelname =~ /3ds/) {
         glob_copy("icon.icn", "$temp_dir/");

@@ -1,18 +1,47 @@
-/* bcm overlay v74: docks / accessories -- notices, per-dock TV settings (apps/iap/iap-lingo0.c) */
+/***************************************************************************
+ *             __________               __   ___.
+ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
+ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
+ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
+ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
+ *                     \/            \/     \/     \/            \/
+ * $Id$
+ *
+ * Dock state interface between the iAP driver and the video player.
+ *
+ * Copyright (C) 2024 bcm-rockbox contributors
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ ****************************************************************************/
 #ifndef BCM_DOCK_H
 #define BCM_DOCK_H
+
 #include <stdbool.h>
-#include "kernel.h"
-#define SYS_IAP_DOCK  MAKE_SYS_EVENT(SYS_EVENT_CLS_MISC, 6)   /* data: 1 connected, 0 gone, 2 power source */
-#if defined(IPOD_VIDEO) && defined(IPOD_ACCESSORY_PROTOCOL)
-void iap_dock_ui(void);                /* UI thread: notices, the dock's TV settings */
-int iap_dock_tv_choice(void);          /* -1 unknown / no dock, 0 iPod screen, 1 TV */
-void iap_dock_remember_tv(bool tv);
-const char *iap_dock_name(void);       /* NULL = no dock */
-#else
-#define iap_dock_ui() do { } while (0)
-#define iap_dock_tv_choice() (-1)
-#define iap_dock_remember_tv(tv) do { } while (0)
-#define iap_dock_name() ((const char *)0)
-#endif
-#endif
+#include <stdint.h>
+
+/* Dock capability flags reported by the accessory via iAP lingo 0 */
+#define DOCK_CAP_LINEOUT    (1u << 0)
+#define DOCK_CAP_VIDEOOUT   (1u << 1)
+#define DOCK_CAP_REMOTE     (1u << 2)
+
+typedef struct {
+    bool     connected;         /* true if an iAP accessory is attached    */
+    uint32_t caps;              /* DOCK_CAP_* flags                        */
+    uint8_t  accessory_id[8];   /* raw accessory ID bytes                  */
+    char     accessory_name[64];
+} dock_state_t;
+
+/* Global dock state — written by iap-core.c, read by the video player. */
+extern dock_state_t g_dock_state;
+
+/** Called by iAP when the dock state changes. */
+void bcm_dock_notify(const dock_state_t *new_state);
+
+#endif /* BCM_DOCK_H */

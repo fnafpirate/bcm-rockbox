@@ -1,92 +1,45 @@
-# Put this file in your fork at:  .github/workflows/build-ipodvideo.yml
-# It runs on every push to branch "bcm-host" (and from Actions -> Run workflow once it exists on
-# your default branch).  First run builds the ARM cross-compiler (~40-60 min); it is cached as
-# soon as it is built, so a later failure does not lose it.
-# On failure the errors are written to the run's Summary page (the first page you see when you
-# open the run) - copy them from there.  Output: artifact "rockbox-ipodvideo".
-name: Build iPod Video
+name: Build iPod Video (bcm-rockbox v94)
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ bcm-host ]
+    branches: [ "bcm-rockbox-v94" ]
+  pull_request:
+    branches: [ "bcm-rockbox-v94" ]
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install ARM cross-compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential wget xz-utils bzip2 gzip patch texinfo \
-            automake autoconf libtool libtool-bin flex bison perl python3 zip unzip git ccache \
-            libgmp-dev libmpfr-dev libmpc-dev libisl-dev zlib1g-dev
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi \
+               libsdl2-dev zip
 
-      - name: Restore ARM toolchain cache
-        id: toolchain
-        uses: actions/cache/restore@v4
-        with:
-          path: /opt/rbdev
-          key: rbdev-arm-gcc9.5-${{ hashFiles('tools/rockboxdev.sh') }}
-
-      - name: Build ARM toolchain (arm-elf-eabi)
-        if: steps.toolchain.outputs.cache-hit != 'true'
+      - name: Apply bcm_overlay_v94
         run: |
-          set -o pipefail
-          sudo mkdir -p /opt/rbdev
-          sudo chown "$USER" /opt/rbdev
-          RBDEV_PREFIX=/opt/rbdev RBDEV_TARGET=a tools/rockboxdev.sh 2>&1 | tee /tmp/toolchain.log
+          cd $GITHUB_WORKSPACE
+          bash bcm_overlay_v94/apply_overlay.sh
 
-      - name: Toolchain failure details
-        if: failure() && steps.toolchain.outputs.cache-hit != 'true'
+      - name: Configure
         run: |
-          { echo '### toolchain build failed'; echo '```'; tail -60 /tmp/toolchain.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save ARM toolchain cache
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: /opt/rbdev
-          key: rbdev-arm-gcc9.5-${{ hashFiles('tools/rockboxdev.sh') }}
-
-      # rockboxdev.sh installs into <prefix>/bin  (it prints "Make sure your PATH includes $prefix/bin")
-      - name: Check toolchain
-        run: |
-          export PATH=/opt/rbdev/bin:$PATH
-          which arm-elf-eabi-gcc
-          arm-elf-eabi-gcc --version | head -1
-
-      - name: Configure (ipodvideo, normal build)
-        run: |
-          export PATH=/opt/rbdev/bin:$PATH
-          mkdir -p build
-          cd build
-          ../tools/configure --target=ipodvideo --type=n
+          mkdir build-ipodvideo
+          cd build-ipodvideo
+          echo -e "20\n1\n" | ../tools/configure
 
       - name: Build
         run: |
-          export PATH=/opt/rbdev/bin:$PATH
-          cd build
-          set +e
-          make -j"$(nproc)" > ../make.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then
-            { echo '### make failed'; echo '```'
-              grep -n -E "error|undefined reference|No rule" ../make.log | head -40
-              echo '--- last lines ---'; tail -40 ../make.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-            tail -80 ../make.log
-            exit $rc
-          fi
-          set -e
-          make zip
+          cd build-ipodvideo
+          make -j$(nproc) 2>&1 | tee build.log
+          grep -E "^(Error|error:)" build.log || true
 
-      - name: Upload
+      - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: rockbox-ipodvideo
+          name: rockbox-ipodvideo-bcm-v94
           path: |
-            build/rockbox.zip
-            build/rockbox.ipod
+            build-ipodvideo/.rockbox/
+            build-ipodvideo/rockbox.ipod

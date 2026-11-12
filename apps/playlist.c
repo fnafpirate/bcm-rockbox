@@ -2298,6 +2298,13 @@ int playlist_directory_tracksearch(const char* dirname, bool recurse,
             /* let the other threads work */
             yield();
         }
+#ifdef HAVE_BCM_VIDEOCORE
+        else if ((files[i].attr & FILE_ATTR_MASK) == FILE_ATTR_VIDEO)
+        {
+            /* bcm-rockbox: skip hardware video files in playlist scan */
+            continue;
+        }
+#endif
     }
 
     /* restore dirfilter */

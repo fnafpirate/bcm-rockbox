@@ -329,6 +329,37 @@ void dc_discard_all(IF_MV_NONVOID(int volume))
         cache_discard_entry(&cache_entry[index], index);
 }
 
+/* bcm-rockbox: commit dirty entries then discard all in one locked op.
+ * Used by the exFAT stdlib formatter after writing the boot sector so
+ * the volume mount sees a clean cache state. */
+void dc_commit_and_discard_all(IF_MV_NONVOID(int volume))
+{
+    dc_lock_cache();
+
+    FOR_EACH_BITARRAY_SET_BIT(&CACHE_VOL_MAP(volume), index)
+    {
+        struct disk_cache_entry *dce = &cache_entry[index];
+        unsigned int flags = dce->flags;
+
+        if (flags & DCE_DIRTY)
+            dc_writeback_callback(IF_MV(volume,) dce->sector,
+                                  cache_buffer[index]);
+
+        cache_discard_entry(dce, index);
+    }
+
+    dc_unlock_cache();
+}
+
+/* bcm-rockbox: discard all cache entries for a volume without
+ * committing dirty ones (called after a USB format wipes the volume). */
+void dc_discard_all_locked(IF_MV_NONVOID(int volume))
+{
+    dc_lock_cache();
+    dc_discard_all(IF_MV_NONVOID(volume));
+    dc_unlock_cache();
+}
+
 /* expropriate a buffer from the cache */
 void * dc_get_buffer(void)
 {

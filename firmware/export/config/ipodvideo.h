@@ -249,3 +249,15 @@
 
 /* Define this if a programmable hotkey is mapped */
 #define HAVE_HOTKEY
+
+/* bcm-rockbox: Broadcom BCM2722 VideoCore hardware acceleration */
+#define HAVE_BCM_VIDEOCORE
+#define BCM_VIDEOCORE_MEM_BASE  0x000000ul  /* VC SRAM start             */
+#define BCM_BUS_DATA            0x30000000ul
+#define BCM_BUS_WR_ADDR32       0x30010000ul
+#define BCM_BUS_RD_ADDR32       0x30020000ul
+#define BCM_BUS_CONTROL         0x30030000ul
+
+/* bcm-rockbox: exFAT support on the iPod data partition */
+#define HAVE_EXFAT
+#define STORAGE_64BIT_SECTOR    /* needed for >2TB volumes and exFAT math */

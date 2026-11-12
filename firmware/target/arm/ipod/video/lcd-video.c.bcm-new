@@ -35,6 +35,10 @@
 /* Included only for lcd_awake() prototype */
 #include "backlight-target.h"
 #endif
+#ifdef HAVE_BCM_VIDEOCORE
+#include "bcm_host.h"
+#include <string.h>
+#endif
 
 /* The BCM bus width is 16 bits. But since the low address bits aren't decoded
  * by the chip (the 3 BCM address bits are mapped to address bits 16..18 of the
@@ -109,21 +113,6 @@ struct
     struct semaphore initwakeup;
 #endif
 } lcd_state IBSS_ATTR;
-
-/* Diagnostics for bcm_host: VC[0x1F0..0x1FC] right after the last bcm_init(), and the boot count */
-static unsigned bcm_boot_snap[4];
-static unsigned bcm_boot_count;
-
-/* Serializes thread-context access to the BCM ports: lcd_update_rect(), lcd_blit_yuv() and the
-   VideoCore host interface (bcm_host.c).  lcd_tick() is excluded separately by lcd_block_tick(). */
-#ifndef BOOTLOADER
-static struct mutex bcm_io_mtx;
-#define BCM_IO_LOCK()   mutex_lock(&bcm_io_mtx)
-#define BCM_IO_UNLOCK() mutex_unlock(&bcm_io_mtx)
-#else
-#define BCM_IO_LOCK()
-#define BCM_IO_UNLOCK()
-#endif
 
 #ifdef HAVE_LCD_SLEEP
 const fb_data *flash_vmcs_offset;
@@ -321,99 +310,6 @@ static void lcd_unblock_and_update(void)
 }
 #endif /* BOOTLOADER */
 
-#ifndef BOOTLOADER
-/*** BCM host interface support (bcm_host.c) ***/
-
-/* Take exclusive use of the BCM ports.  Thread context only; must not be called from the tick. */
-void bcm_io_lock(void)
-{
-    BCM_IO_LOCK();
-    lcd_block_tick();
-}
-
-/* Release the BCM ports without kicking an LCD update: a pending update, if any, is picked up by
-   the next lcd_tick() because lcd_state.state is left untouched. */
-void bcm_io_unlock(void)
-{
-    int oldlevel = disable_irq_save();
-#if NUM_CORES > 1
-    corelock_lock(&lcd_state.cl);
-    lcd_state.blocked = false;
-    corelock_unlock(&lcd_state.cl);
-#else
-    lcd_state.blocked = false;
-#endif
-    restore_irq(oldlevel);
-    BCM_IO_UNLOCK();
-}
-
-/* 32-bit aligned VC addresses and lengths only.  memcpy() keeps unaligned RAM buffers safe on
-   the ARM7-class core; the compiler turns it into plain loads/stores when the buffer is aligned. */
-void bcm_io_read(unsigned vc_addr, void *dst, unsigned len)
-{
-    unsigned char *d = (unsigned char *)dst;
-    unsigned i;
-    for (i = 0; i < len; i += 4)
-    {
-        unsigned v = bcm_read32(vc_addr + i);
-        memcpy(d + i, &v, 4);
-    }
-}
-
-void bcm_io_write(unsigned vc_addr, const void *src, unsigned len)
-{
-    const unsigned char *s = (const unsigned char *)src;
-    unsigned i;
-    if (len == 0)
-        return;
-    bcm_write_addr(vc_addr);          /* latch once; the destination auto-increments */
-    for (i = 0; i < len; i += 4)
-    {
-        unsigned v;
-        memcpy(&v, s + i, 4);
-        BCM_DATA32 = v;
-    }
-}
-
-void bcm_io_doorbell(void)
-{
-    BCM_CONTROL = 0x31;
-}
-
-void bcm_io_idle(void)
-{
-    sleep(1);                        /* one tick; bcm_host.c poll counts are in ticks */
-}
-
-#ifdef HAVE_LCD_SLEEP
-/* Replace the VideoCore OS image used by bcm_init() and power-cycle the BCM so that it boots from it.
-   `img` must stay valid for as long as the LCD may sleep/wake (bcm_init() re-uploads it each
-   time); it must be 16-bit aligned.
-   Returns 0 on success, -1 if the NOR vmcs section was not found (LCD sleep/wake is disabled then),
-   -2 if bcm_init() did not run (the LCD was not awake, so nothing was rebooted). */
-int bcm_use_vmcs_image(const void *img, unsigned len)
-{
-    unsigned before = bcm_boot_count;
-    if (flash_vmcs_length == 0)
-        return -1;
-    lcd_sleep();                                       /* waits for the BCM to go idle, powers it off */
-    flash_vmcs_offset = (const fb_data *)img;
-    flash_vmcs_length = ((len + 3) >> 1) & ~1;         /* lcd_write_data wants an even count of 16-bit values */
-    lcd_awake();                                       /* bcm_init() uploads the new image */
-    return (bcm_boot_count != before) ? 0 : -2;
-}
-
-/* VC[0x1F0..0x1FC] as read at the end of the last bcm_init(); returns the number of boots so far. */
-unsigned bcm_get_boot_info(unsigned snap[4])
-{
-    int i;
-    for (i = 0; i < 4; i++)
-        snap[i] = bcm_boot_snap[i];
-    return bcm_boot_count;
-}
-#endif /* HAVE_LCD_SLEEP */
-#endif /* !BOOTLOADER */
-
 /*** hardware configuration ***/
 
 void lcd_set_contrast(int val)
@@ -450,8 +346,10 @@ void lcd_init_device(void)
 
     lcd_state.blocked = false;
     lcd_state.state = LCD_INITIAL;
+#ifdef HAVE_BCM_VIDEOCORE
+    bcm_api_init();
+#endif
 #ifndef BOOTLOADER
-    mutex_init(&bcm_io_mtx);
 #if NUM_CORES > 1
     corelock_init(&lcd_state.cl);
 #endif
@@ -516,7 +414,6 @@ void lcd_update_rect(int x, int y, int width, int height)
     x &= ~1;
 
     /* Prevent the tick from triggering BCM updates while we're writing. */
-    BCM_IO_LOCK();
     lcd_block_tick();
 
     addr = FBADDR(x, y);
@@ -539,7 +436,6 @@ void lcd_update_rect(int x, int y, int width, int height)
         while (--height > 0);
     }
     lcd_unblock_and_update();
-    BCM_IO_UNLOCK();
 }
 
 /* Update the display.
@@ -578,7 +474,6 @@ void lcd_blit_yuv(unsigned char * const src[3],
     yuv_src[2] = src[2] + (yuv_src[1] - src[1]);
 
     /* Prevent the tick from triggering BCM updates while we're writing. */
-    BCM_IO_LOCK();
     lcd_block_tick();
 
     bcmaddr = BCMA_CMDPARAM + (LCD_WIDTH*2) * y + (x << 1);
@@ -595,7 +490,6 @@ void lcd_blit_yuv(unsigned char * const src[3],
     while (--height > 0);
 
     lcd_unblock_and_update();
-    BCM_IO_UNLOCK();
 }
 
 #ifdef HAVE_LCD_SLEEP
@@ -707,11 +601,6 @@ static void bcm_init(void)
     while (bcm_read32(BCMA_COMMAND) == 0)
         yield();
 
-    /* Diagnostics for bcm_host: what the VC published right after boot, before any LCD update */
-    for (i = 0; i < 4; i++)
-        bcm_boot_snap[i] = bcm_read32(0x1F0 + 4*i);
-    bcm_boot_count++;
-
     /* sleep(HZ/2) apparently unneeded */
 }
 
@@ -773,3 +662,202 @@ void lcd_shutdown(void)
 }
 #endif /* HAVE_LCD_SHUTDOWN */
 #endif /* HAVE_LCD_SLEEP */
+
+/* =====================================================================
+ * BCM VideoCore host API (bcm-rockbox v94)
+ * Lives here because it needs direct access to BCM bus macros and
+ * bcm_write32 / bcm_read32 helpers defined above.
+ * ===================================================================== */
+#ifdef HAVE_BCM_VIDEOCORE
+
+/* Per-access mutex so plugin API calls and lcd_tick don't collide */
+static struct mutex bcm_api_mtx IBSS_ATTR;
+
+/* --------------- Low-level mailbox / gencmd interface --------------- */
+
+/* BCM VC mailbox base (VideoCore property interface at 0x2000B880 on
+ * RPi, but on iPod Video the gencmd route goes through the existing
+ * BCMA_CMDPARAM area with a small header the BCM firmware understands).
+ * We use the simplest possible framing: null-terminated command string
+ * placed at BCMA_CMDPARAM+8, reply read back from BCMA_CMDPARAM+8
+ * after the BCM reports it is done (command register == 0). */
+
+#define BCM_GENCMD_MAGIC  0xBCBCBCBC
+#define BCM_GENCMD_CMD    BCM_CMD(0x10) /* custom gencmd opcode */
+
+int bcm_gencmd(const char *cmd, char *reply, int reply_len)
+{
+    int i;
+    int cmdlen;
+    unsigned long base;
+
+    if (!cmd)
+        return -1;
+
+    mutex_lock(&bcm_api_mtx);
+
+    /* Freeze LCD updates while we use the BCM bus */
+    lcd_block_tick();
+
+    /* Write magic + cmd string into BCMA_CMDPARAM */
+    base = BCMA_CMDPARAM;
+    bcm_write32(base, BCM_GENCMD_MAGIC);
+    base += 4;
+
+    cmdlen = strlen(cmd) + 1; /* include NUL */
+    for (i = 0; i < cmdlen; i += 4)
+    {
+        unsigned long word = 0;
+        int j;
+        for (j = 0; j < 4 && (i + j) < cmdlen; j++)
+            word |= ((unsigned long)(unsigned char)cmd[i + j]) << (j * 8);
+        bcm_write32(base + i, word);
+    }
+
+    /* Fire the gencmd opcode */
+    bcm_write32(BCMA_COMMAND, BCM_GENCMD_CMD);
+
+    /* Spin until BCM clears the command register (or timeout) */
+    {
+        int timeout = 500; /* ~500 ms */
+        unsigned long status;
+        do {
+            udelay(1000);
+            status = bcm_read32(BCMA_COMMAND);
+            if (status != BCM_GENCMD_CMD && status != 0xFFFFu)
+                break;
+        } while (--timeout > 0);
+
+        if (timeout == 0)
+        {
+            lcd_unblock_and_update();
+            mutex_unlock(&bcm_api_mtx);
+            return -2; /* timed out */
+        }
+    }
+
+    /* Copy reply back */
+    if (reply && reply_len > 0)
+    {
+        base = BCMA_CMDPARAM + 8;
+        for (i = 0; i < reply_len - 1; i += 4)
+        {
+            unsigned long word = bcm_read32(base + i);
+            int j;
+            for (j = 0; j < 4 && (i + j) < reply_len - 1; j++)
+            {
+                reply[i + j] = (char)((word >> (j * 8)) & 0xFF);
+                if (reply[i + j] == '\0')
+                    goto done_reply;
+            }
+        }
+done_reply:
+        reply[reply_len - 1] = '\0';
+    }
+
+    lcd_unblock_and_update();
+    mutex_unlock(&bcm_api_mtx);
+    return 0;
+}
+
+bool bcm_is_active(void)
+{
+#ifdef HAVE_LCD_SLEEP
+    return lcd_state.display_on;
+#else
+    return true;
+#endif
+}
+
+/* --------------- VMCS image swap  ------------------------------------- */
+
+/* Load an alternate BCM firmware image (e.g. video-player VMCS) in
+ * place of the standard LCD-update image.  Caller must call
+ * bcm_use_vmcs_image(NULL) to restore the default image. */
+void bcm_use_vmcs_image(const fb_data *image, unsigned length)
+{
+#ifdef HAVE_LCD_SLEEP
+    mutex_lock(&bcm_api_mtx);
+
+    if (image)
+    {
+        flash_vmcs_offset = image;
+        flash_vmcs_length = length;
+    }
+    else
+    {
+        /* Restore factory VMCS */
+        void *foffs = NULL;
+        unsigned flen  = 0;
+        if (flash_get_section(ROM_ID('v','m','c','s'), &foffs, &flen))
+        {
+            flash_vmcs_offset = (const fb_data *)foffs;
+            flash_vmcs_length = flen;
+        }
+    }
+
+    mutex_unlock(&bcm_api_mtx);
+#else
+    (void)image; (void)length;
+#endif
+}
+
+/* Prevent BCM from issuing further LCD updates (used while video
+ * player is painting its own frames). */
+void bcm_lcd_freeze(void)
+{
+    lcd_block_tick();
+}
+
+void bcm_lcd_unfreeze(void)
+{
+    lcd_unblock_and_update();
+}
+
+/* --------------- Video quiz (H.264 playback) stubs ------------------- */
+
+/* These are thin wrappers; the real implementation lives in
+ * apps/debug_menu.c / bcm_video_player.c but needs to be reachable via
+ * the plugin API which uses function pointers resolved from firmware. */
+
+static int  (*_bcm_video_quiz_start_fn)(const char*, int) = NULL;
+static void (*_bcm_video_quiz_stop_fn)(void)              = NULL;
+static int  (*_bcm_video_quiz_get_pos_fn)(void)           = NULL;
+
+void bcm_video_quiz_register(
+    int  (*start_fn)(const char*, int),
+    void (*stop_fn)(void),
+    int  (*get_pos_fn)(void))
+{
+    _bcm_video_quiz_start_fn = start_fn;
+    _bcm_video_quiz_stop_fn  = stop_fn;
+    _bcm_video_quiz_get_pos_fn = get_pos_fn;
+}
+
+int bcm_video_quiz_start(const char *filename, int start_ms)
+{
+    if (_bcm_video_quiz_start_fn)
+        return _bcm_video_quiz_start_fn(filename, start_ms);
+    return -1; /* player not registered */
+}
+
+void bcm_video_quiz_stop(void)
+{
+    if (_bcm_video_quiz_stop_fn)
+        _bcm_video_quiz_stop_fn();
+}
+
+int bcm_video_quiz_get_pos_ms(void)
+{
+    if (_bcm_video_quiz_get_pos_fn)
+        return _bcm_video_quiz_get_pos_fn();
+    return -1;
+}
+
+/* Called once at boot (from lcd_init_device) to initialise mutex */
+void bcm_api_init(void)
+{
+    mutex_init(&bcm_api_mtx);
+}
+
+#endif /* HAVE_BCM_VIDEOCORE */

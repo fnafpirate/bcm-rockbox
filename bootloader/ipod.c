@@ -376,11 +376,15 @@ void* main(void)
         for (int i = 0 ; i < NUM_VOLUMES ; i++) {
             disk_partinfo(i, &pinfo);
             if (pinfo.type)
-                printf("P%d T%02x S%lllx",
+                printf("P%d T%02x S%llx",
                        i, pinfo.type, (unsigned long long)pinfo.size);
         }
 
-        printf("No partition found");
+        printf("No mountable partition found.");
+#ifdef IPOD_VIDEO
+        printf("If data partition is exFAT,");
+        printf("run ipod_exfat_setup.py first.");
+#endif
         fatal_error();
     }
 

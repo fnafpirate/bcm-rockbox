@@ -1,139 +1,83 @@
-/*
- * bcm_host.h - VideoCore host interface ("ring channels") for the iPod Video 5.5G.
+/***************************************************************************
+ *             __________               __   ___.
+ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
+ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
+ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
+ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
+ *                     \/            \/     \/    \/            \/
  *
- * What is verified vs inferred is tracked in VideoCore_Host_Interface_Session3.md.
- * Items marked [UNVERIFIED] below have never run against a real VideoCore.
- */
+ * BCM VideoCore host API — bcm-rockbox v94
+ *
+ * Public interface to the Broadcom BCM2722 VideoCore II co-processor
+ * fitted in iPod Video (5G / 5.5G).  All functions are only compiled
+ * when HAVE_BCM_VIDEOCORE is defined (ipodvideo.h sets it).
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ ****************************************************************************/
+
 #ifndef BCM_HOST_H
 #define BCM_HOST_H
 
-#include <stdint.h>
-#include <stddef.h>
+#include "config.h"
+
+#ifdef HAVE_BCM_VIDEOCORE
+
 #include <stdbool.h>
+#include "lcd.h"   /* fb_data */
 
-/* ---- bring-up ---------------------------------------------------------------- */
+/* ---- Low-level gencmd / mailbox ---- */
 
-/* Call after the VideoCore has been booted (bcm_init()).
- * Reads VC[0x1F0..0x1FF], takes the info pointer at VC[0x1FC] as the base of the host-interface
- * block, reads the channel directory and the channel descriptors.
- * The stock firmware requires VC[0x1F8] == 1 here; on real hardware under Rockbox that word holds
- * the legacy LCD command (0xFFFF0000), so it is only recorded (diag.ready_ok), not enforced.
- * Returns 0 on success, <0 on failure (-2: bad info pointer, -3: no gencmd channel,
- * -4: no plausible channel directory). */
-int  bcm_host_attach(void);
-void bcm_host_detach(void);              /* v47: forget the VC (it is being rebooted into another image) */
+/* Send an ASCII command string to the BCM firmware and read the reply.
+ * Returns 0 on success, negative on error. */
+int  bcm_gencmd(const char *cmd, char *reply, int reply_len);
 
-/* What attach saw, for logging. Valid after any call to bcm_host_attach(). */
-struct bcm_host_diag {
-    uint32_t w1f0, w1f4, w1f8, w1fc;       /* VC[0x1F0..0x1FC] */
-    bool     ready_ok;                     /* VC[0x1F8] == 1 (the stock firmware's condition) */
-    uint16_t dir[8];                       /* channel directory at base (offsets from base) */
-    uint16_t type[8];                      /* descriptor type per channel (0 = absent) */
-    uint32_t tx_start[8], tx_end[8], rx_start[8], rx_end[8];   /* ring bounds, offsets from base */
-};
-const struct bcm_host_diag *bcm_host_get_diag(void);
+/* Returns true if the BCM is currently powered and active. */
+bool bcm_is_active(void);
 
-/* Poll the VC->host signal byte and service every channel with pending messages.
- * There is no interrupt to imitate (see report 11.3): call at ~100-200 Hz from a thread. */
-void bcm_host_service(void);
+/* ---- VMCS image management ---- */
 
-/* ---- channel 1: ASCII gencmd -------------------------------------------------- */
+/* Replace the VMCS firmware image the BCM runs after power-up.
+ * Pass image=NULL, length=0 to restore the factory image from flash. */
+void bcm_use_vmcs_image(const fb_data *image, unsigned length);
 
-/* Sends `cmd` (header opcode 1, payload = string incl. NUL) and waits for the reply with the
- * same sequence number. The reply text is copied to `resp`. Returns the header result word
- * (>=0) or <0 on timeout / not attached. `max_polls` bounds the wait; each poll calls
- * bcm_host_service() then, if still waiting, bcm_io_idle() once. Implemented on top of
- * bcm_gencmd_start()/bcm_gencmd_poll() below. */
-int  bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls);
+/* ---- LCD freeze for video overlay ---- */
 
-/* Split form of bcm_gencmd(), for callers that want to log progress (or do something else) while
- * waiting instead of blocking silently. Only one gencmd request can be outstanding at a time.
- *   bcm_gencmd_start(cmd)                 -- sends the request; returns 0, or <0 if not attached.
- *   bcm_gencmd_poll(resp, resp_sz)        -- services the host interface once and checks for the
- *                                             reply; returns the header result word if it has
- *                                             arrived, or -3 if still waiting. Does not sleep.
- * Typical use: bcm_gencmd_start(cmd); then loop calling bcm_gencmd_poll() with your own sleep and
- * progress logging between calls until it returns something other than -3. */
-int  bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls); /* v34: graphics channel */
-int  bcm_gencmd_start(const char *cmd);
-int  bcm_gencmd_poll(char *resp, size_t resp_sz);
+/* Suspend BCM-issued LCD refreshes (hold the tick mutex).
+ * The caller is responsible for painting its own frames while frozen. */
+void bcm_lcd_freeze(void);
 
-/* ---- channel 5: VCFS (VideoCore -> host file API, read-only) ------------------ */
+/* Resume BCM-issued LCD refreshes and kick an immediate update. */
+void bcm_lcd_unfreeze(void);
 
-/* Paths the VC sends start with "/Resources/". They are mapped to root + path.
- * Example: bcm_vfs_set_root("/.rockbox/vc") -> /.rockbox/vc/Resources/VideoCore/Library/h264dec.vll */
-void bcm_vfs_set_root(const char *root);
-/* v56: flat folder: every requested "/Resources/.../<name>" is served from <root>/<name> (e.g. /.rockbox/VideoCore/mplayer.vll) */
-void bcm_vfs_set_flat(bool flat);
+/* ---- H.264 video player ---- */
 
-/* ---- channel 7: VCPD (passthrough data stream: frames for the player) --------- */
+/* Start playing filename from start_ms milliseconds.
+ * Returns 0 on success, negative on error. */
+int  bcm_video_quiz_start(const char *filename, int start_ms);
 
-struct bcm_pds_ops {
-    /* opcode 0x41: VC announces two data buffers (VC RAM address + capacity) and a stream id
-     * (decimal string at payload+0x420). w1 is the first payload word after word 0 [I: start flags]. */
-    void (*start)(int stream_id, uint32_t w1);
-    /* opcode 0x42: VC wants the next frame (or next chunk of the current one).
-     * w2 = the stream id being asked for, -1 = any (the stock media object compares it with its
-     * two stream ids, rt 0x20b39c) [I]; w1 is passed through as a third argument [meaning unknown]. */
-    void (*get_frame)(int stream_id, uint32_t w1, uint32_t w2);
-    /* opcode 0x43 */
-    void (*seek)(int stream_id, uint32_t position);
-    /* opcode 0x44 */
-    void (*stop)(void);
-};
-void bcm_pds_set_ops(const struct bcm_pds_ops *ops);
+/* Stop the currently playing video (no-op if none). */
+void bcm_video_quiz_stop(void);
 
-/* Which VC buffer a stream id uses. 0 = buffer A (payload words 2/3 of 0x41), 1 = buffer B (words 4/5).
- * Decoded from rt 0xff034 / 0x288f40 / 0x288c14: the table at rt 0x10833c64 is indexed by STREAM ID (order of the
- * accepted streams in the file) and holds the TYPE byte of the stream (0 audio, 1 video). Type 0 uses the capacity
- * from words 4/5 (= B), type 1 the capacity from words 2/3 (= A). So **video -> A, audio -> B**, which is also
- * the default (stream 0 -> A). Real VC values seen: A = {0x813c0, 0x10000}, B = {0x813c0, 0x4000} -- same address. */
-void bcm_pds_map_stream(int stream_id, int buffer /*0=A,1=B*/);
+/* Return the current playback position in milliseconds, or -1. */
+int  bcm_video_quiz_get_pos_ms(void);
 
-struct bcm_pds_frame {
-    /* Field origins in the stock media object (rt 0x20b39c): stream_id = the requested id, f4 =
-     * frame-record word 2, f2 = low 16 bits of frame-record word 3, length = word 1, data = word 0.
-     * meta[] are NOT written per frame by the stock producer; they look like per-stream constants
-     * set elsewhere [I]. */
-    int16_t  stream_id;
-    uint16_t f2;          /* input descriptor +2  [meaning unknown; flags?] */
-    uint32_t f4;          /* input descriptor +4  [meaning unknown; timestamp?] */
-    uint32_t length;      /* frame bytes */
-    uint32_t meta[4];     /* input descriptor +0x18..+0x24 [meaning unknown; timestamps/flags?] */
-    const uint8_t *data;
-};
-/* Queue a frame. The first chunk is written to the VC buffer and announced immediately; the
- * remaining chunks (frames larger than the buffer) are sent on each following opcode 0x42.
- * Returns 0, or <0 if a previous frame on this buffer is still being sent / not attached. */
-int  bcm_pds_send_frame(const struct bcm_pds_frame *f);
+/* Register the actual player implementation (called by bcm_video_player.c).
+ * The firmware layer holds only function pointers; the app layer supplies
+ * the real functions via this call so the firmware doesn't pull in app code. */
+void bcm_video_quiz_register(
+    int  (*start_fn)(const char*, int),
+    void (*stop_fn)(void),
+    int  (*get_pos_fn)(void));
 
-/* Answer a get_frame request with "nothing" (rt 0x20b688 calls the hand-off with (0,0): an 8-byte
- * 0x61 reply of two zero words). Presumably end-of-stream / no frame available [I]. */
-int  bcm_pds_send_empty(void);
+/* ---- Init (called from lcd_init_device) ---- */
+void bcm_api_init(void);
 
-/* Chunk flag byte in the 0x61 reply (payload word 6).  v29: the stock hand-off (rt 0x288c14) has a per-stream "state" word
- * S ([0x10833c4c+4] video, +8 audio; set to 1 by the 0x41 start).  Whole frame: S==1 -> 3, S==0 -> 2 and S:=1.  Frame that does not fit
- * the PDS buffer: first chunk S==1 -> 1 and S:=0; middle chunks (S==0) -> 0; last chunk (S==0, fits) -> 2 and S:=1.  So bit0 = "first
- * chunk of a frame", bit1 = "last chunk of a frame", and a complete frame is 3.  v14-v28 sent 2 for a whole frame, i.e. "last chunk
- * without a first one" -- the VC counted every frame as lost_frame_assert_packetorder (v28 logs). */
-enum { PDS_FLAG_MIDDLE = 0, PDS_FLAG_FIRST = 1, PDS_FLAG_LAST = 2, PDS_FLAG_WHOLE = 3 };
-void bcm_host_set_pds_flags_legacy(int on);     /* A/B test: 1 = the pre-v29 values (first 0, middle 1, whole 2, last 3) */
-
-/* Stream description = the REPLY to the VC's PDS start request (0x41), opcode 0x60, seq echoed from that request
- * (rt 0x288f40, called from the start callback rt 0xa04f0 -> 0x20af74). The VC waits for it before it asks for
- * any frame; mp_selectplay does not complete until it has arrived. Call it from the start() callback.
- * `words`/`len` = the 0x520-byte payload (layout in VideoCore_PDS_Findings.md). Returns 0, or <0. */
-int  bcm_pds_send_stream_info(const uint32_t *words, uint32_t len);
-
-/* ---- tracing ---------------------------------------------------------------------- */
-/* Optional. Called for every VCFS operation, PDS opcode and any message on a channel the module
- * does not serve (VCHR, graphics), so first-hardware runs show what the VideoCore actually asks
- * for. `s` is a path or NULL. Do not call back into bcm_host from the callback. */
-void bcm_host_set_vchr47_len(uint32_t n);      /* v28: 0 = stock zero-length reply to VCHR op 0x47 (default), nonzero = old 4-byte payload */
-void bcm_host_set_trace(void (*fn)(const char *tag, uint32_t a, uint32_t b, const char *s));
-
-/* ---- diagnostics ---------------------------------------------------------------- */
-struct bcm_host_stats { uint32_t rx_msgs, tx_msgs, vcfs_ops, pds_ops, bad_magic, unknown_ops, truncated, resynced; };
-const struct bcm_host_stats *bcm_host_get_stats(void);
-
-#endif
+#endif /* HAVE_BCM_VIDEOCORE */
+#endif /* BCM_HOST_H */

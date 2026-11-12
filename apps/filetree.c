@@ -49,6 +49,10 @@
 #include "mv.h"
 #endif
 
+#ifdef HAVE_BCM_VIDEOCORE
+#include "bcm_host.h"
+#endif
+
 #if CONFIG_TUNER
 #include "radio.h"
 #endif
@@ -871,6 +875,23 @@ int ft_enter(struct tree_context* c)
             case FILE_ATTR_CUE:
                 display_cuesheet_content(buf);
                 break;
+
+#ifdef HAVE_BCM_VIDEOCORE
+            case FILE_ATTR_VIDEO:
+            {
+                /* Hand off to BCM VideoCore hardware H.264 player */
+                if (global_settings.party_mode && audio_status())
+                {
+                    splash(HZ, ID2P(LANG_PARTY_MODE));
+                    break;
+                }
+                splash(0, ID2P(LANG_WAIT));
+                int vrc = bcm_video_quiz_start(buf, 0);
+                if (vrc < 0)
+                    splashf(HZ*2, "Video error %d", vrc);
+                break;
+            }
+#endif /* HAVE_BCM_VIDEOCORE */
 
                 /* plugin file */
             case FILE_ATTR_ROCK:

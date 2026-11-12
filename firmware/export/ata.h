@@ -167,6 +167,12 @@ int ata_num_drives(int first_drive);
 
 long ata_last_disk_activity(void);
 int ata_spinup_time(void); /* ticks */
+#ifdef HAVE_BCM_VIDEOCORE
+/* bcm-rockbox: inhibit ATA spinup while BCM video is playing.
+ * When set, ata_spin() calls are silently dropped to prevent
+ * audio glitches caused by disk seek noise during H.264 decode. */
+void ata_set_bcm_spinup_inhibit(bool inhibit);
+#endif
 
 /* Returns 1 if drive is solid-state */
 static inline int ata_disk_isssd(void)

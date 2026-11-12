@@ -113,6 +113,13 @@ static long lasttime = 0;
 #include "governor-ibasso.h"
 #endif
 
+#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
+#include "powermgmt.h" /* ipod_batt_set_smooth_mode, ipod_batt_set_r_int, ipod_batt_select_table */
+#endif
+#ifdef HAVE_BCM_VIDEOCORE
+#include "piezo.h"     /* piezo_register_pcm_sink, piezo_unregister_pcm_sink */
+#endif
+
 #ifdef LOGF_ENABLE
 static char *debug_get_flags(uint32_t flags);
 #undef DEBUGF /* allow DEBUGF or logf not both */
@@ -1011,6 +1018,21 @@ void settings_apply(bool read_disk)
 #ifdef HAVE_SPEAKER
     audio_enable_speaker(global_settings.speaker_mode);
 #endif
+
+#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
+    /* Apply Apple battery ADC calibration settings */
+    ipod_batt_set_smooth_mode(global_settings.batt_smooth_mode);
+    ipod_batt_set_r_int(global_settings.batt_r_int_mohm);
+    ipod_batt_select_table(global_settings.batt_table_id);
+#endif /* IPOD_VIDEO && ADC_APPLE_BATT */
+
+#ifdef HAVE_BCM_VIDEOCORE
+    /* Register piezo PCM sink if enabled */
+    if (global_settings.bcm_pcm_speaker)
+        piezo_register_pcm_sink();
+    else
+        piezo_unregister_pcm_sink();
+#endif /* HAVE_BCM_VIDEOCORE */
 
     if (read_disk)
     {

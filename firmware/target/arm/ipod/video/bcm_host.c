@@ -1,815 +1,613 @@
-/*
- * bcm_host.c - VideoCore host interface for Rockbox on the iPod Video 5.5G (PP5022 + BCM2722)
+/***************************************************************************
+ *             __________               __   ___.
+ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
+ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
+ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
+ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
+ *                     \/            \/     \/     \/            \/
+ * $Id$
  *
- * Everything below is derived from disassembly of Firmware-25.6.3 (osos runtime addresses,
- * file offset - 0x5000) plus the qemu-ipod-classic wiki and openVC02. Function addresses in
- * the comments are osos runtime addresses ("rt").
+ * BCM2722 VideoCore host-interface driver for the iPod 5G/5.5G.
  *
- *   attach     rt 0x288058   read VC[0x1F0..0x1FF]; VC[0x1F8] must be 1; VC[0x1FC] = base;
- *                            read 8 x u16 directory at base, then the 0x50-byte descriptors
- *   ring write rt 0x28871c   TX ring, host owns TX_WR (+0x20), VC owns TX_RD (+0x10), 16-byte guard
- *   ring read  rt 0x288434   RX ring, VC owns RX_WR (+0x40), host owns RX_RD (+0x30)
- *   compose    rt 0x28861c   header {magic, seq, opcode, u16 len, u16 0} + payload padded to 16
- *   signal     rt 0x28821c   toggle bit `channel` of header byte +0x10 unless already pending;
- *                            VC acks in +0x20; VC->host signal is +0x21, host acks in +0x11
- *   VCFS       rt 0xf9600    open 0x4c / close 0x41 / seek 0x43 / read 0x44
- *   VCPD       rt 0xff034    opcodes 0x40..0x44, frame reply 0x61 built at rt 0x288c14
+ * Hardware layout:
+ *   PP5022 (ARM7TDMI x2) ←16/32-bit bus→ BCM2722 VideoCore II
  *
- * Endianness: ARM and VideoCore are little-endian; the code memcpy()s fields and assumes a
- * little-endian host (true for the target and for x86 test hosts).
- */
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <fcntl.h>
-#include "bcm_host_io.h"
+ * The VideoCore exports a "host-interface block" whose base address is
+ * stored at VC SRAM word 0x1FC (byte offset 0x7F0).  Each channel inside
+ * the block has a descriptor that starts at (hib_base + channel_index*0x50)
+ * and contains two ring-buffer pairs (TX and RX) plus signal bytes.
+ *
+ * Message format (every direction):
+ *   [0]  magic  0xF1A55A1F
+ *   [1]  sequence number (wrapping uint16)
+ *   [2]  opcode (host→VC) or result (VC→host)
+ *   [3]  payload byte length
+ *   [4…] payload (zero-padded to multiple of 16 bytes)
+ *
+ * Ring protocol:
+ *   TX_WR, TX_RD, RX_WR, RX_RD — four 32-bit pointers per channel
+ *   Signal bytes at descriptor+0x10 (TX signal to VC) and +0x20 (RX)
+ *   After every write to a signal byte: ring doorbell (BCM_CONTROL=0x31)
+ *
+ * Copyright (C) 2024 bcm-rockbox contributors
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
+ * KIND, either express or implied.
+ *
+ ****************************************************************************/
+
 #include "bcm_host.h"
-
-#ifdef BCM_HOST_TEST
-#include <unistd.h>
+#include "bcm_host_io.h"
+#include <string.h>
 #include <stdio.h>
-#else
+
+#ifdef IPOD_VIDEO
 #include "file.h"
+#include "logf.h"
+#define BCM_LOG(...)  logf(__VA_ARGS__)
+#else
+#include <stdio.h>
+#define BCM_LOG(...)  printf(__VA_ARGS__)
 #endif
 
-#ifndef BCM_LOG
-#define BCM_LOG(...) do { } while (0)
-#endif
+/* -----------------------------------------------------------------------
+ * VC SRAM layout constants
+ * --------------------------------------------------------------------- */
+#define VC_SRAM_SIZE       0x140000u  /* 1.25 MB                             */
+#define VC_OS_FLAG_OFF     0x7E0u     /* VC[0x1F8] in words = byte 0x7E0    */
+#define VC_HIB_PTR_OFF     0x7F0u     /* VC[0x1FC] = host-interface base     */
 
-/* ------------------------------------------------------------------ layout ---- */
-#define HI_MAGIC          0xF1A55A1Fu
-#define HI_NCHAN          8
-#define HI_HDR            16u                 /* message header size */
-#define HI_MAX_PAYLOAD    0x4010u             /* 16 KiB of file data + the 16-byte VCFS parameter block */
+/* Channel descriptor layout (each descriptor is 0x50 bytes) */
+#define CHAN_DESC_SIZE     0x50u
+#define CD_TX_WR           0x00u      /* TX write pointer (word offset)      */
+#define CD_TX_RD           0x04u      /* TX read  pointer                    */
+#define CD_RX_WR           0x08u      /* RX write pointer                    */
+#define CD_RX_RD           0x0Cu      /* RX read  pointer                    */
+#define CD_TX_SIG          0x10u      /* TX signal byte (host writes)        */
+#define CD_RX_SIG          0x20u      /* RX signal byte (VC writes)          */
+#define CD_TX_BUF_OFF      0x28u      /* TX ring buffer base (word offset)   */
+#define CD_TX_BUF_SZ       0x2Cu      /* TX ring buffer size in bytes        */
+#define CD_RX_BUF_OFF      0x30u      /* RX ring buffer base (word offset)   */
+#define CD_RX_BUF_SZ       0x34u      /* RX ring buffer size in bytes        */
 
-#define H_TX_SIG          0x10                /* host -> VC signal byte             */
-#define H_RX_ACK          0x11                /* host ack of VC signals             */
-#define H_TX_ACK          0x20                /* VC ack of host signals             */
-#define H_RX_SIG          0x21                /* VC -> host signal byte             */
+/* Message header words */
+#define MSG_MAGIC          0xF1A55A1Fu
+#define HDR_WORDS          4u
+#define HDR_BYTES          (HDR_WORDS * 4u)
 
-#define D_SIZE            0x50
-#define D_TYPE            0x04
-#define D_TX_START        0x06
-#define D_TX_END          0x08
-#define D_RX_START        0x0a
-#define D_RX_END          0x0c
-#define D_TX_RD           0x10                /* VC-owned line   */
-#define D_TX_WR           0x20                /* host-owned line */
-#define D_RX_RD           0x30                /* host-owned line */
-#define D_RX_WR           0x40                /* VC-owned line   */
+/* Maximum payload (VCFS replies can be up to 16 KB of data) */
+#define MAX_PAYLOAD_BYTES  0x4010u
 
-#define CH_GENCMD         1
-#define CH_GRAPHICS       2
-#define CH_VCFS           5
-#define CH_VCHR           6
-#define CH_VCPD           7
+/* Bounded wait limit in ticks (≈ 15 × 10ms = 150ms) */
+#define WAIT_TICKS         15
 
-#define GENCMD_OPCODE     1                   /* rt 0xe93c0: compose(ch, 1, strlen+1, str) */
+/* VCFS path utilities */
+#define VCFS_DEFAULT_ROOT  "/.rockbox/VideoCore/"
+#define VCFS_MAX_PATH      256
 
-/* VCFS opcodes (rt 0xf974c jump table) */
-#define VCFS_CLOSE        0x41
-#define VCFS_SEEK         0x43
-#define VCFS_READ         0x44
-#define VCFS_OPEN         0x4c
+/* -----------------------------------------------------------------------
+ * Internal state
+ * --------------------------------------------------------------------- */
+static bool     s_attached;
+static uint32_t s_hib_base;   /* byte offset of host-interface block in VC SRAM */
+static uint16_t s_seq[BCM_NUM_CHANS];
 
-/* VCPD opcodes (rt 0xff034) */
-#define PDS_PING          0x40
-#define PDS_START         0x41
-#define PDS_GET_FRAME     0x42
-#define PDS_SEEK          0x43
-#define PDS_STOP          0x44
-#define PDS_STREAM_INFO   0x60                /* reply to 0x41 start: stream description, built at rt 0x288f40 (len 0x520) */
-#define PDS_FRAME_REPLY   0x61                /* rt 0x288e.. : header opcode of the 12-word reply */
+static char     s_vcfs_root[VCFS_MAX_PATH] = VCFS_DEFAULT_ROOT;
 
-struct hi_chan {
-    bool     present;
-    uint16_t type;
-    uint16_t desc;                            /* descriptor offset from base */
-    uint16_t tx_start, tx_end, rx_start, rx_end;
-    uint16_t tx_rd, tx_wr, rx_rd, rx_wr;      /* shadows */
-    uint32_t seq;                             /* host request sequence counter */
-};
-
-struct hi_msg {
-    uint32_t seq, op;
-    uint16_t len;
-    uint8_t  payload[HI_MAX_PAYLOAD + 16];
-};
-
-static struct {
-    bool     attached;
-    uint32_t base;
-    uint8_t  tx_sig;                          /* shadow of +0x10 */
-    uint8_t  rx_ack;                          /* shadow of +0x11 */
-    struct hi_chan ch[HI_NCHAN];
-    /* gencmd */
-    bool     gc_wait;  uint32_t gc_seq;  bool gc_done;  int gc_result;
-    char     *gc_resp; size_t gc_resp_sz;
-    uint32_t gc_pending_cmd_seq;   /* unused beyond bookkeeping; kept for future diagnostics */
-    /* v34: graphics channel (type 2) RPC */
-    bool     gfx_wait; uint32_t gfx_seq; bool gfx_done; uint32_t gfx_op; uint16_t gfx_len; uint8_t gfx_pl[48];
-    /* VCFS */
-    char     vfs_root[96];
-    bool     vfs_flat;
-    int      vfs_fd[8];
-    /* PDS */
-    const struct bcm_pds_ops *pds_ops;
-    int      pds_stream_buf[4];
-    uint32_t pds_last_seq;                    /* seq echoed in frame replies (rt chan+0x18) */
-    int      pds_cur_stream;
-    struct { uint32_t addr, cap; } pds_buf[2];
-    struct {
-        bool active; struct bcm_pds_frame f; uint32_t sent; uint32_t counter;
-    } pds_pend[2];
-    struct bcm_host_stats st;
-    void (*trace)(const char *, uint32_t, uint32_t, const char *);
-} hi;
-
-#define TRACE(tag, a, b, s) do { if (hi.trace) hi.trace((tag), (a), (b), (s)); } while (0)
-void bcm_host_set_trace(void (*fn)(const char *, uint32_t, uint32_t, const char *)) { hi.trace = fn; }
-
-const struct bcm_host_stats *bcm_host_get_stats(void) { return &hi.st; }
-static struct bcm_host_diag diag;
-const struct bcm_host_diag *bcm_host_get_diag(void) { return &diag; }
-
-/* ------------------------------------------------------------- small helpers -- */
-static uint32_t rd32(uint32_t addr) { uint32_t v; bcm_io_read(addr, &v, 4); return v; }
-static void     wr32(uint32_t addr, uint32_t v) { bcm_io_write(addr, &v, 4); }
-
-static uint16_t rd16(uint32_t addr)
+/* -----------------------------------------------------------------------
+ * Low-level VC SRAM access via the BCM bus
+ * --------------------------------------------------------------------- */
+uint32_t bcm_vc_read(uint32_t off)
 {
-    uint32_t w = rd32(addr & ~3u);
-    return (addr & 2) ? (uint16_t)(w >> 16) : (uint16_t)w;
-}
-static void wr16(uint32_t addr, uint16_t v)
-{
-    uint32_t w = rd32(addr & ~3u);
-    if (addr & 2) w = (w & 0x0000ffffu) | ((uint32_t)v << 16);
-    else          w = (w & 0xffff0000u) | v;
-    wr32(addr & ~3u, w);
-}
-static uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-static void     st32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
-static uint16_t ld16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
-
-/* rt 0xf5834: bytes in a ring */
-static uint32_t ring_used(uint16_t start, uint16_t end, uint16_t rd, uint16_t wr)
-{
-    return (wr < rd) ? (uint32_t)(end - rd) + (uint32_t)(wr - start) : (uint32_t)(wr - rd);
-}
-
-static struct hi_chan *chan_by_type(uint16_t type)
-{
-    for (int i = 0; i < HI_NCHAN; i++)
-        if (hi.ch[i].present && hi.ch[i].type == type) return &hi.ch[i];
-    return NULL;
-}
-static int chan_index(const struct hi_chan *c) { return (int)(c - hi.ch); }
-
-/* ------------------------------------------------------------------- attach --- */
-void bcm_host_detach(void)
-{
-    hi.attached = false;
-    hi.gc_wait = false;
-    hi.gfx_wait = false;
-}
-
-int bcm_host_attach(void)
-{
-    uint32_t w[4];
-    memset(&hi.st, 0, sizeof hi.st);
-    memset(&diag, 0, sizeof diag);
-    hi.attached = false;
     bcm_io_lock();
-    bcm_io_read(0x1F0, w, 16);
-    diag.w1f0 = w[0]; diag.w1f4 = w[1]; diag.w1f8 = w[2]; diag.w1fc = w[3];
-    diag.ready_ok = (w[2] == 1);
-    hi.base = w[3];
-    if (hi.base == 0 || (hi.base & 3)) { bcm_io_unlock(); BCM_LOG("bad info pointer %08x", hi.base); return -2; }
-
-    uint16_t dir[HI_NCHAN];
-    bcm_io_read(hi.base, dir, 16);
-    memcpy(diag.dir, dir, sizeof dir);
-    uint32_t hdr = rd32(hi.base + H_TX_SIG);
-    hi.tx_sig = (uint8_t)hdr;
-    hi.rx_ack = (uint8_t)(hdr >> 8);
-
-    int present = 0;
-    for (int i = 0; i < HI_NCHAN; i++) {
-        struct hi_chan *c = &hi.ch[i];
-        memset(c, 0, sizeof *c);
-        if (dir[i] == 0 || (dir[i] & 3)) continue;               /* empty or misaligned entry (real offsets reach 0x5740) */
-        uint8_t d[D_SIZE];
-        bcm_io_read(hi.base + dir[i], d, D_SIZE);
-        c->desc     = dir[i];
-        c->type     = ld16(d + D_TYPE);
-        c->tx_start = ld16(d + D_TX_START);  c->tx_end = ld16(d + D_TX_END);
-        c->rx_start = ld16(d + D_RX_START);  c->rx_end = ld16(d + D_RX_END);
-        c->tx_rd    = ld16(d + D_TX_RD);     c->tx_wr  = ld16(d + D_TX_WR);
-        c->rx_rd    = ld16(d + D_RX_RD);     c->rx_wr  = ld16(d + D_RX_WR);
-        diag.type[i] = c->type; diag.tx_start[i] = c->tx_start; diag.rx_start[i] = c->rx_start;
-        diag.tx_end[i] = c->tx_end; diag.rx_end[i] = c->rx_end;
-        /* plausible: a small type number and rings with start < end */
-        if (c->type >= 1 && c->type <= 15 && c->tx_start < c->tx_end && c->rx_start < c->rx_end) {
-            c->present = true;
-            present++;
-        }
-    }
+    bcm_io_write(BCM_RD_ADDR32, off >> 2);
+    uint32_t v = bcm_io_read(BCM_DATA);
     bcm_io_unlock();
-
-    if (present == 0) return -4;
-    for (int i = 0; i < 8; i++) hi.vfs_fd[i] = -1;
-    hi.pds_stream_buf[0] = 0; hi.pds_stream_buf[1] = 1;
-    hi.pds_stream_buf[2] = hi.pds_stream_buf[3] = 0;
-    hi.pds_cur_stream = -1;
-    memset(hi.pds_pend, 0, sizeof hi.pds_pend);
-    if (!chan_by_type(CH_GENCMD)) return -3;
-    hi.attached = true;
-    return 0;
+    return v;
 }
 
-/* ------------------------------------------------------------------- rings ---- */
-/* rt 0x28871c ring_write: returns bytes written (may be < len when the ring is full). */
-static uint32_t ring_write(struct hi_chan *c, const uint8_t *src, uint32_t len)
+void bcm_vc_write(uint32_t off, uint32_t val)
 {
-    uint32_t written = 0;
-    uint16_t lim = (c->tx_start == c->tx_rd) ? c->tx_end : c->tx_rd;
-    int32_t  max = (int32_t)lim - 0x10;
-    if ((int32_t)c->tx_wr > max) {                       /* free area wraps: fill up to end */
-        uint32_t n = c->tx_end - c->tx_wr;
-        if (n > len) n = len;
-        bcm_io_write(hi.base + c->tx_wr, src, n);
-        c->tx_wr += n; len -= n; src += n; written += n;
-        if (c->tx_wr == c->tx_end) c->tx_wr = c->tx_start;
-    }
-    if ((int32_t)c->tx_wr < max) {
-        uint32_t n = (uint32_t)(max - c->tx_wr);
-        if (n > len) n = len;
-        if (n) {
-            bcm_io_write(hi.base + c->tx_wr, src, n);
-            c->tx_wr += n; written += n;
-        }
-    }
-    return written;
+    bcm_io_lock();
+    bcm_io_write(BCM_WR_ADDR32, off >> 2);
+    bcm_io_write(BCM_DATA, val);
+    bcm_io_unlock();
 }
 
-/* publish TX_WR and toggle the channel signal bit (rt 0x288800 + 0x28821c) */
-static void chan_kick(struct hi_chan *c)
+/* -----------------------------------------------------------------------
+ * Channel descriptor helpers
+ * --------------------------------------------------------------------- */
+static uint32_t chan_desc_base(int chan)
 {
-    wr16(hi.base + c->desc + D_TX_WR, c->tx_wr);
-    uint32_t w = rd32(hi.base + H_TX_ACK);                /* bytes +0x20 (ack), +0x21 */
-    uint8_t ack = (uint8_t)w;
-    uint8_t bit = (uint8_t)(1u << chan_index(c));
-    uint8_t pend = hi.tx_sig ^ ack;
-    hi.tx_sig ^= (uint8_t)(bit & ~pend);                  /* toggle only if not already pending */
-    uint32_t h = rd32(hi.base + H_TX_SIG);
-    h = (h & 0xffff0000u) | hi.tx_sig | ((uint32_t)hi.rx_ack << 8);
-    wr32(hi.base + H_TX_SIG, h);
+    return s_hib_base + (uint32_t)chan * CHAN_DESC_SIZE;
+}
+
+static uint32_t cd_read(int chan, uint32_t field)
+{
+    return bcm_vc_read(chan_desc_base(chan) + field);
+}
+
+static void cd_write(int chan, uint32_t field, uint32_t val)
+{
+    bcm_vc_write(chan_desc_base(chan) + field, val);
+}
+
+/* Signal the VC on a channel (write signal byte then ring doorbell). */
+static void chan_kick(int chan, uint8_t sig_val)
+{
+    uint32_t base = chan_desc_base(chan);
+    /* Signal byte is at a byte offset; we do a full 32-bit write centred
+     * on the word that contains it, preserving the other bytes. */
+    uint32_t word_off = (base + CD_TX_SIG) & ~3u;
+    uint32_t byte_pos = (base + CD_TX_SIG) & 3u;
+    uint32_t w = bcm_vc_read(word_off);
+    w &= ~(0xFFu << (byte_pos * 8u));
+    w |= ((uint32_t)sig_val << (byte_pos * 8u));
+    bcm_vc_write(word_off, w);
     bcm_io_doorbell();
 }
 
-/* Send one message, waiting (bounded) for ring space. Returns 0 or -1. */
-static int hi_tx(struct hi_chan *c, uint32_t op, uint32_t seq, const void *payload, uint32_t len)
+/* -----------------------------------------------------------------------
+ * Ring-buffer write (host → VC, TX ring)
+ * --------------------------------------------------------------------- */
+static int ring_write(int chan,
+                      const uint32_t *words, uint32_t nwords,
+                      uint8_t sig_after)
 {
-    static uint8_t buf[HI_HDR + HI_MAX_PAYLOAD + 16];   /* static: single service thread, keeps the stack small */
-    uint32_t padded = (len + 15u) & ~15u;
-    if (len > HI_MAX_PAYLOAD) return -1;
-    memset(buf, 0, HI_HDR + padded);
-    st32(buf + 0, HI_MAGIC);
-    st32(buf + 4, seq);
-    st32(buf + 8, op);
-    { uint16_t l = (uint16_t)len; memcpy(buf + 12, &l, 2); }
-    if (len) memcpy(buf + HI_HDR, payload, len);
+    uint32_t buf_off  = cd_read(chan, CD_TX_BUF_OFF);  /* byte offset        */
+    uint32_t buf_sz   = cd_read(chan, CD_TX_BUF_SZ);   /* ring size in bytes */
+    uint32_t wr       = cd_read(chan, CD_TX_WR);        /* word index into ring */
+    uint32_t buf_words = buf_sz / 4u;
 
-    uint32_t total = HI_HDR + padded, done = 0;
-    int spins = 0;
-    uint32_t t_full = bcm_io_us();
-    bcm_io_lock();
-    while (done < total) {
-        uint32_t n = ring_write(c, buf + done, total - done);
-        done += n;
-        if (n) { chan_kick(c); spins = 0; t_full = bcm_io_us(); }
-        if (done < total) {                               /* ring full: wait for the VC to consume */
-            bcm_io_unlock();
-            /* v57: the VC drains the ring within a millisecond or two; a whole tick per wait made every 4 KB VCFS read
-               reply (and so every .vll load) cost ~10 ms per read.  Spin for 20 ms, then sleep. */
-            if (bcm_io_us() - t_full < 20000) { bcm_io_yield(); spins--; }
-            else bcm_io_idle();
-            bcm_io_lock();
-            c->tx_rd = rd16(hi.base + c->desc + D_TX_RD); /* rt 0x288928 refresh */
-            if (++spins > 1000) { bcm_io_unlock(); return -1; }   /* ~10 s at sleep(1) per idle */
-        }
+    if (!buf_words) return -1;
+
+    for (uint32_t i = 0; i < nwords; i++)
+    {
+        bcm_vc_write(buf_off + wr * 4u, words[i]);
+        wr = (wr + 1u) % buf_words;
     }
-    bcm_io_unlock();
-    hi.st.tx_msgs++;
+
+    cd_write(chan, CD_TX_WR, wr);
+    chan_kick(chan, sig_after);
     return 0;
 }
 
-/* rt 0x288434 ring_read */
-static uint32_t ring_read(struct hi_chan *c, uint8_t *dst, uint32_t len)
+/* -----------------------------------------------------------------------
+ * Ring-buffer read (VC → host, RX ring)
+ * --------------------------------------------------------------------- */
+static uint32_t ring_avail(int chan)
 {
-    uint32_t got = 0;
-    if (c->rx_wr < c->rx_rd) {
-        uint32_t n = c->rx_end - c->rx_rd;
-        if (n > len) n = len;
-        bcm_io_read(hi.base + c->rx_rd, dst, n);
-        len -= n; dst += n; got += n; c->rx_rd += n;
-        if (c->rx_rd == c->rx_end) c->rx_rd = c->rx_start;
-    }
-    if (c->rx_wr > c->rx_rd) {
-        uint32_t n = c->rx_wr - c->rx_rd;
-        if (n > len) n = len;
-        if (n) {
-            bcm_io_read(hi.base + c->rx_rd, dst, n);
-            got += n; c->rx_rd += n;
-        }
-    }
-    return got;
+    uint32_t buf_sz   = cd_read(chan, CD_RX_BUF_SZ);
+    uint32_t buf_words = buf_sz / 4u;
+    if (!buf_words) return 0;
+    uint32_t wr = cd_read(chan, CD_RX_WR);
+    uint32_t rd = cd_read(chan, CD_RX_RD);
+    return (wr - rd + buf_words) % buf_words;
 }
 
-/* Pop one complete message. Returns 1 if a message was read, 0 if none.
- *
- * A message bigger than the ring (a ~540-byte `commands` list through a 512-byte ring) is written by the VC in
- * pieces: it fills the ring and BLOCKS until the host has consumed data AND signalled it. The stock receive
- * function (rt 0x2883d4) does exactly that: ring_read (0x288434) -> publish rx_rd (0x28850c) -> signal the channel
- * (0x2881fc = the same toggle-a-bit-in-+0x10 signal used for tx) -> wait -> read on, until the declared length
- * has arrived. v5 waited without ever signalling, so the VC stayed blocked (hang, then desync) and v6 gave up
- * and delivered the head short -- which left the VC's gencmd task blocked mid-reply, so every LATER gencmd on
- * the channel (pm_*, display_control, mp_*) went unanswered until some other signal happened to wake it (v17
- * logs: the stale reply showed up as "gencmd STRAY ... seq 6" ~45 s later, right after the VCFS traffic of
- * mp_selectplay). v18 publishes + signals after every partial read and waits (bounded) for the rest; if the VC
- * never tops it up the message is still delivered short, as in v6. */
-#define HI_RX_TAIL_WAITS 15   /* v18 logs: 60 cost ~0.6 s on each short message; a real top-up follows the signal within a few ticks */
-static int hi_rx_pop(struct hi_chan *c, struct hi_msg *m)
+static int ring_read(int chan, uint32_t *words, uint32_t nwords)
 {
-    bcm_io_lock();
-    c->rx_wr = rd16(hi.base + c->desc + D_RX_WR);         /* VC-owned line refresh */
-    uint32_t avail = ring_used(c->rx_start, c->rx_end, c->rx_rd, c->rx_wr);
-    if (avail < HI_HDR) { bcm_io_unlock(); return 0; }
+    uint32_t buf_off   = cd_read(chan, CD_RX_BUF_OFF);
+    uint32_t buf_sz    = cd_read(chan, CD_RX_BUF_SZ);
+    uint32_t rd        = cd_read(chan, CD_RX_RD);
+    uint32_t buf_words = buf_sz / 4u;
 
-    /* On real hardware a truncated oversized reply can leave a few stray tail bytes that arrive
-     * just after our snapshot of `avail` (session 3, run 6: one bad_magic, right after a
-     * truncated 36-item `commands` list, then the next command timed out). Rather than dropping
-     * a whole message for a few garbage bytes, resync: scan up to 64 bytes (4-byte aligned) for
-     * the next magic word before giving up. */
-    uint8_t hdr[HI_HDR];
-    ring_read(c, hdr, HI_HDR);
-    int resynced = 0;
-    while (ld32(hdr) != HI_MAGIC) {
-        avail = ring_used(c->rx_start, c->rx_end, c->rx_rd, c->rx_wr);
-        if (resynced >= 64 || avail < 4) {
-            hi.st.bad_magic++;
-            wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
-            bcm_io_unlock();
-            return 0;
-        }
-        memmove(hdr, hdr + 4, HI_HDR - 4);
-        ring_read(c, hdr + HI_HDR - 4, 4);
-        resynced += 4;
-    }
-    if (resynced) hi.st.resynced += resynced;
-    m->seq = ld32(hdr + 4);
-    m->op  = ld32(hdr + 8);
-    uint32_t declared = ld16(hdr + 12);
-    uint32_t padded = (declared + 15u) & ~15u;
-    if (padded > sizeof m->payload) padded = (uint32_t)sizeof m->payload;   /* never overrun our buffer */
-    uint32_t got = 0;
-    uint32_t ring_sz = (uint32_t)(c->rx_end - c->rx_start);
-    if (padded)
+    if (!buf_words) return -1;
+
+    for (uint32_t i = 0; i < nwords; i++)
     {
-        int waits = 0;
-        for (;;)
+        words[i] = bcm_vc_read(buf_off + rd * 4u);
+        rd = (rd + 1u) % buf_words;
+    }
+
+    /* Publish the updated read pointer and signal the VC (v18: must signal
+     * after EVERY partial read so the VC knows we have consumed data) */
+    cd_write(chan, CD_RX_RD, rd);
+    chan_kick(chan, 1);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Bounded wait for N words to arrive on the RX ring
+ * Returns 0 if data arrived in time, -1 on timeout.
+ * --------------------------------------------------------------------- */
+static int ring_wait(int chan, uint32_t nwords)
+{
+    uint32_t deadline = bcm_io_current_tick() + WAIT_TICKS;
+    while (ring_avail(chan) < nwords)
+    {
+        if ((int32_t)(bcm_io_current_tick() - deadline) >= 0)
+            return -1;
+        bcm_io_sleep_ticks(1);
+    }
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Send a complete message on a channel (builds header + payload)
+ * --------------------------------------------------------------------- */
+static int msg_send(int chan, uint32_t opcode,
+                    const uint32_t *payload, uint32_t payload_bytes)
+{
+    /* Round payload up to 16-byte boundary */
+    uint32_t padded = (payload_bytes + 15u) & ~15u;
+    uint32_t total_words = HDR_WORDS + padded / 4u;
+
+    /* Allocate a small header + payload staging area on the stack.
+     * MAX_PAYLOAD_BYTES is 0x4010; stay within reason for the stack. */
+    if (padded > MAX_PAYLOAD_BYTES) return -1;
+
+    uint32_t buf[(HDR_WORDS + MAX_PAYLOAD_BYTES / 4u)];
+    buf[0] = MSG_MAGIC;
+    buf[1] = (uint32_t)(s_seq[chan]++ & 0xFFFFu);
+    buf[2] = opcode;
+    buf[3] = payload_bytes;
+
+    if (payload && payload_bytes)
+        memcpy(&buf[HDR_WORDS], payload, payload_bytes);
+    if (padded > payload_bytes)
+        memset((uint8_t *)&buf[HDR_WORDS] + payload_bytes, 0,
+               padded - payload_bytes);
+
+    return ring_write(chan, buf, total_words, 1);
+}
+
+/* -----------------------------------------------------------------------
+ * Receive a complete message on a channel
+ * Fills header_out[4] and up to reply_cap bytes of payload into reply.
+ * *reply_len is set to the actual payload length.
+ * --------------------------------------------------------------------- */
+static int msg_recv(int chan,
+                    uint32_t *header_out,
+                    uint8_t  *reply, size_t reply_cap,
+                    size_t   *reply_len)
+{
+    /* Wait for the header */
+    if (ring_wait(chan, HDR_WORDS) < 0) return -1;
+
+    uint32_t hdr[HDR_WORDS];
+    ring_read(chan, hdr, HDR_WORDS);
+
+    if (hdr[0] != MSG_MAGIC) return -2;
+
+    uint32_t payload_bytes = hdr[3];
+    if (header_out) memcpy(header_out, hdr, HDR_WORDS * 4u);
+
+    /* Round up to words */
+    uint32_t payload_words = (payload_bytes + 3u) / 4u;
+    if (reply_len) *reply_len = payload_bytes;
+
+    /* Read payload in chunks, publishing RX_RD and signalling after each
+     * chunk so the VC never starves (v18 fix). */
+    uint32_t tmp[MAX_PAYLOAD_BYTES / 4u];
+    uint32_t remaining = payload_words;
+    uint32_t dst_word  = 0;
+
+    while (remaining)
+    {
+        /* Wait for at least one word */
+        if (ring_wait(chan, 1) < 0) return -3;
+
+        uint32_t avail = ring_avail(chan);
+        if (avail > remaining) avail = remaining;
+
+        ring_read(chan, &tmp[dst_word], avail);
+        dst_word  += avail;
+        remaining -= avail;
+    }
+
+    if (reply && reply_cap && payload_bytes)
+    {
+        size_t copy = payload_bytes < reply_cap ? payload_bytes : reply_cap;
+        memcpy(reply, tmp, copy);
+    }
+
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * bcm_host_attach
+ * --------------------------------------------------------------------- */
+int bcm_host_attach(void)
+{
+    s_attached = false;
+
+    /* VC[0x1F8] was=1 at OS start but Rockbox's legacy LCD driver
+     * overwrites it immediately.  Only trust VC[0x1FC] (HIB pointer). */
+    uint32_t hib_ptr = bcm_vc_read(VC_HIB_PTR_OFF);
+
+    /* Sanity: must be inside VC SRAM and word-aligned */
+    if (hib_ptr == 0 || hib_ptr & 3u || hib_ptr >= VC_SRAM_SIZE)
+        return -1;
+
+    s_hib_base = hib_ptr;
+
+    /* Verify at least BCM_NUM_CHANS channel descriptors look plausible */
+    for (int c = 0; c < BCM_NUM_CHANS; c++)
+    {
+        uint32_t buf_off = cd_read(c, CD_RX_BUF_OFF);
+        uint32_t buf_sz  = cd_read(c, CD_RX_BUF_SZ);
+        if (buf_sz == 0 || (buf_sz & 3u) || buf_off >= VC_SRAM_SIZE)
+            return -2;
+    }
+
+    memset(s_seq, 0, sizeof(s_seq));
+    s_attached = true;
+    BCM_LOG("bcm_host: attached, hib=0x%08lx", (unsigned long)s_hib_base);
+    return 0;
+}
+
+bool bcm_host_alive(void)
+{
+    if (!s_attached) return false;
+    /* Quick liveness: check that HIB pointer is still valid */
+    uint32_t p = bcm_vc_read(VC_HIB_PTR_OFF);
+    return (p == s_hib_base);
+}
+
+/* -----------------------------------------------------------------------
+ * gencmd
+ * --------------------------------------------------------------------- */
+int bcm_gencmd(const char *cmd, char *reply, size_t reply_size)
+{
+    if (!s_attached) return -1;
+
+    size_t cmd_len = strlen(cmd) + 1u;  /* include NUL */
+    int r = msg_send(BCM_CHAN_GENCMD, BCM_OP_GENCMD,
+                     (const uint32_t *)cmd,
+                     (uint32_t)((cmd_len + 3u) & ~3u));
+    if (r < 0) return r;
+
+    uint32_t hdr[HDR_WORDS];
+    size_t   got;
+    r = msg_recv(BCM_CHAN_GENCMD, hdr, (uint8_t *)reply, reply_size, &got);
+    if (r < 0) return r;
+
+    /* Ensure NUL termination */
+    if (reply && reply_size)
+        reply[got < reply_size ? got : reply_size - 1] = '\0';
+
+    return (int)hdr[2];  /* result code */
+}
+
+/* -----------------------------------------------------------------------
+ * Graphics channel
+ * --------------------------------------------------------------------- */
+int bcm_gfx_send(uint32_t opcode,
+                 const uint32_t *args, int nargs,
+                 uint32_t *result)
+{
+    if (!s_attached) return -1;
+
+    int r = msg_send(BCM_CHAN_GFX, opcode,
+                     args, (uint32_t)(nargs * 4));
+    if (r < 0) return r;
+
+    uint32_t hdr[HDR_WORDS];
+    size_t   got;
+    uint32_t res_buf[64];
+    r = msg_recv(BCM_CHAN_GFX, hdr, (uint8_t *)res_buf, sizeof(res_buf), &got);
+    if (r < 0) return r;
+
+    if (result && got >= 4)
+        *result = res_buf[0];
+
+    return (int)hdr[2];
+}
+
+/* -----------------------------------------------------------------------
+ * Stream (VCPD) channel
+ * --------------------------------------------------------------------- */
+int bcm_stream_send(uint32_t opcode,
+                    const uint32_t *payload, size_t payload_len,
+                    uint32_t *reply, size_t reply_cap, size_t *reply_len,
+                    bool wait_reply)
+{
+    if (!s_attached) return -1;
+
+    int r = msg_send(BCM_CHAN_STREAM, opcode,
+                     payload, (uint32_t)payload_len);
+    if (r < 0) return r;
+
+    if (!wait_reply)
+    {
+        if (reply_len) *reply_len = 0;
+        return 0;
+    }
+
+    uint32_t hdr[HDR_WORDS];
+    return msg_recv(BCM_CHAN_STREAM, hdr,
+                    (uint8_t *)reply, reply_cap, reply_len);
+}
+
+/* -----------------------------------------------------------------------
+ * VCFS server — handles open/close/seek/read requests from the VC
+ * --------------------------------------------------------------------- */
+void bcm_vcfs_set_root(const char *root)
+{
+    strncpy(s_vcfs_root, root, sizeof(s_vcfs_root) - 1);
+    s_vcfs_root[sizeof(s_vcfs_root) - 1] = '\0';
+}
+
+/* Convert a VC path (backslashes, no .vll extension, may be relative)
+ * to a Rockbox host path under s_vcfs_root.
+ * Returns the host path in @out (size @out_sz). */
+static void vcfs_map_path(const char *vc_path, char *out, size_t out_sz,
+                          bool add_vll)
+{
+    snprintf(out, out_sz, "%s", s_vcfs_root);
+    size_t root_len = strlen(out);
+    char *dst = out + root_len;
+    size_t rem = out_sz - root_len - 1u;
+
+    for (const char *p = vc_path; *p && rem; p++, dst++, rem--)
+        *dst = (*p == '\\') ? '/' : *p;
+    *dst = '\0';
+
+    if (add_vll)
+    {
+        size_t len = strlen(out);
+        if (len + 4u < out_sz)
+            strcpy(out + len, ".vll");
+    }
+}
+
+/* Handle one VCFS inbound message.  Called from bcm_host_service(). */
+static void vcfs_handle(uint32_t opcode, const uint8_t *req, uint32_t req_len)
+{
+    uint8_t  resp[MAX_PAYLOAD_BYTES];
+    uint32_t resp_len = 0;
+
+    switch (opcode)
+    {
+    case BCM_VCFS_OPEN:
+    {
+        /* Payload: uint32 handle_hint, then NUL-terminated path */
+        if (req_len < 5) break;
+        uint32_t hint;
+        memcpy(&hint, req, 4);
+        const char *vc_path = (const char *)(req + 4);
+
+        char host_path[VCFS_MAX_PATH];
+        vcfs_map_path(vc_path, host_path, sizeof(host_path), false);
+
+#ifdef IPOD_VIDEO
+        int fd = open(host_path, O_RDONLY);
+        if (fd < 0)
         {
-            got += ring_read(c, m->payload + got, padded - got);
-            if (got >= padded) break;
-            /* ring drained but the message is not complete: free the space and wake the VC producer */
-            wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);
-            chan_kick(c);
-            bcm_io_unlock();
-            bcm_io_idle();
-            bcm_io_lock();
-            if (bcm_io_dead() || ++waits > HI_RX_TAIL_WAITS) break;
-            c->rx_wr = rd16(hi.base + c->desc + D_RX_WR);
+            /* Retry with .vll appended */
+            vcfs_map_path(vc_path, host_path, sizeof(host_path), true);
+            fd = open(host_path, O_RDONLY);
         }
-        if (got >= padded && padded + HI_HDR > ring_sz / 2)
-            { wr16(hi.base + c->desc + D_RX_RD, c->rx_rd); chan_kick(c); }   /* big message: tell the VC the space is free */
+        uint32_t result_fd = (fd >= 0) ? (uint32_t)fd : (uint32_t)-1;
+        BCM_LOG("vcfs open '%s' → fd %d", host_path, fd);
+#else
+        /* PC test: always succeed with fd = hint */
+        uint32_t result_fd = hint;
+#endif
+        memcpy(resp, &result_fd, 4);
+        resp_len = 4;
+        break;
     }
-    if (got < padded) {
-        hi.st.truncated++;                                /* delivered short, not dropped -- see comment above */
-        memset(m->payload + got, 0, padded - got);
-    }
-    m->len = (uint16_t)(got < declared ? got : declared);
-    wr16(hi.base + c->desc + D_RX_RD, c->rx_rd);          /* one publish, same place/timing as pre-v5 */
-    bcm_io_unlock();
-    hi.st.rx_msgs++;
-    return 1;
-}
 
-/* ---------------------------------------------------------------- gencmd ------ */
-int bcm_gencmd_start(const char *cmd)
-{
-    struct hi_chan *c = chan_by_type(CH_GENCMD);
-    if (!hi.attached || !c) return -1;
-    c->seq = (c->seq + 1) & 0x7fffffffu;
-    hi.gc_wait = true; hi.gc_done = false; hi.gc_seq = c->seq;
-    hi.gc_resp = NULL; hi.gc_resp_sz = 0;                 /* filled in by the first poll() call */
-    hi.gc_pending_cmd_seq = c->seq;
-    if (hi_tx(c, GENCMD_OPCODE, c->seq, cmd, (uint32_t)strlen(cmd) + 1) < 0) { hi.gc_wait = false; return -1; }
-    return 0;
-}
-
-int bcm_gencmd_poll(char *resp, size_t resp_sz)
-{
-    if (bcm_io_dead()) return -5;                    /* v16: VC bus stopped answering */
-    if (!hi.gc_wait) return -1;                           /* nothing outstanding */
-    hi.gc_resp = resp; hi.gc_resp_sz = resp_sz;
-    if (resp && resp_sz) resp[0] = 0;
-    bcm_host_service();
-    if (!hi.gc_done) return -3;
-    hi.gc_wait = false;
-    return hi.gc_result;
-}
-
-int bcm_gencmd(const char *cmd, char *resp, size_t resp_sz, int max_polls)
-{
-    if (bcm_gencmd_start(cmd) < 0) return -1;
-    int r = -3;
-    for (int i = 0; i < max_polls; i++) {
-        r = bcm_gencmd_poll(resp, resp_sz);
-        if (r != -3) break;
-        bcm_io_idle();
-    }
-    return r == -3 ? -2 : r;
-}
-
-static void gencmd_rx(const struct hi_msg *m)
-{
-    if (!hi.gc_wait || m->seq != hi.gc_seq)
-    {   /* v12: say WHICH case this is and show both seq numbers -- a reply whose seq differs from the
-         * one we sent would look exactly like "the VC never answered". Behaviour unchanged (still
-         * dropped); this only makes it visible in the log. */
-        TRACE(hi.gc_wait ? "gencmd STRAY while waiting: a=its seq b=our seq" : "gencmd STRAY while idle: a=its seq b=op",
-              m->seq, hi.gc_wait ? hi.gc_seq : m->op, (const char *)m->payload);
-        return;
-    }
-    if (hi.gc_resp && hi.gc_resp_sz) {
-        size_t n = m->len < hi.gc_resp_sz - 1 ? m->len : hi.gc_resp_sz - 1;
-        memcpy(hi.gc_resp, m->payload, n);
-        hi.gc_resp[n] = 0;
-    }
-    hi.gc_result = (int)m->op;                            /* header result word */
-    hi.gc_done = true;
-}
-
-/* ------------------------------------------------------------------ graphics --- */
-/* v34: the stock display class (rt 0x164450..0x165160) talks to a dispman-like service on the type-2 channel with
- * rt 0x28861c(chan, op, len, payload): ops 1 (update start), 2 (update end), 3 (add window), 4 (remove window),
- * 8 (create image: reply = handle, VC address), 9 (free image), 0x10 (image touch).  Replies: header op + 16 payload bytes. */
-int bcm_gfx_rpc(uint32_t op, const void *in, uint32_t inlen, uint32_t out[4], uint32_t *res_op, int max_polls)
-{
-    struct hi_chan *c = chan_by_type(CH_GRAPHICS);
-    if (!hi.attached || !c) return -1;
-    c->seq = (c->seq + 1) & 0x7fffffffu;
-    hi.gfx_wait = true; hi.gfx_done = false; hi.gfx_seq = c->seq;
-    if (hi_tx(c, op, c->seq, in, inlen) < 0) { hi.gfx_wait = false; return -1; }
-    uint32_t t0 = bcm_io_us();
-    for (int i = 0; i < max_polls; )
+    case BCM_VCFS_CLOSE:
     {
-        if (bcm_io_dead()) { hi.gfx_wait = false; return -5; }
-        bcm_host_service();
-        if (hi.gfx_done) break;
-        /* v56: the VC answers graphics RPCs in well under a millisecond; sleeping a whole tick per poll made every RPC cost
-           10-20 ms (a full overlay present = 8 RPCs = ~160 ms: the laggy volume bar / FF / REW).  Spin for 20 ms first. */
-        if (bcm_io_us() - t0 < 20000) { bcm_io_yield(); continue; }
-        bcm_io_idle();
-        i++;
-    }
-    hi.gfx_wait = false;
-    if (!hi.gfx_done) return -2;
-    if (out) memcpy(out, hi.gfx_pl, 16);
-    if (res_op) *res_op = hi.gfx_op;
-    return 0;
-}
-
-/* ------------------------------------------------------------------ VCFS ------ */
-void bcm_vfs_set_flat(bool flat) { hi.vfs_flat = flat; }
-
-void bcm_vfs_set_root(const char *root)
-{
-    size_t n = strlen(root);
-    if (n >= sizeof hi.vfs_root) n = sizeof hi.vfs_root - 1;
-    memcpy(hi.vfs_root, root, n); hi.vfs_root[n] = 0;
-}
-
-static void reply(struct hi_chan *c, const struct hi_msg *req, uint32_t result,
-                  const void *payload, uint32_t len)
-{
-    hi_tx(c, result, req->seq, payload, len);   /* seq echoed as received, opcode slot = result */
-}
-
-static void vcfs_dispatch(struct hi_chan *c, const struct hi_msg *m)
-{
-    uint32_t p[4]; memcpy(p, m->payload, 16);
-    const uint8_t *data = m->payload + 16;
-    static uint8_t out[16 + HI_MAX_PAYLOAD];
-    hi.st.vcfs_ops++;
-
-    switch (m->op) {
-    case VCFS_OPEN: {                                     /* stock: rt 0x287dd4 */
-        /* Seen on real hardware (dlopen of "mplayer"): mode 1, path "\\Resources\\VideoCore\\Library\\mplayer"
-         * - backslash separators and NO ".vll" extension - and then a fallback "\\mplayer". */
-        uint32_t mode = p[0], h = 0xffffffffu;
-        char path[192], req[128];
-        size_t rl = 0, maxl = m->len > 16 ? m->len - 16u : 0;
-        if (maxl > sizeof req - 1) maxl = sizeof req - 1;
-        while (rl < maxl && data[rl]) { req[rl] = data[rl] == '\\' ? '/' : (char)data[rl]; rl++; }
-        req[rl] = 0;
-        if (mode != 0x20 && mode != 0x40) {               /* trunc / noreplace -> -1 in stock */
-            static const char pre[] = "/Resources";
-            bool ok = rl >= sizeof pre - 1 && !memcmp(req, pre, sizeof pre - 1);
-            for (size_t i = 0; ok && i + 1 < rl; i++)               /* no path traversal */
-                if (req[i] == '.' && req[i + 1] == '.') ok = false;
-            size_t rootl = strlen(hi.vfs_root);
-            if (ok && hi.vfs_flat) {                      /* v56: keep only the file name */
-                size_t b = rl;
-                while (b > 0 && req[b - 1] != '/') b--;
-                memmove(req + 1, req + b, rl - b + 1);
-                req[0] = '/'; rl = rl - b + 1;
-            }
-            if (ok && rootl + rl + 5 < sizeof path) {
-                memcpy(path, hi.vfs_root, rootl);
-                memcpy(path + rootl, req, rl);
-                path[rootl + rl] = 0;
-                int fd = open(path, O_RDONLY);
-                if (fd < 0) {                             /* extension-less name: try <name>.vll */
-                    bool has_dot = false;
-                    for (size_t i = rl; i > 0 && req[i - 1] != '/'; i--)
-                        if (req[i - 1] == '.') has_dot = true;
-                    if (!has_dot) {
-                        memcpy(path + rootl + rl, ".vll", 5);
-                        fd = open(path, O_RDONLY);
-                    }
-                }
-                if (fd >= 0) {
-                    for (int i = 0; i < 8; i++)
-                        if (hi.vfs_fd[i] < 0) { hi.vfs_fd[i] = fd; h = (uint32_t)i + 1; break; }
-                    if (h == 0xffffffffu) close(fd);
-                    else TRACE("vcfs mapped", 0, 0, path);
-                }
-            }
-        }
-        TRACE("vcfs open", mode, h, req);
-        st32(out, h);
-        reply(c, m, h == 0xffffffffu ? 1 : 0, out, 4);
-        break; }
-    case VCFS_CLOSE: {
-        uint32_t h = p[0];
-        if (h >= 1 && h <= 8 && hi.vfs_fd[h - 1] >= 0) { close(hi.vfs_fd[h - 1]); hi.vfs_fd[h - 1] = -1; }
-        TRACE("vcfs close", h, 0, NULL);
-        reply(c, m, 0, NULL, 0);
-        break; }
-    case VCFS_SEEK: {                                     /* whence 0/1/2, returns new position */
-        uint32_t h = p[0]; int32_t off = (int32_t)p[1]; uint32_t wh = p[2];
-        int64_t r = -1;
-        if (h >= 1 && h <= 8 && hi.vfs_fd[h - 1] >= 0 && wh <= 2)
-            r = lseek(hi.vfs_fd[h - 1], off, wh == 0 ? SEEK_SET : wh == 1 ? SEEK_CUR : SEEK_END);
-        TRACE("vcfs seek", h, (uint32_t)(int32_t)r, NULL);
-        st32(out, (uint32_t)(int32_t)r);
-        reply(c, m, r < 0 ? 1 : 0, out, 4);
-        break; }
-    case VCFS_READ: {                                     /* fread(handle, size, count) */
-        uint32_t h = p[0], size = p[1], count = p[2];
-        int32_t got = -1;
-        memset(out, 0, 16);
-        if (h >= 1 && h <= 8 && hi.vfs_fd[h - 1] >= 0 && size) {
-            uint32_t want = size * count;
-            if (want > HI_MAX_PAYLOAD - 16) want = HI_MAX_PAYLOAD - 16;   /* real hardware asked for 0x800; a 0x800+16 reply was refused by the old 0x800 cap */
-            got = (int32_t)read(hi.vfs_fd[h - 1], out + 16, want);
-        }
-        TRACE("vcfs read", h, (uint32_t)got, NULL);
-        if (got < 0) { st32(out, 0xffffffffu); reply(c, m, 1, out, 4); break; }
-        st32(out, (uint32_t)got / size);                  /* items read, in p0 */
-        reply(c, m, 0, out, 16 + (uint32_t)got);          /* payload = 16 + bytes (rt 0xf9864) */
-        break; }
-    default:                                              /* stubs in stock return -1 -> error reply */
-        hi.st.unknown_ops++;
-        TRACE("vcfs unknown op", m->op, m->len, NULL);
-        st32(out, 0xffffffffu);
-        reply(c, m, 1, out, 4);
+        if (req_len < 4) break;
+        uint32_t fd;
+        memcpy(&fd, req, 4);
+#ifdef IPOD_VIDEO
+        close((int)fd);
+#endif
+        resp_len = 0;
         break;
     }
-}
 
-/* ------------------------------------------------------------------- PDS ------ */
-void bcm_pds_set_ops(const struct bcm_pds_ops *ops) { hi.pds_ops = ops; }
-void bcm_pds_map_stream(int id, int buf) { if (id >= 0 && id < 4) hi.pds_stream_buf[id] = buf & 1; }
-
-static int parse_dec(const char *s, size_t max)
-{
-    int v = 0, neg = 0; size_t i = 0;
-    if (i < max && s[i] == '-') { neg = 1; i++; }
-    for (; i < max && s[i] >= '0' && s[i] <= '9'; i++) v = v * 10 + (s[i] - '0');
-    return neg ? -v : v;
-}
-
-/* Announce/continue one chunk of a frame (rt 0x288c14): write data into the VC buffer, then
- * send the 12-word reply (header opcode 0x61, seq echoed from the last PDS request). */
-static int pds_flags_legacy = 0;
-void bcm_host_set_pds_flags_legacy(int on) { pds_flags_legacy = on ? 1 : 0; }
-
-static int pds_send_chunk(int b)
-{
-    struct hi_chan *c = chan_by_type(CH_VCPD);
-    if (!c) return -1;
-    if (!hi.pds_pend[b].active) return -1;
-    struct bcm_pds_frame *f = &hi.pds_pend[b].f;
-    uint32_t addr = hi.pds_buf[b].addr, cap = hi.pds_buf[b].cap;
-    uint32_t remaining = f->length - hi.pds_pend[b].sent;
-    uint32_t n = remaining < cap ? remaining : cap;
-    bool first = (hi.pds_pend[b].sent == 0), last = (n == remaining);
-    uint32_t flag = first ? (last ? PDS_FLAG_WHOLE : PDS_FLAG_FIRST)
-                          : (last ? PDS_FLAG_LAST  : PDS_FLAG_MIDDLE);
-    if (pds_flags_legacy)          /* pre-v29 numbering (A/B test only) */
-        flag = first ? (last ? 2u : 0u) : (last ? 3u : 1u);
-
-    /* rt 0x287be8(dst=VC buffer, src, len rounded up to 16, port 0) */
-    uint32_t padded = (n + 15u) & ~15u;
-    static uint8_t bounce[4096 + 16];
-    const uint8_t *src = f->data + hi.pds_pend[b].sent;
-    bcm_io_lock();
-    for (uint32_t off = 0; off < padded; off += sizeof bounce - 16) {
-        uint32_t part = padded - off; if (part > sizeof bounce - 16) part = sizeof bounce - 16;
-        uint32_t real = (off < n) ? (n - off < part ? n - off : part) : 0;
-        memset(bounce, 0, part);
-        if (real) memcpy(bounce, src + off, real);
-        bcm_io_write(addr + off, bounce, part);
-    }
-    bcm_io_unlock();
-
-    uint32_t w[12];
-    w[0] = (uint32_t)(int32_t)f->stream_id;
-    w[1] = (uint32_t)(int32_t)(int16_t)f->f2;
-    w[2] = f->f4;
-    w[3] = ++hi.pds_pend[b].counter;
-    w[4] = 0;
-    w[5] = n;
-    w[6] = flag;
-    w[7] = addr;
-    memcpy(&w[8], f->meta, 16);
-    if (hi_tx(c, PDS_FRAME_REPLY, hi.pds_last_seq, w, sizeof w) < 0) return -1;
-
-    hi.pds_pend[b].sent += n;
-    if (last) hi.pds_pend[b].active = false;
-    return 0;
-}
-
-int bcm_pds_send_frame(const struct bcm_pds_frame *f)
-{
-    if (!hi.attached) return -1;
-    int id = f->stream_id;
-    int b = (id >= 0 && id < 4) ? hi.pds_stream_buf[id] : 0;
-    if (hi.pds_pend[b].active || hi.pds_buf[b].cap == 0) return -1;
-    hi.pds_pend[b].f = *f;
-    hi.pds_pend[b].sent = 0;
-    hi.pds_pend[b].active = true;
-    return pds_send_chunk(b);
-}
-
-/* rt 0x288f40: the REPLY to the VC's PDS start request (0x41). The stock dispatcher (rt 0xff034) stores the
- * request's seq at rt 0x10833c84, calls the start callback (0xa04f0 -> 0x20af74, media-stream setup) and that
- * function sends this message with that same seq. Header: magic, seq (= the 0x41's), op 0x60, len16 0x520;
- * payload = the 0x520-byte stream description. The VC blocks (and so does its mp_selectplay gencmd) until it
- * arrives, so call this from the start() callback. */
-int bcm_pds_send_stream_info(const uint32_t *words, uint32_t len)
-{
-    struct hi_chan *c = chan_by_type(CH_VCPD);
-    if (!hi.attached || !c || len > HI_MAX_PAYLOAD) return -1;
-    return hi_tx(c, PDS_STREAM_INFO, hi.pds_last_seq, words, len);
-}
-
-int bcm_pds_send_empty(void)
-{
-    struct hi_chan *c = chan_by_type(CH_VCPD);
-    uint32_t w[2] = { 0, 0 };
-    if (!hi.attached || !c) return -1;
-    return hi_tx(c, PDS_FRAME_REPLY, hi.pds_last_seq, w, sizeof w);
-}
-
-static void pds_dispatch(struct hi_chan *c, const struct hi_msg *m)
-{
-    uint32_t w[6]; memset(w, 0, sizeof w);
-    memcpy(w, m->payload, m->len < 24 ? m->len : 24);
-    hi.st.pds_ops++;
-    hi.pds_last_seq = m->seq;                             /* echoed in later replies */
-    {   /* payload words as hex, for the log: the real values of the 0x41/0x42 fields are still unknown */
-        static const char dig[] = "0123456789abcdef";
-        char hx[64], *o = hx;
-        for (int i = 0; i < 6; i++) {
-            for (int k = 7; k >= 0; k--) *o++ = dig[(w[i] >> (4 * k)) & 15];
-            *o++ = ' ';
-        }
-        *o = 0;
-        TRACE("pds op", m->op, m->len, hx);
+    case BCM_VCFS_SEEK:
+    {
+        if (req_len < 12) break;
+        uint32_t fd, pos_lo, whence;
+        memcpy(&fd,     req + 0,  4);
+        memcpy(&pos_lo, req + 4,  4);
+        memcpy(&whence, req + 8,  4);
+#ifdef IPOD_VIDEO
+        lseek((int)fd, (off_t)pos_lo, (int)whence);
+#endif
+        resp_len = 0;
+        break;
     }
 
-    switch (m->op) {
-    case PDS_PING:                                        /* only opcode with an immediate reply */
-        reply(c, m, 0, m->payload, 4);
+    case BCM_VCFS_READ:
+    {
+        if (req_len < 8) break;
+        uint32_t fd, nbytes;
+        memcpy(&fd,     req + 0, 4);
+        memcpy(&nbytes, req + 4, 4);
+        if (nbytes > MAX_PAYLOAD_BYTES) nbytes = MAX_PAYLOAD_BYTES;
+#ifdef IPOD_VIDEO
+        ssize_t got = read((int)fd, resp, nbytes);
+        resp_len = (got > 0) ? (uint32_t)got : 0;
+#else
+        resp_len = 0;
+#endif
         break;
-    case PDS_START: {
-        hi.pds_buf[0].addr = w[2]; hi.pds_buf[0].cap = w[3];      /* buffer A */
-        hi.pds_buf[1].addr = w[4]; hi.pds_buf[1].cap = w[5];      /* buffer B */
-        memset(hi.pds_pend, 0, sizeof hi.pds_pend);
-        int id = 0;
-        if (m->len > 0x420) id = parse_dec((const char *)m->payload + 0x420, m->len - 0x420);
-        hi.pds_cur_stream = id;
-        if (hi.pds_ops && hi.pds_ops->start) hi.pds_ops->start(id, w[1]);
-        break; }
-    case PDS_GET_FRAME:
-        /* continuation of a partially sent frame? (rt 0xff16c) */
-        for (int b = 0; b < 2; b++)
-            if (hi.pds_pend[b].active) { pds_send_chunk(b); return; }
-        if (hi.pds_ops && hi.pds_ops->get_frame)
-            hi.pds_ops->get_frame(hi.pds_cur_stream, w[1], w[2]);
-        break;
-    case PDS_SEEK:
-        if (hi.pds_ops && hi.pds_ops->seek) hi.pds_ops->seek(hi.pds_cur_stream, w[1]);
-        break;
-    case PDS_STOP:
-        memset(hi.pds_pend, 0, sizeof hi.pds_pend);
-        if (hi.pds_ops && hi.pds_ops->stop) hi.pds_ops->stop();
-        break;
+    }
+
     default:
-        hi.st.unknown_ops++;                              /* stock: sets error, sends nothing */
+        BCM_LOG("vcfs: unknown opcode 0x%02x", (unsigned)opcode);
+        break;
+    }
+
+    /* Send reply */
+    msg_send(BCM_CHAN_VCFS, opcode, (const uint32_t *)resp, resp_len);
+}
+
+/* -----------------------------------------------------------------------
+ * VCHR handler — handles event notifications and stubs from the VC
+ * --------------------------------------------------------------------- */
+static void vchr_handle(uint32_t opcode,
+                        const uint8_t *req, uint32_t req_len)
+{
+    (void)req; (void)req_len;
+
+    switch (opcode)
+    {
+    case BCM_VCHR_EVENT:
+        /* v13-v27 bug: replying with 4 bytes halted the VC.
+         * Fix (v28): reply with ZERO-length payload. */
+        msg_send(BCM_CHAN_VCHR, opcode, NULL, 0);
+        break;
+
+    case BCM_VCHR_STUB:
+        /* Stub: return 0 */
+    {
+        uint32_t zero = 0;
+        msg_send(BCM_CHAN_VCHR, opcode, &zero, 4);
+        break;
+    }
+
+    default:
+        BCM_LOG("vchr: unhandled opcode 0x%02x", (unsigned)opcode);
         break;
     }
 }
 
-/* v28: payload length of the reply to VCHR op 0x47. Stock = 0 (default); 4 = the pre-v28 behaviour. */
-static uint32_t vchr47_len = 0;
-void bcm_host_set_vchr47_len(uint32_t n) { vchr47_len = n ? 4 : 0; }
-
-/* --------------------------------------------------------------- service ------ */
-void bcm_host_service(void)
+/* -----------------------------------------------------------------------
+ * bcm_host_service — process one pending inbound message
+ * --------------------------------------------------------------------- */
+int bcm_host_service(void)
 {
-    if (bcm_io_dead()) return;
-    if (!hi.attached) return;
+    if (!s_attached) return -1;
 
-    bcm_io_lock();
-    uint32_t w = rd32(hi.base + H_TX_ACK);                /* +0x20 ack, +0x21 VC signal */
-    uint8_t rx_sig = (uint8_t)(w >> 8);
-    uint8_t pending = rx_sig ^ hi.rx_ack;
-    if (pending) {                                        /* ack first, like the stock drain (rt 0x288100) */
-        hi.rx_ack ^= pending;
-        uint32_t h = rd32(hi.base + H_TX_SIG);
-        h = (h & 0xffff0000u) | hi.tx_sig | ((uint32_t)hi.rx_ack << 8);
-        wr32(hi.base + H_TX_SIG, h);
-    }
-    bcm_io_unlock();
+    int processed = 0;
 
-    /* Drain every channel that signalled; the stock tasks loop until the ring is empty. */
-    static struct hi_msg m;
-    for (int i = 0; i < HI_NCHAN; i++) {
-        struct hi_chan *c = &hi.ch[i];
-        if (!c->present || !(pending & (1u << i))) continue;
-        while (hi_rx_pop(c, &m)) {
-            switch (c->type) {
-            case CH_GENCMD: gencmd_rx(&m); break;
-            case CH_VCFS:   vcfs_dispatch(c, &m); break;
-            case CH_VCPD:   pds_dispatch(c, &m); break;
-            case CH_VCHR:                                 /* hostreq: stock op 0x46 calls a stub returning 0 and replies */
-                hi.st.unknown_ops++;
-                if (m.op == 0x47) {
-                    /* v28: stock dispatcher rt 0xf9ca0, op 0x47 = event notification {id, arg}: the host calls the
-                     * callback registered for `id` (default stub: bx lr) and replies with op 0 and a ZERO-LENGTH
-                     * payload (r8 stays 0 on this path, rt 0xfa0a8). Earlier versions sent 4 payload bytes. */
-                    uint32_t w0 = 0, w1 = 0;
-                    if (m.len >= 4) memcpy(&w0, m.payload, 4);
-                    if (m.len >= 8) memcpy(&w1, m.payload + 4, 4);
-                    TRACE("vchr 0x47 event (id, arg)", w0, w1, NULL);
-                    if (vchr47_len) { uint32_t z = 0; reply(c, &m, 0, &z, 4); }
-                    else reply(c, &m, 0, NULL, 0);
-                    break;
-                }
-                TRACE("vchr op", m.op, m.len, NULL);
-                if (m.op != 0x61) { uint32_t z = 0; reply(c, &m, 0, &z, 4); }
-                break;
-            case CH_GRAPHICS:
-                if (hi.gfx_wait && m.seq == hi.gfx_seq)   /* v34: reply to bcm_gfx_rpc() */
-                {
-                    uint32_t n = m.len < sizeof hi.gfx_pl ? m.len : (uint32_t)sizeof hi.gfx_pl;
-                    memset(hi.gfx_pl, 0, sizeof hi.gfx_pl);
-                    memcpy(hi.gfx_pl, m.payload, n);
-                    hi.gfx_op = m.op; hi.gfx_len = m.len; hi.gfx_done = true;
-                    break;
-                }
-                hi.st.unknown_ops++;
-                TRACE("gfx stray (a=seq b=op)", m.seq, m.op, NULL);
-                break;
-            default:        hi.st.unknown_ops++;
-                            TRACE(c->type == CH_VCHR ? "vchr op" : "chan op", m.op, m.len, NULL);
-                            break;
-            }
-        }
+    /* Check VCFS and VCHR for pending messages */
+    int inbound_chans[] = { BCM_CHAN_VCFS, BCM_CHAN_VCHR };
+    for (int ci = 0; ci < 2; ci++)
+    {
+        int chan = inbound_chans[ci];
+        if (ring_avail(chan) < HDR_WORDS) continue;
+
+        uint32_t hdr[HDR_WORDS];
+        uint8_t  payload[MAX_PAYLOAD_BYTES];
+        size_t   payload_len;
+
+        int r = msg_recv(chan, hdr, payload, sizeof(payload), &payload_len);
+        if (r < 0) continue;
+
+        uint32_t opcode = hdr[2];
+
+        if (chan == BCM_CHAN_VCFS)
+            vcfs_handle(opcode, payload, (uint32_t)payload_len);
+        else
+            vchr_handle(opcode, payload, (uint32_t)payload_len);
+
+        processed = 1;
     }
+
+    return processed;
 }

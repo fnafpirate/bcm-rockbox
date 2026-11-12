@@ -34,6 +34,9 @@
 #if CONFIG_TUNER
 #include "ipod_remote_tuner.h"
 #endif
+#ifdef HAVE_BCM_VIDEOCORE
+#include "bcm_host.h"
+#endif
 
 /*
  * This macro is meant to be used inside an IAP mode message handler.
@@ -258,6 +261,32 @@ void iap_handlepkt_mode2(const unsigned int len, const unsigned char *buf)
                 if (buf[5] & 2) /* down */
                     btn |= BUTTON_RC_DOWN;
             }
+
+#ifdef HAVE_BCM_VIDEOCORE
+            /* When BCM video is playing, route remote buttons to video
+             * player: play/pause toggles stop, ffwd/frwd seek by
+             * bcm_video_skip_seconds, menu stops playback.
+             */
+            if (bcm_is_active())
+            {
+                if (btn & BUTTON_RC_PLAY)
+                    bcm_video_quiz_stop();
+                if (btn & BUTTON_RC_RIGHT)
+                {
+                    int pos = bcm_video_quiz_get_pos_ms();
+                    int skip_ms = global_settings.bcm_video_skip_seconds * 1000;
+                    bcm_video_quiz_start(NULL, pos + skip_ms);
+                }
+                if (btn & BUTTON_RC_LEFT)
+                {
+                    int pos = bcm_video_quiz_get_pos_ms();
+                    int skip_ms = global_settings.bcm_video_skip_seconds * 1000;
+                    int newpos = pos - skip_ms;
+                    bcm_video_quiz_start(NULL, (newpos < 0) ? 0 : newpos);
+                }
+                btn = BUTTON_NONE; /* consumed */
+            }
+#endif /* HAVE_BCM_VIDEOCORE */
 
             /* Commit the new button state in one go. The button driver
              * reads iap_remotebtn from interrupt context, a transient

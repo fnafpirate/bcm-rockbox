@@ -288,6 +288,39 @@ MENUITEM_SETTING(usb_mode, &global_settings.usb_mode, NULL);
 #if defined(HAVE_GENERAL_PURPOSE_LED)
 MENUITEM_SETTING(use_led_indicators, &global_settings.use_led_indicators, NULL);
 #endif
+
+/* BCM hardware video settings (bcm-rockbox v94) */
+#ifdef HAVE_BCM_VIDEOCORE
+MENUITEM_SETTING(bcm_video_brightness,  &global_settings.bcm_video_brightness,  NULL);
+MENUITEM_SETTING(bcm_video_contrast,    &global_settings.bcm_video_contrast,     NULL);
+MENUITEM_SETTING(bcm_video_saturation,  &global_settings.bcm_video_saturation,   NULL);
+MENUITEM_SETTING(bcm_video_tint,        &global_settings.bcm_video_tint,         NULL);
+MENUITEM_SETTING(bcm_video_tvout,       &global_settings.bcm_video_tvout,        NULL);
+MENUITEM_SETTING(bcm_video_subtitles,   &global_settings.bcm_video_subtitles,    NULL);
+MENUITEM_SETTING(bcm_video_aspect,      &global_settings.bcm_video_aspect,       NULL);
+MENUITEM_SETTING(bcm_video_deinterlace, &global_settings.bcm_video_deinterlace,  NULL);
+MENUITEM_SETTING(bcm_video_skip_seconds,&global_settings.bcm_video_skip_seconds, NULL);
+MENUITEM_SETTING(bcm_video_resume,      &global_settings.bcm_video_resume,       NULL);
+MENUITEM_SETTING(bcm_pcm_speaker,       &global_settings.bcm_pcm_speaker,        NULL);
+
+MAKE_MENU(bcm_video_menu, ID2P(LANG_SETTINGS), 0, Icon_NOICON,
+          &bcm_video_brightness, &bcm_video_contrast,
+          &bcm_video_saturation, &bcm_video_tint,
+          &bcm_video_tvout, &bcm_video_subtitles,
+          &bcm_video_aspect, &bcm_video_deinterlace,
+          &bcm_video_skip_seconds, &bcm_video_resume,
+          &bcm_pcm_speaker);
+#endif /* HAVE_BCM_VIDEOCORE */
+
+#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
+MENUITEM_SETTING(batt_smooth_mode, &global_settings.batt_smooth_mode, NULL);
+MENUITEM_SETTING(batt_r_int_mohm,  &global_settings.batt_r_int_mohm,  NULL);
+MENUITEM_SETTING(batt_table_id,    &global_settings.batt_table_id,    NULL);
+
+MAKE_MENU(apple_battery_menu, ID2P(LANG_BATTERY_MENU), 0, Icon_NOICON,
+          &batt_smooth_mode, &batt_r_int_mohm, &batt_table_id);
+#endif /* IPOD_VIDEO && ADC_APPLE_BATT */
+
 /* Disk */
 #ifdef HAVE_DISK_STORAGE
 MENUITEM_SETTING(disk_spindown, &global_settings.disk_spindown, NULL);
@@ -520,6 +553,12 @@ MAKE_MENU(system_menu, ID2P(LANG_SYSTEM),
 #endif
 #if defined(HAVE_GENERAL_PURPOSE_LED)
             &use_led_indicators,
+#endif
+#ifdef HAVE_BCM_VIDEOCORE
+            &bcm_video_menu,
+#endif
+#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
+            &apple_battery_menu,
 #endif
          );
 

@@ -1,170 +1,251 @@
 #!/usr/bin/env python3
 """
-vc_extract.py - pull the Resources FAT12 volume out of an iPod 5G/5.5G firmware
-image (Firmware-XX.Y.Z, or the .ipsw that contains it) with LONG FILE NAMES intact.
+vc_extract.py — Extract VideoCore firmware files from an iPod .ipsw.
 
-Why LFN matters: the VideoCore libraries are stored as 8.3 short names
-(PASSTH~1.VLL, SLIDES~1.VLL, RENDER~1.BIN). A short-name-only parser makes
-passthruhandler.vll / slideshow.vll / RenderServer.bin look like they don't exist.
+The .ipsw is a ZIP archive.  Inside it there is a Firmware-*.zip (or the
+firmware image directly).  The firmware image contains a FAT12 volume at
+a known offset; the volume holds the VideoCore files.
 
-Stdlib only. Read-only on the input; writes only under --out.
+The FAT12 volume is identified by:
+  • 0x55AA signature at byte 510 of the boot sector
+  • OEM string starting with "MTOOL" at byte 3
 
-    python vc_extract.py iPod_25_1_3.ipsw --out vc_out
-    python vc_extract.py Firmware-25.6.3 --list
-    python vc_extract.py Firmware-25.6.3 --out vc_out --all      # fonts too (~4 MB)
+Usage:
+    python3 vc_extract.py <path/to/iPod_25.1.3_1.ipsw> [--out <dir>]
+
+Output: flat directory containing vmcs.bin, mplayer.vll, h264dec.vll, etc.
+        (since v56 all VideoCore files are in a flat directory)
+
+Copyright (C) 2024 bcm-rockbox contributors
+SPDX-License-Identifier: GPL-2.0-or-later
 """
+
 import argparse
-import hashlib
 import os
 import struct
 import sys
 import zipfile
+import io
 
 
-# ----------------------------------------------------------------- FAT12 ----
+# ---------------------------------------------------------------------------
+# FAT12 helpers
+# ---------------------------------------------------------------------------
+
+SECTOR_SIZE = 512
+
+def _read16(data, off):
+    return struct.unpack_from("<H", data, off)[0]
+
+def _read32(data, off):
+    return struct.unpack_from("<I", data, off)[0]
+
+
 class Fat12:
-    def __init__(self, img, off):
-        self.img, self.off = img, off
-        b = img[off:off + 512]
-        self.bps = struct.unpack_from("<H", b, 11)[0]
-        self.spc = b[13]
-        self.rsv = struct.unpack_from("<H", b, 14)[0]
-        self.nfat = b[16]
-        self.nroot = struct.unpack_from("<H", b, 17)[0]
-        self.tot = struct.unpack_from("<H", b, 19)[0]
-        self.spf = struct.unpack_from("<H", b, 22)[0]
-        self.oem = b[3:11].decode("latin1")
-        fat0 = off + self.rsv * self.bps
-        self.fat = img[fat0:fat0 + self.spf * self.bps]
-        self.root = off + (self.rsv + self.nfat * self.spf) * self.bps
-        self.data = self.root + self.nroot * 32
-        self.csize = self.spc * self.bps
+    """Minimal FAT12 reader that understands long-name directory entries."""
 
-    def _next(self, c):
-        o = c * 3 // 2
-        v = self.fat[o] | (self.fat[o + 1] << 8)
-        return (v >> 4) if (c & 1) else (v & 0xFFF)
+    def __init__(self, data: bytes):
+        bs = data[:512]
+        # Bytes per sector
+        self.bps  = _read16(bs, 0x0B)
+        # Sectors per cluster
+        self.spc  = bs[0x0D]
+        # Reserved sectors
+        self.rsvd = _read16(bs, 0x0E)
+        # Number of FATs
+        self.nfat = bs[0x10]
+        # Root entry count
+        self.nroot = _read16(bs, 0x11)
+        # FAT size in sectors
+        self.fat_sz = _read16(bs, 0x16)
 
-    def chain(self, c):
-        out, seen = [], set()
-        while 2 <= c < 0xFF8 and c not in seen:
-            seen.add(c)
-            out.append(c)
-            c = self._next(c)
-        return out
+        self.data = data
+        self.fat_off  = self.rsvd * self.bps
+        self.root_off = self.fat_off + self.nfat * self.fat_sz * self.bps
+        self.data_off = self.root_off + self.nroot * 32
 
-    def cluster_off(self, c):
-        return self.data + (c - 2) * self.csize
+    def _fat_entry(self, cluster: int) -> int:
+        offset = self.fat_off + cluster * 3 // 2
+        w = _read16(self.data, offset)
+        if cluster & 1:
+            return (w >> 4) & 0xFFF
+        else:
+            return w & 0xFFF
 
-    def read(self, c, size=None):
-        buf = b"".join(self.img[self.cluster_off(k):self.cluster_off(k) + self.csize]
-                       for k in self.chain(c))
-        return buf if size is None else buf[:size]
+    def _cluster_to_offset(self, cluster: int) -> int:
+        return self.data_off + (cluster - 2) * self.spc * self.bps
 
-    @staticmethod
-    def _parse_dir(data):
-        ents, lfn = [], []
-        for i in range(0, len(data), 32):
-            e = data[i:i + 32]
-            if e[0] == 0x00:
+    def _read_chain(self, cluster: int) -> bytes:
+        out = bytearray()
+        while cluster < 0xFF8:
+            off = self._cluster_to_offset(cluster)
+            out += self.data[off:off + self.spc * self.bps]
+            cluster = self._fat_entry(cluster)
+        return bytes(out)
+
+    def _parse_dir(self, data: bytes):
+        """
+        Yield (long_name_or_short_name, start_cluster, size) tuples.
+        Handles LFN entries.
+        """
+        i = 0
+        lfn_parts = {}
+        while i + 32 <= len(data):
+            entry = data[i:i+32]
+            i += 32
+            if entry[0] == 0x00:
                 break
-            if e[0] == 0xE5:
-                lfn = []
+            if entry[0] == 0xE5:
+                lfn_parts.clear()
                 continue
-            if e[11] == 0x0F:                       # LFN fragment
-                part = e[1:11] + e[14:26] + e[28:32]
-                s = part.decode("utf-16le")
-                s = s.split("\x00")[0].split("\uffff")[0]
-                lfn.insert(0, s)
+            attr = entry[11]
+            if attr == 0x0F:
+                # LFN entry
+                seq = entry[0] & 0x1F
+                chars = (entry[1:11] + entry[14:26] + entry[28:32])
+                name_part = chars.decode("utf-16-le", errors="replace").rstrip("\x00\xff")
+                lfn_parts[seq] = name_part
                 continue
-            base = e[:8].decode("latin1").rstrip()
-            ext = e[8:11].decode("latin1").rstrip()
-            short = base + ("." + ext if ext else "")
-            ents.append({
-                "name": "".join(lfn) or short,
-                "short": short,
-                "dir": bool(e[11] & 0x10),
-                "cluster": struct.unpack_from("<H", e, 26)[0],
-                "size": struct.unpack_from("<I", e, 28)[0],
-            })
-            lfn = []
-        return ents
-
-    def root_entries(self):
-        return self._parse_dir(self.img[self.root:self.root + self.nroot * 32])
-
-    def dir_entries(self, cluster):
-        return self._parse_dir(self.read(cluster))
-
-    def walk(self, entries=None, prefix=""):
-        for e in (self.root_entries() if entries is None else entries):
-            if e["name"] in (".", ".."):
+            if attr & 0x08:
+                lfn_parts.clear()
                 continue
-            path = prefix + "/" + e["name"]
-            if e["dir"]:
-                yield path, e
-                yield from self.walk(self.dir_entries(e["cluster"]), path)
+            is_dir = bool(attr & 0x10)
+            name_raw = entry[0:8].decode("ascii", errors="replace").rstrip()
+            ext_raw  = entry[8:11].decode("ascii", errors="replace").rstrip()
+            if lfn_parts:
+                parts = sorted(lfn_parts.keys())
+                long_name = "".join(lfn_parts[k] for k in parts)
             else:
-                yield path, e
+                long_name = (name_raw + ("." + ext_raw if ext_raw else ""))
+            lfn_parts.clear()
+            cluster_hi = _read16(entry, 20)
+            cluster_lo = _read16(entry, 26)
+            cluster = (cluster_hi << 16) | cluster_lo
+            size = _read32(entry, 28)
+            yield long_name, cluster, size, is_dir
+
+    def list_root(self):
+        root_data = self.data[self.root_off:self.root_off + self.nroot * 32]
+        return list(self._parse_dir(root_data))
+
+    def list_dir(self, cluster: int):
+        dir_data = self._read_chain(cluster)
+        return list(self._parse_dir(dir_data))
+
+    def read_file(self, cluster: int, size: int) -> bytes:
+        raw = self._read_chain(cluster)
+        return raw[:size]
+
+    def walk(self, cluster=0, path=""):
+        """
+        Yield (path, cluster, size) for every file (recursively).
+        cluster=0 means the root directory.
+        """
+        entries = self.list_root() if cluster == 0 else self.list_dir(cluster)
+        for name, cl, size, is_dir in entries:
+            if name in (".", ".."):
+                continue
+            full = path + "/" + name if path else name
+            if is_dir:
+                yield from self.walk(cl, full)
+            else:
+                yield full, cl, size
 
 
-def find_volume(img):
-    """Locate the FAT12 volume by its boot sector instead of hard-coding an offset."""
-    for off in range(0, len(img) - 512, 512):
-        b = img[off:off + 512]
-        if b[510:512] != b"\x55\xAA" or b[3:8] != b"MTOOL":
-            continue
-        bps = struct.unpack_from("<H", b, 11)[0]
-        if bps == 512 and b[13] in (1, 2, 4, 8) and b[16] == 2:
-            return off
-    return None
+# ---------------------------------------------------------------------------
+# IPSW / firmware extraction
+# ---------------------------------------------------------------------------
+
+def find_fat12(data: bytes) -> int:
+    """Return the byte offset of the FAT12 volume, or -1 if not found."""
+    pos = 0
+    while pos + 512 <= len(data):
+        # Look for 0x55AA boot signature
+        if data[pos + 510] == 0x55 and data[pos + 511] == 0xAA:
+            oem = data[pos + 3:pos + 11]
+            if oem[:5] == b"MTOOL":
+                return pos
+        pos += 512
+    return -1
 
 
-def load_image(path):
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as z:
-            cands = [n for n in z.namelist() if os.path.basename(n).startswith("Firmware-")]
-            if not cands:
-                sys.exit("no Firmware-* member in " + path)
-            return z.read(cands[0]), cands[0]
-    with open(path, "rb") as f:
-        return f.read(), os.path.basename(path)
+def extract_ipsw(ipsw_path: str, out_dir: str):
+    print(f"Opening {ipsw_path} ...")
+    with zipfile.ZipFile(ipsw_path, "r") as z:
+        names = z.namelist()
+        # Find the firmware payload (Firmware-*.zip or WTF*.ipsw or similar)
+        fw_name = None
+        for n in names:
+            bn = os.path.basename(n).lower()
+            if bn.startswith("firmware") and bn.endswith(".zip"):
+                fw_name = n
+                break
+        if not fw_name:
+            # Try direct .dmg or raw firmware
+            for n in names:
+                if "firmware" in n.lower() and not n.endswith("/"):
+                    fw_name = n
+                    break
+
+        if not fw_name:
+            print("ERROR: could not find firmware payload inside .ipsw")
+            sys.exit(1)
+
+        print(f"  Found firmware payload: {fw_name}")
+        fw_data = z.read(fw_name)
+
+    # If the payload itself is a ZIP, open it
+    if fw_data[:2] == b"PK":
+        print("  Firmware payload is a ZIP, opening inner archive ...")
+        inner = zipfile.ZipFile(io.BytesIO(fw_data))
+        # Find the raw binary
+        for n in inner.namelist():
+            bn = os.path.basename(n).lower()
+            if not n.endswith("/") and bn not in ("info.plist", "manifest.plist"):
+                fw_data = inner.read(n)
+                print(f"  Using inner file: {n}")
+                break
+        inner.close()
+
+    # Find FAT12 volume
+    fat_off = find_fat12(fw_data)
+    if fat_off < 0:
+        print("ERROR: FAT12 volume (MTOOL OEM, 0x55AA) not found in firmware")
+        sys.exit(1)
+
+    print(f"  FAT12 volume at offset 0x{fat_off:08X}")
+    fat_data = fw_data[fat_off:]
+    fs = Fat12(fat_data)
+
+    # Walk and extract all files
+    os.makedirs(out_dir, exist_ok=True)
+    n_extracted = 0
+    for path, cl, size in fs.walk():
+        # Flatten: drop directory components (since v56 layout is flat)
+        basename = os.path.basename(path.replace("\\", "/"))
+        out_path = os.path.join(out_dir, basename)
+        content = fs.read_file(cl, size)
+        with open(out_path, "wb") as f:
+            f.write(content)
+        print(f"  Extracted: {path} → {basename} ({size} bytes)")
+        n_extracted += 1
+
+    print(f"Done. {n_extracted} file(s) extracted to {out_dir}/")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("image", help="Firmware-XX.Y.Z or .ipsw")
-    ap.add_argument("--out", help="output directory")
-    ap.add_argument("--list", action="store_true", help="list only, extract nothing")
-    ap.add_argument("--all", action="store_true", help="extract everything (default: VideoCore tree only)")
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__,
+                   formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("ipsw", help="Path to .ipsw file")
+    parser.add_argument("--out", default="Resources/VideoCore",
+                        help="Output directory (default: Resources/VideoCore)")
+    args = parser.parse_args()
 
-    img, member = load_image(a.image)
-    off = find_volume(img)
-    if off is None:
-        sys.exit("no MTOOL FAT12 volume found - is this a 5G/5.5G Firmware image?")
-    fs = Fat12(img, off)
-    print(f"image: {member}  ({len(img)} bytes)")
-    print(f"FAT12 volume @ {off:#x}  OEM={fs.oem!r}  {fs.tot} sectors x {fs.bps} B  cluster={fs.csize} B")
-    print(f"{'path':58s} {'size':>9s} {'file offset':>12s}  sha1")
+    if not os.path.exists(args.ipsw):
+        print(f"ERROR: {args.ipsw} not found")
+        sys.exit(1)
 
-    for path, e in fs.walk():
-        if e["dir"]:
-            continue
-        if not a.all and "/videocore/" not in path.lower():
-            continue
-        data = fs.read(e["cluster"], e["size"]) if e["size"] else b""
-        fo = fs.cluster_off(e["cluster"]) if e["cluster"] >= 2 else 0
-        print(f"{path:58s} {e['size']:9d} {fo:#12x}  {hashlib.sha1(data).hexdigest()[:12]}"
-              + (f"   (short: {e['short']})" if e["short"] != e["name"] else ""))
-        if a.out and not a.list:
-            dest = os.path.join(a.out, *path.strip("/").split("/"))
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "wb") as f:
-                f.write(data)
-
-    if a.out and not a.list:
-        print("\nextracted under", os.path.abspath(a.out))
+    extract_ipsw(args.ipsw, args.out)
 
 
 if __name__ == "__main__":

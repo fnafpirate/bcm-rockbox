@@ -981,6 +981,29 @@ struct user_settings
 #if defined(HAVE_GENERAL_PURPOSE_LED)
     bool use_led_indicators;
 #endif
+
+    /* ---- bcm-rockbox v94 additions ---- */
+#ifdef HAVE_BCM_VIDEOCORE
+    /* BCM hardware video player */
+    int  bcm_video_brightness;      /* 0-100 */
+    int  bcm_video_contrast;        /* 0-100 */
+    int  bcm_video_saturation;      /* 0-100 */
+    int  bcm_video_tint;            /* -50 to +50 */
+    bool bcm_video_tvout;           /* enable composite TV-out during video */
+    bool bcm_video_subtitles;       /* show embedded text subtitles */
+    int  bcm_video_aspect;          /* 0=original 1=fullscreen 2=4:3 3=16:9 */
+    int  bcm_video_deinterlace;     /* 0=off 1=auto 2=forced */
+    int  bcm_video_skip_seconds;    /* seek step for left/right buttons (s) */
+    bool bcm_video_resume;          /* remember last position */
+    bool bcm_pcm_speaker;           /* route audio to click speaker (piezo) */
+#endif /* HAVE_BCM_VIDEOCORE */
+
+#if defined(IPOD_VIDEO) && defined(ADC_APPLE_BATT)
+    /* Apple battery ADC */
+    int  batt_smooth_mode;          /* 0=smooth 1=balanced 2=exact */
+    int  batt_r_int_mohm;           /* internal resistance mOhm (default 120) */
+    int  batt_table_id;             /* calibration table A-F (0-5) */
+#endif /* IPOD_VIDEO && ADC_APPLE_BATT */
 };
 
 /* global settings */
