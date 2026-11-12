@@ -1,52 +1,14 @@
-/***************************************************************************
- *             __________               __   ___.
- *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
- *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
- *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
- *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
- *                     \/            \/     \/     \/            \/
- * $Id$
- *
- * TV-series episode ordering for auto-play.
- * Parses SxxEyy / 1x02 patterns in filenames to determine the
- * next episode in a TV-series directory.
- *
- * Copyright (C) 2024 bcm-rockbox contributors
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
- * KIND, either express or implied.
- *
- ****************************************************************************/
+/* bcm overlay v74: TV series episode order (apps/bcm_tvshow.c) */
 #ifndef BCM_TVSHOW_H
 #define BCM_TVSHOW_H
-
 #include <stdbool.h>
-
-/**
- * tvshow_next_episode - given the path of the just-played episode, find
- * the next one in the same directory using episode ordering.
- *
- * Parses SxxEyy / NxMM patterns.  Falls back to alphabetical order if
- * no episode pattern is found.
- *
- * @current_path : full path of the episode just played
- * @next_path    : buffer to receive the next episode's full path
- * @next_sz      : size of @next_path
- *
- * Returns true if a next episode was found.
- */
-bool tvshow_next_episode(const char *current_path,
-                         char *next_path, size_t next_sz);
-
-/**
- * tvshow_parse_ep - extract season and episode numbers from @filename.
- * Returns true if a pattern was found.
- */
-bool tvshow_parse_ep(const char *filename, int *season, int *episode);
-
-#endif /* BCM_TVSHOW_H */
+#include <stddef.h>
+/* the show's folder ("/Video's/TV Show/Some Show") of an episode path, and the show's name; false = not an episode */
+bool tvs_show_root(const char *path, char *root, size_t n, char *show, size_t sn);
+/* season / episode from a file name (-1 = none); folder_season = from its folder ("Season 2") or -1 */
+void tvs_parse(const char *name, int folder_season, int *season, int *episode);
+int tvs_natcmp(const char *a, const char *b);
+/* the next (dir +1) or previous (-1) episode of the show: its path in out, and "Show  S01E04\nTitle" in label.
+   Returns 1 if there is one. */
+int tvs_next(const char *cur, int dir, char *out, size_t n, char *label, size_t ln);
+#endif

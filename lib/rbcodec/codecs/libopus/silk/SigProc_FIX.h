@@ -621,11 +621,11 @@ static OPUS_INLINE opus_int64 silk_max_64(opus_int64 a, opus_int64 b)
 #include "MacroCount.h"
 #include "MacroDebug.h"
 
-#ifdef OPUS_ARM_ASM_ARMV4_ONLY
+#ifdef OPUS_ARM_INLINE_ASM
 #include "arm/SigProc_FIX_armv4.h"
 #endif
 
-#ifdef OPUS_ARM_ASM_ARMV5E_AND_LATER
+#ifdef OPUS_ARM_INLINE_EDSP
 #include "arm/SigProc_FIX_armv5e.h"
 #endif
 

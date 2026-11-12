@@ -33,18 +33,6 @@
 
 #include <math.h>
 #include "bands.h"
-#include "log2tan_table.h"
-
-/* Rockbox builds the decoder only: celt_encoder.c is not in SOURCES, and the
-   one caller of quant_all_bands passes encode=0.  Saying so lets gcc fold the
-   thirteen encoder-only branches in this file away -- and, worth more than the
-   branches, stops it keeping their live values in registers across the
-   recursive calls, which is where quant_partition was spilling. */
-#ifdef CELT_DECODE_ONLY
-# define CELT_ENCODE_FLAG(x) 0
-#else
-# define CELT_ENCODE_FLAG(x) (x)
-#endif
 #include "modes.h"
 #include "vq.h"
 #include "cwrs.h"
@@ -54,9 +42,6 @@
 #include "rate.h"
 #include "quant_bands.h"
 #include "pitch.h"
-#if defined(OPUS_ARM_ASM)
-#include "arm/bands_arm.h"
-#endif
 
 int hysteresis_decision(opus_val16 val, const opus_val16 *thresholds, const opus_val16 *hysteresis, int N, int prev)
 {
@@ -92,7 +77,7 @@ opus_int16 bitexact_cos(opus_int16 x)
    return 1+x2;
 }
 
-ICODE_ATTR_OPUS_MR int bitexact_log2tan(int isin,int icos)
+int bitexact_log2tan(int isin,int icos)
 {
    int lc;
    int ls;
@@ -208,7 +193,7 @@ void normalise_bands(const CELTMode *m, const celt_sig * OPUS_RESTRICT freq, cel
 #endif /* FIXED_POINT */
 
 /* De-normalise the energy to produce the synthesis from the unit-energy bands */
-ICODE_ATTR_OPUS void denormalise_bands(const CELTMode *m, const celt_norm * OPUS_RESTRICT X,
+void denormalise_bands(const CELTMode *m, const celt_norm * OPUS_RESTRICT X,
       celt_sig * OPUS_RESTRICT freq, const opus_val16 *bandLogE, int start,
       int end, int M, int downsample, int silence)
 {
@@ -271,24 +256,16 @@ ICODE_ATTR_OPUS void denormalise_bands(const CELTMode *m, const celt_norm * OPUS
       } else
 #endif
          /* Be careful of the fixed-point "else" just above when changing this code */
-#if defined(FIXED_POINT) && defined(OVERRIDE_DENORM_BAND)
-      {
-         DENORM_BAND(f, x, band_end-j, g, shift);
-         f += band_end-j;
-         x += band_end-j;
-      }
-#else
          do {
             *f++ = SHR32(MULT16_16(*x++, g), shift);
          } while (++j<band_end);
-#endif
    }
    celt_assert(start <= end);
    OPUS_CLEAR(&freq[bound], N-bound);
 }
 
 /* This prevents energy collapse for transients with multiple short MDCTs */
-ICODE_ATTR_OPUS void anti_collapse(const CELTMode *m, celt_norm *X_, unsigned char *collapse_masks, int LM, int C, int size,
+void anti_collapse(const CELTMode *m, celt_norm *X_, unsigned char *collapse_masks, int LM, int C, int size,
       int start, int end, const opus_val16 *logE, const opus_val16 *prev1logE,
       const opus_val16 *prev2logE, const int *pulses, opus_uint32 seed, int arch)
 {
@@ -603,7 +580,7 @@ static const int ordery_table[] = {
       15,  0,  8,  7, 12,  3, 11,  4, 14,  1,  9,  6, 13,  2, 10,  5,
 };
 
-ICODE_ATTR_OPUS static void deinterleave_hadamard(celt_norm *X, int N0, int stride, int hadamard)
+static void deinterleave_hadamard(celt_norm *X, int N0, int stride, int hadamard)
 {
    int i,j;
    VARDECL(celt_norm, tmp);
@@ -652,8 +629,7 @@ static void interleave_hadamard(celt_norm *X, int N0, int stride, int hadamard)
    RESTORE_STACK;
 }
 
-#ifndef OVERRIDE_haar1
-ICODE_ATTR_OPUS void haar1(celt_norm *X, int N0, int stride)
+void haar1(celt_norm *X, int N0, int stride)
 {
    int i, j;
    N0 >>= 1;
@@ -667,7 +643,6 @@ ICODE_ATTR_OPUS void haar1(celt_norm *X, int N0, int stride)
          X[stride*(2*j+1)+i] = EXTRACT16(PSHR32(SUB32(tmp1, tmp2), 15));
       }
 }
-#endif
 
 static int compute_qn(int N, int b, int offset, int pulse_cap, int stereo)
 {
@@ -722,16 +697,13 @@ struct split_ctx {
    int qalloc;
 };
 
-ICODE_ATTR_OPUS static void compute_theta(struct band_ctx *ctx, struct split_ctx *sctx,
+static void compute_theta(struct band_ctx *ctx, struct split_ctx *sctx,
       celt_norm *X, celt_norm *Y, int N, int *b, int B, int B0,
       int LM,
       int stereo, int *fill)
 {
    int qn;
    int itheta=0;
-#ifdef OPUS_LOG2TAN_TABLE
-   int itheta_q=-1;   /* the quantiser index behind itheta */
-#endif
    int delta;
    int imid, iside;
    int qalloc;
@@ -746,7 +718,7 @@ ICODE_ATTR_OPUS static void compute_theta(struct band_ctx *ctx, struct split_ctx
    ec_ctx *ec;
    const celt_ener *bandE;
 
-   encode = CELT_ENCODE_FLAG(ctx->encode);
+   encode = ctx->encode;
    m = ctx->m;
    i = ctx->i;
    intensity = ctx->intensity;
@@ -864,9 +836,6 @@ ICODE_ATTR_OPUS static void compute_theta(struct band_ctx *ctx, struct split_ctx
          }
       }
       celt_assert(itheta>=0);
-#ifdef OPUS_LOG2TAN_TABLE
-      itheta_q = itheta;
-#endif
       itheta = celt_udiv((opus_int32)itheta*16384, qn);
       if (encode && stereo)
       {
@@ -922,29 +891,7 @@ ICODE_ATTR_OPUS static void compute_theta(struct band_ctx *ctx, struct split_ctx
       iside = bitexact_cos((opus_int16)(16384-itheta));
       /* This is the mid vs side allocation that minimizes squared error
          in that band. */
-#ifdef OPUS_LOG2TAN_TABLE
-      /* bitexact_log2tan here is a function of (qn, itheta_q) alone, and that
-         set is closed and small, so it is tabulated exactly: two EC_ILOG
-         ladders and four FRAC_MUL16 products become one indexed load.  The
-         bounds test is what makes the lookup safe rather than merely correct:
-         every decode path bounds itheta_q to [0,qn], but a table index must
-         not depend on that being true of a corrupt stream. */
-      {
-         /* qn needs no range test: compute_qn clamps qb to 8<<BITRES before
-            the shift, so qn is in [1,256] whatever the stream says, and the
-            offset table spans that.  itheta_q does need one -- it is decoded
-            -- and an unlisted qn falls back through the 0xFFFF sentinel. */
-         int lt;
-         unsigned o = log2tan_off[qn];
-         if (o != 0xFFFFu && (unsigned)itheta_q <= (unsigned)qn)
-            lt = log2tan_tab[o + itheta_q];
-         else
-            lt = bitexact_log2tan(iside,imid);
-         delta = FRAC_MUL16((N-1)<<7,lt);
-      }
-#else
       delta = FRAC_MUL16((N-1)<<7,bitexact_log2tan(iside,imid));
-#endif
    }
 
    sctx->inv = inv;
@@ -965,7 +912,7 @@ static unsigned quant_band_n1(struct band_ctx *ctx, celt_norm *X, celt_norm *Y, 
 
    (void)b;
 
-   encode = CELT_ENCODE_FLAG(ctx->encode);
+   encode = ctx->encode;
    ec = ctx->ec;
 
    stereo = Y != NULL;
@@ -996,7 +943,7 @@ static unsigned quant_band_n1(struct band_ctx *ctx, celt_norm *X, celt_norm *Y, 
    It can split the band in two and transmit the energy difference with
    the two half-bands. It can be called recursively so bands can end up being
    split in 8 parts. */
-ICODE_ATTR_OPUS static unsigned quant_partition(struct band_ctx *ctx, celt_norm *X,
+static unsigned quant_partition(struct band_ctx *ctx, celt_norm *X,
       int N, int b, int B, celt_norm *lowband,
       int LM,
       opus_val16 gain, int fill)
@@ -1015,7 +962,7 @@ ICODE_ATTR_OPUS static unsigned quant_partition(struct band_ctx *ctx, celt_norm 
    int spread;
    ec_ctx *ec;
 
-   encode = CELT_ENCODE_FLAG(ctx->encode);
+   encode = ctx->encode;
    m = ctx->m;
    i = ctx->i;
    spread = ctx->spread;
@@ -1162,7 +1109,7 @@ ICODE_ATTR_OPUS static unsigned quant_partition(struct band_ctx *ctx, celt_norm 
 
 
 /* This function is responsible for encoding and decoding a band for the mono case. */
-ICODE_ATTR_OPUS static unsigned quant_band(struct band_ctx *ctx, celt_norm *X,
+static unsigned quant_band(struct band_ctx *ctx, celt_norm *X,
       int N, int b, int B, celt_norm *lowband,
       int LM, celt_norm *lowband_out,
       opus_val16 gain, celt_norm *lowband_scratch, int fill)
@@ -1179,7 +1126,7 @@ ICODE_ATTR_OPUS static unsigned quant_band(struct band_ctx *ctx, celt_norm *X,
    int encode;
    int tf_change;
 
-   encode = CELT_ENCODE_FLAG(ctx->encode);
+   encode = ctx->encode;
    tf_change = ctx->tf_change;
 
    longBlocks = B0==1;
@@ -1288,7 +1235,7 @@ ICODE_ATTR_OPUS static unsigned quant_band(struct band_ctx *ctx, celt_norm *X,
 
 
 /* This function is responsible for encoding and decoding a band for the stereo case. */
-ICODE_ATTR_OPUS static unsigned quant_band_stereo(struct band_ctx *ctx, celt_norm *X, celt_norm *Y,
+static unsigned quant_band_stereo(struct band_ctx *ctx, celt_norm *X, celt_norm *Y,
       int N, int b, int B, celt_norm *lowband,
       int LM, celt_norm *lowband_out,
       celt_norm *lowband_scratch, int fill)
@@ -1305,7 +1252,7 @@ ICODE_ATTR_OPUS static unsigned quant_band_stereo(struct band_ctx *ctx, celt_nor
    int encode;
    ec_ctx *ec;
 
-   encode = CELT_ENCODE_FLAG(ctx->encode);
+   encode = ctx->encode;
    ec = ctx->ec;
 
    /* Special case for one sample */
@@ -1449,7 +1396,7 @@ static void special_hybrid_folding(const CELTMode *m, celt_norm *norm, celt_norm
       OPUS_COPY(&norm2[n1], &norm2[2*n1 - n2], n2-n1);
 }
 
-ICODE_ATTR_OPUS void quant_all_bands(int encode, const CELTMode *m, int start, int end,
+void quant_all_bands(int encode, const CELTMode *m, int start, int end,
       celt_norm *X_, celt_norm *Y_, unsigned char *collapse_masks,
       const celt_ener *bandE, int *pulses, int shortBlocks, int spread,
       int dual_stereo, int intensity, int *tf_res, opus_int32 total_bits,
@@ -1514,7 +1461,6 @@ ICODE_ATTR_OPUS void quant_all_bands(int encode, const CELTMode *m, int start, i
    lowband_offset = 0;
    ctx.bandE = bandE;
    ctx.ec = ec;
-   encode = CELT_ENCODE_FLAG(encode);
    ctx.encode = encode;
    ctx.intensity = intensity;
    ctx.m = m;

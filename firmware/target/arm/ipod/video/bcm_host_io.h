@@ -1,85 +1,43 @@
-/***************************************************************************
- *             __________               __   ___.
- *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
- *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
- *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
- *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
- *                     \/            \/     \/    \/            \/
- * $Id$
+/*
+ * bcm_host_io.h - BCM2722 (VideoCore) memory access primitives used by bcm_host.c
  *
- * BCM2722 host-interface bus I/O hooks.
- * Swapped in by the PC test harness; on the iPod these are real MMIO accesses.
+ * On target these are implemented in lcd-video.c (see 0001-ipodvideo-bcm-host-io.patch)
+ * on top of the existing bcm_write_addr()/bcm_read32() code. The host-side unit test
+ * (test/bcm_host_test.c) supplies a mock VideoCore RAM instead.
  *
- * Copyright (C) 2024 bcm-rockbox contributors
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
- * KIND, either express or implied.
- *
- ****************************************************************************/
+ * Rules learned from the stock firmware and from lcd-video.c:
+ *   - every transfer is 32-bit aligned, length a multiple of 4 ("the BCM ignores small
+ *     unaligned writes" - lcd-video.c);
+ *   - writes latch the destination once and auto-increment (this is how the stock code
+ *     and Rockbox upload vmcs.bin);
+ *   - reads here set the source address for every word (slow but known-good in
+ *     lcd-video.c's bcm_read32()).
+ */
 #ifndef BCM_HOST_IO_H
 #define BCM_HOST_IO_H
 
-#ifdef BCM_HOST_TEST
-/* PC test shim — implemented in bcm_host_test.c */
 #include <stdint.h>
-void     bcm_io_write(uint32_t addr, uint32_t val);
-uint32_t bcm_io_read(uint32_t addr);
-void     bcm_io_lock(void);
-void     bcm_io_unlock(void);
-void     bcm_io_doorbell(void);
-void     bcm_io_sleep_ticks(int ticks);
-uint32_t bcm_io_current_tick(void);
-#else
-/* Real iPod hardware */
-#include "config.h"
-#include "system.h"
-#include "kernel.h"
+#include <stddef.h>
+#include <stdbool.h>
 
-/* BCM bus register physical addresses */
-#define BCM_DATA        0x30000000u  /* 32-bit data window into VC SRAM      */
-#define BCM_WR_ADDR32   0x30010000u  /* write pointer (VC word address)       */
-#define BCM_RD_ADDR32   0x30020000u  /* read pointer  (VC word address)       */
-#define BCM_CONTROL     0x30030000u  /* write 0x31 to ring the doorbell        */
-#define BCM_ALT0        0x30040000u
-#define BCM_ALT1        0x30050000u
-#define BCM_ALT2        0x30060000u
-#define BCM_ALT3        0x30070000u
+void bcm_io_lock(void);     /* exclude the LCD tick and lcd_update_rect() from the BCM ports */
+void bcm_io_unlock(void);
+void bcm_io_read(uint32_t vc_addr, void *dst, size_t len);
+void bcm_io_write(uint32_t vc_addr, const void *src, size_t len);
+void bcm_io_doorbell(void); /* BCM_CONTROL = 0x31 */
+int  bcm_io_dead(void);     /* nonzero once a host bus wait timed out (VC not answering): 1 write-ready, 2 read-addr, 3 read-ready.
+                               All later bcm_io_read/write calls return at once (reads give 0xffffffff) instead of spinning forever. */
+void bcm_lcd_freeze(bool on);        /* v26: stop the legacy LCD driver from touching the BCM (tick kicks, updates) */
+void bcm_io_status(unsigned v[4]);   /* BCM_CONTROL, BCM_RD_ADDR, BCM_ALT_CONTROL, BCM_ALT_RD_ADDR (status bits) */
+void bcm_io_idle(void);     /* called while waiting; sleep(1) on target, so poll counts are ~10 ms units */
+void bcm_io_yield(void);    /* v56: short wait without giving up the tick (yield() on target) */
+uint32_t bcm_io_us(void);   /* v56: free-running microsecond counter (USEC_TIMER on target) */
 
-/* GPO bit 14 controls BCM power rail */
-#define BCM_POWER_BIT   (1u << 14)
+/* Target only (lcd-video.c): replace the VideoCore OS image and power-cycle the BCM so that it
+ * boots from `img` (16-bit aligned, must stay valid). */
+#include <stdbool.h>
+int  bcm_use_vmcs_image(const void *img, unsigned len);   /* 0 ok, -1 no NOR vmcs, -2 BCM not rebooted */
+unsigned bcm_get_boot_info(unsigned snap[4]);             /* VC[0x1F0..0x1FC] right after boot; returns boot count */
+int  bcm_restore_rom_vmcs(void);                          /* v47: power-cycle back to Rockbox's NOR display firmware; 0 ok */
 
-static inline void bcm_io_write(uint32_t addr, uint32_t val)
-{
-    REG32(addr) = val;
-}
-static inline uint32_t bcm_io_read(uint32_t addr)
-{
-    return REG32(addr);
-}
-
-/* The bus mutex lives in lcd-video.c; declared there, used here */
-extern struct mutex bcm_bus_mutex;
-
-static inline void bcm_io_lock(void)    { mutex_lock(&bcm_bus_mutex); }
-static inline void bcm_io_unlock(void)  { mutex_unlock(&bcm_bus_mutex); }
-
-static inline void bcm_io_doorbell(void)
-{
-    bcm_io_write(BCM_CONTROL, 0x31);
-}
-static inline void bcm_io_sleep_ticks(int ticks)
-{
-    sleep(ticks);
-}
-static inline uint32_t bcm_io_current_tick(void)
-{
-    return (uint32_t)current_tick;
-}
-#endif /* BCM_HOST_TEST */
-
-#endif /* BCM_HOST_IO_H */
+#endif
