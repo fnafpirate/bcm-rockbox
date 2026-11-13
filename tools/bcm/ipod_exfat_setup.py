@@ -55,10 +55,14 @@ up to 300 MB 4 KB, up to 34 GB 32 KB, up to 550 GB 128 KB, up to 2.2 TB 256 KB, 
 format it ("You need to format the disk in drive E:"); formatting it would have erased the bootloader.  The firmware
 partition is now listed once, as type 0 in the iPod's own units, the way Apple's layout does it.  (bcm overlay v102
 also hides an existing 0xDA entry from the computer in the iPod's USB mode.)
+
+1.10: the iPod is paired with this computer for clock sync (bcm overlay v105): /.rockbox/timesync_pc.txt names it,
+so the iPod takes its time only from this computer (ipod_time_sync.pyw, in this package, sends it).  A pairing kept
+from the old /.rockbox wins.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.9'
+VERSION = '1.10'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -917,6 +921,12 @@ def build_tree(up, rockbox_zip, keep_dir=None, log=print, ipsw=None):
             t.add('/' + info.filename, info.file_size, (lambda i=info: zf.open(i)), src='zip')
             nzip += 1
     log('  %d files from %s, %d kept from your old /.rockbox' % (nzip, os.path.basename(rockbox_zip), nkeep))
+    # 1.10: pair the clock sync with this computer, unless the kept /.rockbox already names one
+    rb0 = t.root.children.get(t.key('.rockbox'))
+    if rb0 is not None and t.key('timesync_pc.txt') not in rb0.children:
+        data = timesync_pair_text().encode('ascii')
+        t.add('/.rockbox/timesync_pc.txt', len(data), (lambda d=data: io.BytesIO(d)), src='zip')
+        log('  clock sync paired with this computer (%s)' % _computer_name())
     if ipsw:
         add_ipsw(t, ipsw, log)
     rb = t.root.children.get(t.key('.rockbox'))
@@ -1935,6 +1945,32 @@ def clock_sync(root, log=print):
     return now
 
 HELPER = 'ipod_clock_sync.pyw'
+
+# 1.10: clock sync pairing (bcm overlay v105, apps/bcm_timesync.c).  The same id as ipod_time_sync.pyw sends.
+def _machine_id():
+    if os.name == 'nt':
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Cryptography', 0,
+                               winreg.KEY_READ | getattr(winreg, 'KEY_WOW64_64KEY', 0))
+            v, _ = winreg.QueryValueEx(k, 'MachineGuid')
+            winreg.CloseKey(k)
+            if v:
+                return str(v)
+        except OSError:
+            pass
+    import uuid
+    return 'mac-%012x' % uuid.getnode()
+
+def _computer_name():
+    import socket
+    return os.environ.get('COMPUTERNAME') or socket.gethostname() or '?'
+
+def timesync_pair_text():
+    clean = lambda s: ''.join(c for c in str(s) if 0x20 <= ord(c) < 0x7f and c not in '=\n\r')[:60] or '?'
+    return ('# iPod clock sync: the computer this iPod takes its time from over USB.\n'
+            '# Delete this file to pair another computer (the next one that syncs).\n'
+            'id=%s\npc=%s\nlast=0\nseq=\n' % (clean(_machine_id()), clean(_computer_name())))
 
 def _startup_link():
     return os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'Microsoft', 'Windows', 'Start Menu',

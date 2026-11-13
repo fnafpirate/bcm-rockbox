@@ -368,6 +368,40 @@ static void bcm_hide_fw_partition(unsigned char *b)
         if(b[0x1be + 16 * k + 4] == 0xda)
             b[0x1be + 16 * k + 4] = 0;
 }
+
+/* bcm overlay v105: clock sync.  ipod_time_sync.pyw on the computer writes /.rockbox/timesync.dat (one 512-byte
+   sector starting "RBTSYNC1", with the computer's local time, name and id) when the iPod appears.  The sector is
+   caught here as it is written, with the tick it arrived, so the time can be carried forward exactly when it is
+   applied after the cable comes out (apps/bcm_timesync.c).  Nothing is changed in what is written. */
+static char ts_rec[512];
+static long ts_tick;
+static bool ts_have;
+
+static void bcm_timesync_scan(const unsigned char *b, unsigned len)
+{
+    for(unsigned i = 0; i + 512 <= len; i += 512)
+        if(!memcmp(b + i, "RBTSYNC1", 8)) {
+            memcpy(ts_rec, b + i, 511);
+            ts_rec[511] = 0;
+            ts_tick = current_tick;
+            ts_have = true;
+        }
+}
+
+/* the last record written during this connection, and the tick it arrived; false = none */
+bool usb_storage_timesync_take(char *rec, int n, long *tick)
+{
+    if(!ts_have || n < 1)
+        return false;
+    int old = disable_irq_save();
+    int m = n - 1 < 511 ? n - 1 : 511;
+    memcpy(rec, ts_rec, m);
+    rec[m] = 0;
+    *tick = ts_tick;
+    ts_have = false;
+    restore_irq(old);
+    return true;
+}
 #endif
 
 static int usb_interface;
@@ -595,6 +629,10 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
                         MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
                 int result = USBSTOR_WRITE_SECTORS_FILTER();
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                bcm_timesync_scan(cur_cmd.data[cur_cmd.data_select],
+                                  MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);   /* v105 */
+#endif
 
                 if (result == 0) {
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)

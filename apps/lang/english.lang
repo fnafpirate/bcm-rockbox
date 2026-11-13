@@ -19118,3 +19118,37 @@
     ipodvideo: "In Video Folders"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_TIMESYNC_SET
+  desc: bcm overlay v105: clock sync splash
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Clock set from %s"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Clock set from %s"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Clock set from s"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TIMESYNC_NOT_PAIRED
+  desc: bcm overlay v105: clock sync splash
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Clock not set: %s is not this iPod's computer"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Clock not set: %s is not this iPod's computer"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Clock not set s is not this iPod's computer"
+  </voice>
+</phrase>
