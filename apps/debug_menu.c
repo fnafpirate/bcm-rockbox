@@ -4495,7 +4495,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v105 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v107 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5840,7 +5840,7 @@ static void mon_tick(void)
     if (el != 0xffffffffu) pl_el_ms = el;
     {
         char ck[24] = "";
-        if (bcm_warm_run) snprintf(ck, sizeof ck, " core=%u MHz", bcm_core_mhz());   /* v102: warm starts only */
+        snprintf(ck, sizeof ck, " core=%u MHz", bcm_core_mhz());   /* v102 warm starts; v106 every monitor line */
         BLOG("  mon +%ld.%lds: elapsed=%u buffering=%d paused=%s frames requested since=%d%s",
              (current_tick - mon_t0) / HZ, (current_tick - mon_t0) % HZ / 10, (unsigned)el, bu == 0xffffffffu ? -1 : (int)bu,
              strstr(r, "paused=yes") ? "yes" : "no", v_getframes - mon_req0, ck);
@@ -6021,12 +6021,40 @@ static void av_prep(uint32_t t, bool video_paused_by_us)
    the unknown wiring, the WM8758's AUX inputs mixed into the output (cfg av_mix). */
 static bool av_vc_route;
 static unsigned int av_hz_saved;
+/* v106: a video's sound is always 48 kHz stereo, on both routes, and the rate is set BEFORE the VideoCore opens its
+   sound.  Its audio block takes its bit and frame clocks from the WM8758 and checks for them only for ~65 ms when the
+   sound opens (ProkBox's reading of Apple's driver, vmcs @14020); v53-v105 switched the codec 44.1 -> 48 kHz right
+   AFTER mp_play, i.e. while the VideoCore was opening its sound.  Rockbox's route keeps 48 kHz too (its DSP resamples a
+   44.1 kHz track), so the two routes sound and time the same. */
+static bool av48_on;
+static unsigned int av48_saved_hz;
+static int av48_saved_pf;
+static void av_48k_begin(void)
+{
+    if (av48_on) return;
+    av48_on = true;
+    av48_saved_hz = mixer_get_frequency();
+    av48_saved_pf = global_settings.play_frequency;
+    global_settings.play_frequency = SAMPR_48;         /* playback must not switch back to a 44.1 kHz track's rate */
+    mixer_set_frequency(SAMPR_44);                     /* v54: a change forces pcm_apply_settings() to program the codec */
+    mixer_set_frequency(SAMPR_48);
+    sound_set_channels(SOUND_CHAN_STEREO);
+    BLOG("  audio: 48 kHz stereo for the video, set before the VideoCore opens its sound (was %u Hz)", av48_saved_hz);
+}
+static void av_48k_end(void)
+{
+    if (!av48_on) return;
+    av48_on = false;
+    global_settings.play_frequency = av48_saved_pf;
+    sound_set_channels(global_settings.channel_config);
+    if (av48_saved_hz && av48_saved_hz != SAMPR_48) mixer_set_frequency(av48_saved_hz);
+}
 static void av_codec_vc(bool on)
 {
     if (on)
     {
-        av_hz_saved = mixer_get_frequency();
-        if (cfg_av_hz > 0)
+        av_hz_saved = av48_on ? 0 : mixer_get_frequency();
+        if (cfg_av_hz > 0 && !av48_on)
         {   /* v54: v53 asked for 48 kHz, but the mixer's *pending* rate was already 48 kHz (Rockbox's last track) while the
                codec still ran at 44.1 kHz, so mixer_set_frequency() returned without touching the codec: the VC's 48 kHz
                sound came out at 44.1 kHz (-8 %, deep) and its clock -- and the picture -- ran 8 % slow.  Switching to
@@ -7240,6 +7268,7 @@ static void bcm_video_run(int secs)
     if (rs_vol >= 0) { av_set_vol(rs_vol); rs_vol = -1; }
     rs_state = 0;
     av_close();
+    av_48k_end();                                      /* v106 */
     av_boost(false);
 #ifdef HAVE_BATTERY_SMOOTH_API
     powermgmt_set_load_hint(3, false);
@@ -7249,7 +7278,11 @@ static void bcm_video_run(int secs)
 
 /* v17: the stock firmware sends "pm_set_policy min" (rt 0x1b013c, called from the mp_selectplay builder at rt 0x1fa3f0
    and the mp_play builder at rt 0x1f8ea0, and from the TV-out code) right before those commands; v16 never did. */
-static const char *bcm_pm_pol = "min";           /* v102: a warm start may use "max" (see bcm_warm_clock) */
+/* v106: "min" is Apple's load governor (5-150 MHz in 1 MHz steps, 10 ms windows, about +6 % a window when busy),
+   "max" holds 150 MHz (ProkBox's reading of vmcs @fcec / @fe00).  The UI and standby use "min"; a video runs on "max":
+   under "min" the kept VideoCore idled down to 25 / 138 MHz and starts sat 4-7 s at buffering=0.  Back to "min" when
+   the video ends (kp_enter) -- a VideoCore that is handed back is powered off anyway. */
+static const char *bcm_pm_pol = "min";
 static void bcm_pm_set(void)
 {
     char resp[256], c[32]; int r;
@@ -7268,32 +7301,9 @@ static unsigned bcm_core_mhz(void)
     const char *p = strstr(r, "core=");
     return p ? (unsigned)(atoi(p + 5) / 1000000) : 0;
 }
-/* v102: both warm-start logs: the kept VideoCore ran slower than a fresh one (25 MHz in v99, 138 in v101, 150 fresh)
-   and sat at "buffering=0" for 4-7 s before the picture moved; a fresh one moves 0.5-1.5 s after buffering ends.
-   Experiment: if the clock is down, try "pm_set_policy max" and keep it for this video only if the clock goes up. */
 static void bcm_warm_clock(void)
-{
-    char resp[128];
-    unsigned c0 = bcm_core_mhz(), c1;
-    long t;
-    BLOG("warm start: VideoCore clock %u MHz (a fresh start runs at 150)", c0);
-    if (!c0 || c0 >= 150) return;
-    bcm_cmd_t0 = current_tick;
-    bcm_log_text("pm_set_policy max", bcm_gencmd_watched("pm_set_policy max", resp, sizeof resp, 2), resp);
-    t = current_tick + HZ * 3 / 10;
-    while (TIME_BEFORE(current_tick, t)) { bcm_host_service(); yield(); }
-    c1 = bcm_core_mhz();
-    if (c1 > c0)
-    {
-        bcm_pm_pol = "max";
-        BLOG("warm start: clock %u -> %u MHz with policy max -- kept for this video", c0, c1);
-    }
-    else
-    {
-        bcm_cmd_t0 = current_tick;
-        bcm_log_text("pm_set_policy min", bcm_gencmd_watched("pm_set_policy min", resp, sizeof resp, 2), resp);
-        BLOG("warm start: clock %u -> %u MHz with policy max -- not higher, back to min", c0, c1);
-    }
+{   /* v106: only a log line now -- every video runs on "max" (bcm_pm_set) */
+    BLOG("warm start: VideoCore clock %u MHz before the video (a fresh start runs at 150)", bcm_core_mhz());
 }
 /* v27: the stock mp_selectplay path starts with "audio_enable 1" (function 0x1f90f4, called at 0x1fa3dc), then pm_set_policy min, then mp_selectplay. */
 static void bcm_audio_enable(void)
@@ -7820,6 +7830,15 @@ static void bcm_playback_probe(void)
     if (bcm_tv) bcm_tv_enable(true);                   /* v55: the TV region replaces the LCD region; v56: after mp4_open (size) */
     bcm_step("mp_region");
 again:
+    {
+#ifndef SIMULATOR
+        bool spk = piezo_speaker_home_sink() == PCM_SINK_PIEZO;
+#else
+        bool spk = false;
+#endif
+        if (v_sound && !spk) av_48k_begin();           /* v106 */
+    }
+    bcm_pm_pol = "max";                                /* v106: full speed for the whole video (see bcm_pm_set) */
     bcm_setvol();                                      /* v28: stock order: mp_setvol 0, audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_audio_enable();                                /* v27: stock order: audio_enable 1, pm_set_policy min, mp_selectplay */
     bcm_pm_set();                                      /* stock order: pm_set_policy min, then mp_selectplay (cfg pm, default off since v20) */
@@ -8063,6 +8082,7 @@ static void bcm_handback(void)
 {
     static char resp[256];
     int rr = 0;
+    av_48k_end();                                      /* v106: a run that ended before the playback loop */
     /* v56: panel off first, then the VideoCore (it may stop answering after power_control); backlight off before
        the panel is (a lit panel that loses its picture shows white).  bcm_restore_rom_vmcs() lights it again after
        the first complete picture from Rockbox's display firmware. */
@@ -8324,6 +8344,11 @@ static bool kp_enter(void)
         bcm_mp_task = -1;
         if (r1 < 0) { BLOG("keep ready: not kept -- end_application was not answered"); return false; }
     }
+    {   /* v106: the video ran on "max"; on standby the governor lets the VideoCore idle down again */
+        static char pr[96];
+        bcm_pm_pol = "min";
+        bcm_log_text("pm_set_policy min", bcm_gencmd_watched("pm_set_policy min", pr, sizeof pr, 2), pr);
+    }
     imgs = bcm_gfx_tracked(&wins, &lost);
     fails = bcm_gfx_release_all();
     BLOG("keep ready: freed %d image(s) and %d window(s) of the video (%d unanswered, %d not recorded)", imgs, wins, fails, lost);
@@ -8404,7 +8429,7 @@ static bool bcm_run(const char *play_path)
     if ((bcm_standby || warm) && bcm_log_fd >= 0)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
-    BLOG("bcm host test v105, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v107, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -8679,6 +8704,7 @@ out:
         bcm_wd_secs = 15;
         if (bcm_play_path)
         {
+            av_48k_end();                                      /* v106: before standby or hand-back */
             if (kp_wanted() && run_ok && !pl_sys_event && kp_enter())
                 BLOG("player: the VideoCore stays on standby while the browser stays in the video folders");
             else bcm_handback();

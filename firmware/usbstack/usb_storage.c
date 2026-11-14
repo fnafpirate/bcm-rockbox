@@ -402,6 +402,223 @@ bool usb_storage_timesync_take(char *rec, int n, long *tick)
     restore_irq(old);
     return true;
 }
+
+/* bcm overlay v107: USB speed.
+ * 1. Read-ahead.  Each READ costs a whole ATA command (the command's own latency + the data); Windows reads 64 KB at a
+ *    time.  When a READ continues where the last one ended, one ATA command now fetches 256 KB into a window and the
+ *    next READs are sent to the computer straight out of it (no copy: the USB transfer reads the window).  A window is
+ *    only refilled while no USB transfer is reading from it; any WRITE, a reset, an eject or the end of the connection
+ *    empties it; sector 0 never comes from it (the v102 partition-table patch needs its own copy).  Settings > General
+ *    Settings > System > USB > USB Read-Ahead switches it off.
+ * 2. A speed report, /.rockbox/usb_speed.txt, written when the cable comes out: MB moved each way, MB/s, how long the
+ *    disk took per command, command sizes, read-ahead hits.  (Inspired by ProkBox5g's USB speed work on the same chip:
+ *    their per-command ATA latency of 1-3 ms dominated small reads.) */
+#include <stdio.h>
+#include "file.h"
+#include "kernel.h"
+bool usb_storage_readahead = true;          /* from the setting (apps/settings.c), read at each connection */
+#define RA_BYTES (256*1024)
+static int ra_handle = -1;
+static unsigned char *ra_buf;               /* uncached alias, like the transfer buffer: ATA DMA in, USB DMA out */
+static bool ra_on;
+static sector_t ra_start, ra_next, ra_total;
+static unsigned int ra_count;               /* sectors in the window; 0 = empty */
+
+struct us_stats {
+    uint64_t bytes[2];                      /* [0] read, [1] write */
+    uint32_t cmds[3];                       /* read, write, other */
+    uint64_t wall_us[3];                    /* CBW to the next CBW (gaps over 1 s left out) */
+    uint64_t dev_us[3];                     /* CBW to CSW: time spent inside the iPod */
+    uint64_t ata_us[2];
+    uint32_t ata_n[2], ata_max[2];
+    uint32_t ra_hits, ra_fills, ra_direct;
+    uint64_t ra_hit_bytes;
+    uint32_t size_hist[2][6];               /* <=4K, <=16K, <=32K, <=64K, <=128K, more */
+    long t_first, t_last;                   /* ticks of the first / last data command */
+};
+static struct us_stats us;
+static uint32_t us_cbw_t;
+static int us_cbw_type = -1;
+static bool us_csw_pending;
+
+static void us_cmd_start(int op, unsigned int bytes)
+{
+    uint32_t now = USEC_TIMER;
+    int type = (op == SCSI_READ_10 || op == 0x88) ? 0 : (op == SCSI_WRITE_10 || op == 0x8a) ? 1 : 2;
+    if(us_cbw_type >= 0 && now - us_cbw_t < 1000000)
+        us.wall_us[us_cbw_type] += now - us_cbw_t;
+    us_cbw_t = now;
+    us_cbw_type = type;
+    us_csw_pending = true;
+    us.cmds[type]++;
+    if(type < 2) {
+        int k = bytes <= 4096 ? 0 : bytes <= 16384 ? 1 : bytes <= 32768 ? 2 : bytes <= 65536 ? 3 : bytes <= 131072 ? 4 : 5;
+        us.bytes[type] += bytes;
+        us.size_hist[type][k]++;
+        if(!us.t_first)
+            us.t_first = current_tick;
+        us.t_last = current_tick;
+    }
+}
+
+static void us_cmd_end(void)
+{
+    if(us_csw_pending && us_cbw_type >= 0)
+        us.dev_us[us_cbw_type] += USEC_TIMER - us_cbw_t;
+    us_csw_pending = false;
+}
+
+static int us_ata(int write, IF_MD(int lun,) sector_t sector, int count, void *buf)
+{
+    uint32_t t0 = USEC_TIMER, dt;
+    int r = write ? storage_write_sectors(IF_MD(lun,) sector, count, buf)
+                  : storage_read_sectors(IF_MD(lun,) sector, count, buf);
+    dt = USEC_TIMER - t0;
+    us.ata_us[write] += dt;
+    us.ata_n[write]++;
+    if(dt > us.ata_max[write])
+        us.ata_max[write] = dt;
+    return r;
+}
+
+static void ra_drop(void)
+{
+    ra_count = 0;
+    ra_next = 0;
+}
+
+static void ra_init(void)
+{
+    ra_drop();
+    ra_on = false;
+    if(!usb_storage_readahead || ra_handle > 0)
+        return;
+    ra_handle = core_alloc_ex(RA_BYTES + 31, &buflib_ops_locked);
+    if(ra_handle <= 0) {
+        ra_handle = -1;                     /* no room: plain reads, as before */
+        return;
+    }
+    unsigned char *p = core_get_data(ra_handle);
+#if defined(UNCACHED_ADDR) && CONFIG_CPU != AS3525
+    ra_buf = (void *)UNCACHED_ADDR((unsigned int)(p + 31) & 0xffffffe0);
+#else
+    ra_buf = (void *)((unsigned int)(p + 31) & 0xffffffe0);
+#endif
+    commit_discard_dcache();
+    ra_on = true;
+}
+
+static void ra_free(void)
+{
+    ra_drop();
+    ra_on = false;
+    if(ra_handle > 0)
+        core_free(ra_handle);
+    ra_handle = -1;
+}
+
+static bool ra_in_window(const void *p)
+{
+    return ra_on && (const unsigned char *)p >= ra_buf && (const unsigned char *)p < ra_buf + RA_BYTES;
+}
+
+/* Fills chunk `select` of the current READ.  Points cur_cmd.data[select] into the window when it holds the sectors,
+   else at its own transfer buffer and reads into that.  `busy` = the other chunk is being sent out of the window right
+   now, so the window must not be refilled. */
+static int ums_read_chunk(int select, sector_t sector, int count, bool busy)
+{
+    unsigned char *own = select ? &tb.transfer_buffer[READ_BUFFER_SIZE] : tb.transfer_buffer;
+    unsigned int bs = cur_cmd.block_size;
+    cur_cmd.data[select] = own;
+    if(ra_on && sector != 0 && bs && (unsigned int)count * bs <= RA_BYTES) {
+        if(ra_count && sector >= ra_start && sector + count <= ra_start + ra_count) {
+            cur_cmd.data[select] = ra_buf + (unsigned int)(sector - ra_start) * bs;
+            us.ra_hits++;
+            us.ra_hit_bytes += (unsigned int)count * bs;
+            ra_next = sector + count;
+            return 0;
+        }
+        if(!busy && ra_next && sector == ra_next && ra_total > sector) {
+            unsigned int n = RA_BYTES / bs;
+            if(sector + n > ra_total)
+                n = ra_total - sector;
+            if(n >= (unsigned int)count) {
+                ra_count = 0;
+                if(us_ata(0, IF_MD(cur_cmd.lun,) sector, n, ra_buf) == 0) {
+                    ra_start = sector;
+                    ra_count = n;
+                    us.ra_fills++;
+                    cur_cmd.data[select] = ra_buf;
+                    us.ra_hits++;
+                    us.ra_hit_bytes += (unsigned int)count * bs;
+                    ra_next = sector + count;
+                    return 0;
+                }
+            }
+        }
+    }
+    us.ra_direct++;
+    ra_next = sector + count;
+    return us_ata(0, IF_MD(cur_cmd.lun,) sector, count, own);
+}
+
+/* called from the USB screen after the cable is pulled: the speed of the session just ended */
+void usb_storage_speed_save(void)
+{
+    static const char *const sz[6] = { "<=4K", "<=16K", "<=32K", "<=64K", "<=128K", ">128K" };
+    struct us_stats s = us;
+    memset(&us, 0, sizeof us);
+    us_cbw_type = -1;
+    if(s.bytes[0] + s.bytes[1] == 0)
+        return;
+    int fd = open("/.rockbox/usb_speed.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if(fd < 0)
+        return;
+    fdprintf(fd, "bcm overlay v107 USB speed (the last connection)\n");
+    fdprintf(fd, "disk in use for %ld s; CPU %ld MHz; read-ahead %s (%d KB window); write chunk %d KB "
+                 "(Settings > System > USB > USB Write Speed: %s)\n\n",
+             (s.t_last - s.t_first) / HZ, (long)(FREQ / 1000000), usb_storage_readahead ? "on" : "off",
+             RA_BYTES / 1024, (int)(WRITE_CHUNK / 1024),
+#ifdef USB_STORAGE_RUNTIME_WRITE_CHUNK
+             usb_storage_fast_writes ? "Fast" : "Stock"
+#else
+             "-"
+#endif
+             );
+    for(int d = 0; d < 2; d++) {
+        uint64_t b = s.bytes[d];
+        uint32_t c = s.cmds[d];
+        if(!c)
+            continue;
+        unsigned long wall_ms = (unsigned long)(s.wall_us[d] / 1000), dev_ms = (unsigned long)(s.dev_us[d] / 1000);
+        unsigned long rate10 = s.wall_us[d] ? (unsigned long)(b * 10 / s.wall_us[d]) : 0;
+        unsigned long drate10 = s.dev_us[d] ? (unsigned long)(b * 10 / s.dev_us[d]) : 0;
+        fdprintf(fd, "%s: %lu.%lu MB in %lu commands (average %lu KB)\n", d ? "WRITE" : "READ",
+                 (unsigned long)(b >> 20), (unsigned long)((b & 0xfffff) * 10 >> 20), (unsigned long)c,
+                 (unsigned long)(b / c / 1024));
+        fdprintf(fd, "  speed while busy: %lu.%lu MB/s (with the computer's gaps), %lu.%lu MB/s inside the iPod; "
+                     "%lu ms busy, %lu ms inside\n", rate10 / 10, rate10 % 10, drate10 / 10, drate10 % 10, wall_ms, dev_ms);
+        fdprintf(fd, "  per command: %lu us inside the iPod, %lu us waiting for the computer\n",
+                 (unsigned long)(s.dev_us[d] / c), (unsigned long)((s.wall_us[d] > s.dev_us[d] ? s.wall_us[d] - s.dev_us[d] : 0) / c));
+        if(s.ata_n[d])
+            fdprintf(fd, "  disk: %lu commands, %lu us each on average, longest %lu us, %lu ms in all\n",
+                     (unsigned long)s.ata_n[d], (unsigned long)(s.ata_us[d] / s.ata_n[d]), (unsigned long)s.ata_max[d],
+                     (unsigned long)(s.ata_us[d] / 1000));
+        fdprintf(fd, "  sizes:");
+        for(int k = 0; k < 6; k++)
+            if(s.size_hist[d][k])
+                fdprintf(fd, " %s %lu", sz[k], (unsigned long)s.size_hist[d][k]);
+        fdprintf(fd, "\n");
+        if(!d)
+            fdprintf(fd, "  read-ahead: %lu window fills, %lu chunks sent from the window (%lu MB), %lu read directly\n",
+                     (unsigned long)s.ra_fills, (unsigned long)s.ra_hits, (unsigned long)(s.ra_hit_bytes >> 20),
+                     (unsigned long)s.ra_direct);
+        fdprintf(fd, "\n");
+    }
+    if(s.cmds[2])
+        fdprintf(fd, "other commands: %lu\n", (unsigned long)s.cmds[2]);
+    close(fd);
+}
 #endif
 
 static int usb_interface;
@@ -565,6 +782,9 @@ static int usb_storage_init_connection(void)
 #endif
 #endif
     usb_drv_recv_nonblocking(EP_OUT, cbw_buffer, MAX_CBW_SIZE);
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    ra_init();                                  /* v107 */
+#endif
 
     int i;
     for(i=0;i<storage_num_drives();i++) {
@@ -577,6 +797,9 @@ static int usb_storage_init_connection(void)
 
 void usb_storage_disconnect(void)
 {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    ra_free();                                  /* v107 */
+#endif
 #ifndef USB_STATIC_ALLOC
     usb_handle = core_free(usb_handle);
 #endif
@@ -635,10 +858,17 @@ static void usb_storage_transfer_complete(int ep,int dir,int status,int length)
 #endif
 
                 if (result == 0) {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                    result = us_ata(1, IF_MD(cur_cmd.lun,)
+                        cur_cmd.sector,
+                        MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count),
+                        cur_cmd.data[cur_cmd.data_select]);      /* v107: timed */
+#else
                     result = storage_write_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
                         MIN(WRITE_CHUNK/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
+#endif
                 }
 
                 if(result != 0) {
@@ -816,6 +1046,9 @@ static bool usb_storage_control_request(struct usb_ctrlrequest* req, uint8_t* re
         case USB_BULK_RESET_REQUEST:
             logf("ums: bulk reset");
             state = WAITING_FOR_COMMAND;
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+            ra_drop();                          /* v107 */
+#endif
             /* UMS BOT 3.1 says The device shall preserve the value of its bulk
                data toggle bits and endpoint STALL conditions despite
                the Bulk-Only Mass Storage Reset. */
@@ -855,10 +1088,17 @@ static void send_and_read_next(void)
                 ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
                 MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+        /* v107: the chunk just handed to USB may be in the window: then it must not be refilled now */
+        result = ums_read_chunk(cur_cmd.data_select, cur_cmd.sector,
+                MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
+                ra_in_window(cur_cmd.data[!cur_cmd.data_select]));
+#else
         result = storage_read_sectors(IF_MD(cur_cmd.lun,)
                 cur_cmd.sector,
                 MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                 cur_cmd.data[cur_cmd.data_select]);
+#endif
         if(cur_cmd.last_result == 0)
             cur_cmd.last_result = result;
 
@@ -944,6 +1184,25 @@ static void handle_scsi(struct command_block_wrapper* cbw)
     cur_cmd.tag = cbw->tag;
     cur_cmd.lun = lun;
     cur_cmd.cur_cmd = cbw->command_block[0];
+
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    {   /* v107: speed report; the read-ahead window survives only reads and harmless questions */
+        const unsigned char *cb = cbw->command_block;
+        unsigned char op = cb[0];
+        unsigned int n = 0;
+        if(op == SCSI_READ_10 || op == SCSI_WRITE_10)
+            n = (cb[7] << 8 | cb[8]) * bsize;
+        else if(op == 0x88 || op == 0x8a)
+            n = ((uint32_t)cb[10] << 24 | cb[11] << 16 | cb[12] << 8 | cb[13]) * bsize;
+        us_cmd_start(op, n);
+        ra_total = block_count;
+        if(!lun_present || ejected[lun] ||
+           !(op == SCSI_READ_10 || op == 0x88 || op == SCSI_TEST_UNIT_READY || op == SCSI_REQUEST_SENSE ||
+             op == SCSI_INQUIRY || op == SCSI_MODE_SENSE_6 || op == SCSI_MODE_SENSE_10 || op == SCSI_READ_CAPACITY_10 ||
+             op == USB_UFI_READ_FORMAT_CAPACITY || op == SCSI_ALLOW_MEDIUM_REMOVAL || op == 0x9e))
+            ra_drop();
+    }
+#endif
 
     switch (cbw->command_block[0]) {
         case SCSI_TEST_UNIT_READY:
@@ -1308,15 +1567,16 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 memcpy(cur_cmd.data[cur_cmd.data_select],
                         ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size,cur_cmd.count)*cur_cmd.block_size);
+#elif defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                cur_cmd.last_result = ums_read_chunk(cur_cmd.data_select, cur_cmd.sector,
+                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count), false);   /* v107 */
+                if(cur_cmd.sector == 0)
+                    bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 (never from the window) */
 #else
                 cur_cmd.last_result = storage_read_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
-#endif
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-                if(cur_cmd.sector == 0)
-                    bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 */
 #endif
                 send_and_read_next();
             }
@@ -1363,15 +1623,16 @@ static void handle_scsi(struct command_block_wrapper* cbw)
                 memcpy(cur_cmd.data[cur_cmd.data_select],
                         ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size,cur_cmd.count)*cur_cmd.block_size);
+#elif defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+                cur_cmd.last_result = ums_read_chunk(cur_cmd.data_select, cur_cmd.sector,
+                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count), false);   /* v107 */
+                if(cur_cmd.sector == 0)
+                    bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 (never from the window) */
 #else
                 cur_cmd.last_result = storage_read_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
                         MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
-#endif
-#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
-                if(cur_cmd.sector == 0)
-                    bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 */
 #endif
                 send_and_read_next();
             }
@@ -1604,6 +1865,9 @@ static void receive_block_data(void *data,int size)
 
 static void send_csw(int status)
 {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    us_cmd_end();                               /* v107 */
+#endif
     tb.csw->signature = htole32(CSW_SIGNATURE);
     tb.csw->tag = cur_cmd.tag;
     tb.csw->data_residue = htole32(cur_cmd.data_residue);

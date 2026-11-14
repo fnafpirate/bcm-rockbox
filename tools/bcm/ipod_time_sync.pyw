@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""iPod Time Sync 1.0 -- sets the clock of a Rockbox iPod (bcm overlay v105 or later) from this computer.
+"""iPod Time Sync 1.1 -- sets the clock of a Rockbox iPod (bcm overlay v105 or later) from this computer.
 
 USB storage gives the iPod no way to ask the computer for the time, so this small helper does it: started with
 Windows, it watches for the iPod's drive and, when it appears, writes the computer's local time, name and id to
@@ -9,11 +9,14 @@ Windows, it watches for the iPod's drive and, when it appears, writes the comput
 Pairing is done by the iPod: the first computer that syncs it is remembered in /.rockbox/timesync_pc.txt, and
 records from any other computer are ignored.  Delete that file on the iPod to pair a different computer.
 
-Run it once (double-click) and press "Start with Windows".  Python 3 standard library only.
+Only the iPod you choose is synced (1.1): run it once (double-click), pick your iPod's drive, press "Use this iPod",
+then "Start with Windows".  The iPod is recognised by its volume serial number, so it is still found when Windows
+gives it another drive letter.  (Formatting the iPod gives it a new serial: choose it again afterwards.)
+Python 3 standard library only.
 
-  ipod_time_sync.pyw                 the window: install / remove / sync now
-  ipod_time_sync.pyw --background    what Windows starts at log-on: no window, watches for the iPod
-  ipod_time_sync.pyw --sync-now      writes the record to every connected iPod and exits
+  ipod_time_sync.pyw                 the window: choose the iPod, install / remove, sync now
+  ipod_time_sync.pyw --background    what Windows starts at log-on: no window, watches for the chosen iPod
+  ipod_time_sync.pyw --sync-now      writes the record to the chosen iPod (if connected) and exits
 """
 import os
 import sys
@@ -24,9 +27,10 @@ import socket
 import shutil
 import datetime
 import subprocess
+import json
 
 APP = 'iPod Time Sync'
-VERSION = '1.0'
+VERSION = '1.1'
 RUN_VALUE = 'iPodTimeSync'
 RECORD_FILE = os.path.join('.rockbox', 'timesync.dat')
 MARKER = os.path.join('.rockbox', 'rockbox.ipod')       # a Rockbox iPod (5G / 5.5G)
@@ -110,6 +114,66 @@ def find_ipods(roots=None):
     return found
 
 
+def volume_id(root):
+    """(serial, label) of the volume at root: the Windows volume serial ("1A2B-3C4D"), which stays the same when
+    the drive letter changes; elsewhere the device number.  (None, '') if it cannot be read."""
+    if IS_WIN:
+        import ctypes
+        from ctypes import wintypes
+        ser = wintypes.DWORD()
+        label = ctypes.create_unicode_buffer(261)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(ctypes.c_wchar_p(root), label, 261, ctypes.byref(ser),
+                                                          None, None, None, 0)
+        if not ok:
+            return None, ''
+        return '%04X-%04X' % (ser.value >> 16, ser.value & 0xFFFF), label.value
+    try:
+        return 'dev-%x' % os.stat(root).st_dev, os.path.basename(root.rstrip('/\\'))
+    except OSError:
+        return None, ''
+
+
+def config_path():
+    return os.path.join(data_dir(), 'config.json')
+
+
+def load_choice():
+    """the chosen iPod: {'serial', 'label', 'letter'} or None"""
+    try:
+        with open(config_path(), encoding='utf-8') as f:
+            c = json.load(f)
+        return c if c.get('serial') else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_choice(root):
+    serial, label = volume_id(root)
+    if not serial:
+        raise OSError('cannot read the volume serial of %s' % root)
+    c = {'serial': serial, 'label': label, 'letter': root}
+    with open(config_path(), 'w', encoding='utf-8') as f:
+        json.dump(c, f, indent=1)
+    log('iPod chosen: %s (%s, serial %s)' % (root, label or 'no label', serial))
+    return c
+
+
+def chosen_root(choice=None, ipods=None):
+    """the drive of the chosen iPod if it is connected now (whatever its letter), else None"""
+    choice = load_choice() if choice is None else choice
+    if not choice:
+        return None
+    for r in (find_ipods() if ipods is None else ipods):
+        if volume_id(r)[0] == choice['serial']:
+            return r
+    return None
+
+
+def describe(root):
+    serial, label = volume_id(root)
+    return '%s  %s  (serial %s)' % (root, label or '(no label)', serial or '?')
+
+
 # ---------------------------------------------------------------- background watcher
 
 def data_dir():
@@ -142,7 +206,8 @@ def single_instance():
 
 
 def watch(stop_after=None):
-    """Writes the record once each time an iPod's drive appears.  A 'quit' file in the data folder stops it."""
+    """Writes the record once each time the CHOSEN iPod's drive appears (1.1: no other drive is touched).
+    A 'quit' file in the data folder stops it.  The choice is read again each time, so a new one applies at once."""
     if not single_instance():
         return
     quit_flag = os.path.join(data_dir(), 'quit')
@@ -156,7 +221,8 @@ def watch(stop_after=None):
             os.remove(quit_flag)
             log('stopped')
             return
-        now_ipods = set(find_ipods())
+        r0 = chosen_root()
+        now_ipods = {r0} if r0 else set()
         for r in sorted(now_ipods - seen):
             time.sleep(1.0)                                     # let Windows finish mounting it
             try:
@@ -233,26 +299,74 @@ def gui():
     frm = ttk.Frame(root, padding=14)
     frm.grid()
     ttk.Label(frm, text=APP, font=('Segoe UI', 13, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w')
-    ttk.Label(frm, wraplength=430, justify='left', text=(
+    ttk.Label(frm, wraplength=470, justify='left', text=(
         'Sets your iPod\'s clock from this computer every time you plug it in.  Needs Rockbox with bcm overlay '
-        'v105 or later on the iPod.\n\nThe first computer that syncs the iPod is the only one it takes the time '
-        'from.  To pair a different computer, delete .rockbox\\timesync_pc.txt on the iPod.')
+        'v105 or later on the iPod.\n\nOnly the iPod you choose here is synced: pick its drive and press "Use this '
+        'iPod".  It is recognised by its volume serial, so a different drive letter later does not matter.\n\n'
+        'The iPod itself takes the time only from the computer it is paired with (the first one that syncs it).  '
+        'To pair a different computer, delete .rockbox\\timesync_pc.txt on the iPod.')
     ).grid(row=1, column=0, columnspan=3, sticky='w', pady=(4, 10))
     who = ttk.Label(frm, text='This computer: %s' % computer_name())
     who.grid(row=2, column=0, columnspan=3, sticky='w')
+
+    pick = ttk.LabelFrame(frm, text='Your iPod', padding=8)
+    pick.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(8, 6))
+    drives = []
+    drive_var = tk.StringVar()
+    combo = ttk.Combobox(pick, textvariable=drive_var, state='readonly', width=52)
+    combo.grid(row=0, column=0, sticky='w')
+    chosen_lbl = ttk.Label(pick, text='')
+    chosen_lbl.grid(row=1, column=0, columnspan=3, sticky='w', pady=(6, 0))
     status = ttk.Label(frm, text='')
-    status.grid(row=3, column=0, columnspan=3, sticky='w', pady=(2, 10))
+    status.grid(row=4, column=0, columnspan=3, sticky='w', pady=(2, 10))
+
+    def list_drives():
+        drives[:] = find_ipods()
+        names = [describe(r) for r in drives]
+        combo['values'] = names
+        cur = chosen_root(ipods=drives)
+        if cur in drives:
+            combo.current(drives.index(cur))
+        elif names and combo.current() < 0:
+            combo.current(0)
+        elif not names:
+            drive_var.set('')
 
     def refresh():
         try:
             on = bool(run_key()) if IS_WIN else False
         except OSError:
             on = False
-        ipods = find_ipods()
-        status.config(text='Starts with Windows: %s.   iPods connected: %s' %
-                      ('yes' if on else 'no', ', '.join(ipods) if ipods else 'none'))
+        c = load_choice()
+        if c:
+            r = chosen_root(c)
+            chosen_lbl.config(text='Chosen: %s (serial %s) -- %s' % (c.get('label') or '(no label)', c['serial'],
+                                                                  'connected as %s' % r if r else 'not connected'))
+        else:
+            chosen_lbl.config(text='Chosen: none yet -- nothing is synced until you choose your iPod')
+        status.config(text='Starts with Windows: %s' % ('yes' if on else 'no'))
+
+    def do_choose():
+        i = combo.current()
+        if i < 0 or i >= len(drives):
+            messagebox.showwarning(APP, 'No Rockbox iPod drive to choose.  Plug it in, wait for its drive letter, '
+                                        'and press Refresh.')
+            return
+        try:
+            c = save_choice(drives[i])
+            messagebox.showinfo(APP, 'Only this iPod will be synced:\n\n%s\n%s (serial %s)'
+                                % (drives[i], c.get('label') or '(no label)', c['serial']))
+        except OSError as e:
+            messagebox.showerror(APP, 'Could not choose it: %s' % e)
+        refresh()
+
+    ttk.Button(pick, text='Refresh', command=lambda: (list_drives(), refresh())).grid(row=0, column=1, padx=6)
+    ttk.Button(pick, text='Use this iPod', command=do_choose).grid(row=0, column=2)
 
     def do_install():
+        if not load_choice():
+            messagebox.showwarning(APP, 'Choose your iPod first (pick its drive and press "Use this iPod").')
+            return
         try:
             install()
             messagebox.showinfo(APP, 'Installed.  It runs in the background from now on and starts with Windows.\n\n'
@@ -271,24 +385,28 @@ def gui():
         refresh()
 
     def do_sync():
-        ipods = find_ipods()
-        if not ipods:
-            messagebox.showwarning(APP, 'No Rockbox iPod found.  Plug it in and wait for its drive letter.')
+        if not load_choice():
+            messagebox.showwarning(APP, 'Choose your iPod first (pick its drive and press "Use this iPod").')
             return
-        msgs = []
-        for r in ipods:
-            try:
-                write_record(r)
-                msgs.append('%s: time sent' % r)
-            except OSError as e:
-                msgs.append('%s: %s' % (r, e))
-        messagebox.showinfo(APP, '\n'.join(msgs) + '\n\nUnplug the iPod to set its clock.')
+        r = chosen_root()
+        if not r:
+            messagebox.showwarning(APP, 'Your chosen iPod is not connected.  Plug it in and wait for its drive letter.')
+            return
+        try:
+            write_record(r)
+            messagebox.showinfo(APP, '%s: time sent.\n\nUnplug the iPod to set its clock.' % r)
+        except OSError as e:
+            messagebox.showerror(APP, '%s: %s' % (r, e))
 
-    ttk.Button(frm, text='Start with Windows', command=do_install).grid(row=4, column=0, sticky='w')
-    ttk.Button(frm, text='Remove', command=do_remove).grid(row=4, column=1, sticky='w', padx=6)
-    ttk.Button(frm, text='Sync now', command=do_sync).grid(row=4, column=2, sticky='w')
+    ttk.Button(frm, text='Start with Windows', command=do_install).grid(row=5, column=0, sticky='w')
+    ttk.Button(frm, text='Remove', command=do_remove).grid(row=5, column=1, sticky='w', padx=6)
+    ttk.Button(frm, text='Sync now', command=do_sync).grid(row=5, column=2, sticky='w')
+    list_drives()
     refresh()
-    root.after(3000, lambda: (refresh(), root.after(3000, refresh)))
+    def tick():
+        refresh()
+        root.after(3000, tick)
+    root.after(3000, tick)
     root.mainloop()
 
 
@@ -296,9 +414,11 @@ def main(argv):
     if '--background' in argv:
         watch()
     elif '--sync-now' in argv:
-        for r in find_ipods():
-            write_record(r)
-            print('%s: time sent' % r)
+        r = chosen_root()
+        if not r:
+            sys.exit('the chosen iPod is not connected (or none chosen: run without arguments to choose it)')
+        write_record(r)
+        print('%s: time sent' % r)
     elif '--record' in argv:                               # for tests: print the record that would be sent
         sys.stdout.write(build_record(time.time(), computer_name(), machine_id()).rstrip(b'\0\n').decode() + '\n')
     else:

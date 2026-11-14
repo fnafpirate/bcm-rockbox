@@ -1107,6 +1107,19 @@ static const char *bcm_piezo_carrier_fmt(char *buf, size_t sz, int val, const ch
 #define bcm_piezo_carrier_fmt NULL
 #endif
 
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+/* bcm overlay v107: the USB speed settings take effect at the next connection, not the next start */
+static void bcm_usb_fast_changed(bool on)
+{
+    extern bool usb_storage_fast_writes;
+    usb_storage_fast_writes = on;
+}
+static void bcm_usb_ra_changed(bool on)
+{
+    extern bool usb_storage_readahead;
+    usb_storage_readahead = on;
+}
+#endif
 const struct settings_list settings[] = {
 /* system_status settings .resume.cfg */
     SYSTEM_STATUS_SOUND(F_NO_WRAP, volume, LANG_VOLUME, "volume", SOUND_VOLUME),
@@ -1379,7 +1392,8 @@ const struct settings_list settings[] = {
     OFFON_SETTING(0, bcm_dock_profile, LANG_DOCK_PROFILE, true, "dock line-out profile", NULL),
 #if !defined(SIMULATOR)
     BOOL_SETTING(0, bcm_usb_fast, LANG_USB_WRITE_SPEED, false, "usb write speed", "stock,fast",
-                 LANG_USB_WRITE_FAST, LANG_USB_WRITE_STOCK, NULL),     /* v87 */
+                 LANG_USB_WRITE_FAST, LANG_USB_WRITE_STOCK, bcm_usb_fast_changed),     /* v87; v107: applies at once */
+    OFFON_SETTING(0, bcm_usb_readahead, LANG_USB_READAHEAD, true, "usb read-ahead", bcm_usb_ra_changed),   /* v107 */
 #endif
     /* bcm overlay v77: the click speaker (apps/bcm_piezo.c) */
     CHOICE_SETTING(0, bcm_piezo_speaker, LANG_PIEZO_SPEAKER, 0, "click speaker", "off,no headphones,always",

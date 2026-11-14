@@ -283,6 +283,10 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     handle_usb_events(title);
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
     bcm_timesync_after_usb();      /* bcm overlay v105: the clock from the paired computer, if it sent the time */
+    {
+        extern void usb_storage_speed_save(void);
+        usb_storage_speed_save();  /* bcm overlay v107: /.rockbox/usb_speed.txt */
+    }
 #endif
 
 #if defined(USB_ENABLE_HID)

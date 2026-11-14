@@ -19152,3 +19152,20 @@
     ipodvideo: "Clock not set s is not this iPod's computer"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_USB_READAHEAD
+  desc: bcm overlay v107: USB read-ahead setting
+  user: core
+  <source>
+    *: none
+    ipodvideo: "USB Read-Ahead"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "USB Read-Ahead"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "USB Read-Ahead"
+  </voice>
+</phrase>

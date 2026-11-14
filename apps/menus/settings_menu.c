@@ -433,10 +433,11 @@ MENUITEM_SETTING(governor, &global_settings.governor, NULL);
 
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
 MENUITEM_SETTING(bcm_usb_fast_item, &global_settings.bcm_usb_fast, NULL);     /* v87 */
+MENUITEM_SETTING(bcm_usb_ra_item, &global_settings.bcm_usb_readahead, NULL);  /* v107 */
 #endif
 MAKE_MENU(usb_menu, ID2P(LANG_USB_MENU), 0, Icon_NOICON,
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
-            &bcm_usb_fast_item,
+            &bcm_usb_fast_item, &bcm_usb_ra_item,
 #endif
 #ifdef USB_ENABLE_HID
             &usb_hid,
