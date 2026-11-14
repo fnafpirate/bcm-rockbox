@@ -2960,6 +2960,10 @@ static volatile long bcm_wd_last;
 static volatile int  bcm_wd_on;
 static long bcm_last_sync;
 static long bcm_sync_every;      /* v45: while a video plays, fsync at most this often (ticks; 0 = old rules) */
+/* v108: during start-up the log reaches the disk at least every 0.25 s (it was every 10 s: a start that hung or was reset
+   left only its first two lines, the v107 logs 1 and 3).  On exFAT a flush takes a few ms; one over 50 ms switches it off. */
+static bool bcm_sync_startup;
+static uint32_t bcm_sync_n, bcm_sync_max_us;
 static int  bcm_trace_42;        /* v45: number of PDS 0x42 trace lines written */
 static volatile int bcm_wd_secs = BCM_WD_SECS;   /* v87: 15 s while the display is handed back */
 static void bcm_wd_tick(void)
@@ -2991,11 +2995,23 @@ static void bcm_logline(const char *s, int n)
        a space (VCFS traces, dumps, list items) are flushed at most twice a second; everything else is flushed at once. */
     /* v45: the v44 log shows one PDS 0x42 every ~33 ms; an fsync on this volume costs 0.1-0.6 s, so during playback
        the log is flushed only every log_sync seconds (lines are still written at once). */
-    if (bcm_sync_every ? (long)(current_tick - bcm_last_sync) >= bcm_sync_every
-                       : (t[0] != ' ' || (long)(current_tick - bcm_last_sync) >= HZ / 2))
     {
-        fsync(bcm_log_fd);             /* keep the log even if the VideoCore hangs and we must hard-reset */
-        bcm_last_sync = current_tick;
+        long every = bcm_sync_every;
+        if (bcm_sync_startup && every > HZ / 4) every = HZ / 4;                                       /* v108 */
+        if (every ? (long)(current_tick - bcm_last_sync) >= every
+                  : (t[0] != ' ' || (long)(current_tick - bcm_last_sync) >= HZ / 2))
+        {
+            unsigned long t0 = USEC_TIMER;
+            fsync(bcm_log_fd);             /* keep the log even if the VideoCore hangs and we must hard-reset */
+            bcm_last_sync = current_tick;
+            if (bcm_sync_startup)
+            {
+                uint32_t us = (uint32_t)(USEC_TIMER - t0);
+                bcm_sync_n++;
+                if (us > bcm_sync_max_us) bcm_sync_max_us = us;
+                if (us > 50000) bcm_sync_startup = false;                                             /* a slow volume */
+            }
+        }
     }
     bcm_wd_last = current_tick;
     memcpy(bcm_last_line, t, sizeof bcm_last_line - 1); bcm_last_line[sizeof bcm_last_line - 1] = 0;
@@ -3242,6 +3258,7 @@ static uint32_t ra_size;
 static m4off_t ra_lo, ra_hi;          /* file bytes [ra_lo, ra_hi) are in the ring at offset % ra_size */
 static m4off_t ra_fsize;
 static m4off_t ra_pos[2];             /* last data offsets read: video, audio */
+static long ra_pos_t[2];              /* v108: when each was read */
 static int ra_stream;                 /* which of the two the next m4_rdd is for */
 static bool ra_filling, ra_slept;
 static uint32_t ra_bursts, ra_misses, ra_read_kb;
@@ -3300,7 +3317,7 @@ static bool ra_get(m4off_t off, void *buf, uint32_t n)
         if (!ra_restart(off, n)) return false;
         if (!(off >= ra_lo && off + n <= ra_hi)) return false;
     }
-    ra_pos[ra_stream & 1] = off;
+    ra_pos[ra_stream & 1] = off; ra_pos_t[ra_stream & 1] = current_tick;
     while (n)
     {
         uint32_t p = (uint32_t)(off % ra_size), c = ra_size - p;
@@ -3318,7 +3335,13 @@ static void ra_tick(void)
     if (!ra_buf || m4.fd < 0 || ra_hi >= ra_fsize) return;
     keep = ra_hi; lead = ra_lo;
     for (k = 0; k < 2; k++)                                                   /* only positions inside the ring count */
-        if (ra_pos[k] >= ra_lo && ra_pos[k] < ra_hi)
+        if (ra_pos[k] >= ra_lo && ra_pos[k] < ra_hi
+            /* v108: and only a stream that is still being read (or both, when neither is: paused).  During FF the sound is
+               not read; its old place held the ring, the ring filled with what was behind, and in the v107 logs the
+               picture's read-ahead fell to 127 KB with thousands of empty refill rounds.  A video-only file's unused
+               sound position (0) held a ring that started at 0 the same way. */
+            && (current_tick - ra_pos_t[k] < 3 * HZ
+                || (current_tick - ra_pos_t[0] >= 3 * HZ && current_tick - ra_pos_t[1] >= 3 * HZ)))
         {
             inside++;
             if (ra_pos[k] < keep) keep = ra_pos[k];                           /* the stream that is furthest behind */
@@ -3328,9 +3351,10 @@ static void ra_tick(void)
     keep = keep > ra_lo + ra_keep_back ? keep - ra_keep_back : ra_lo;         /* keep 128 KB (v96: adaptive) behind it */
     ra_lo = keep;
     ahead = (uint32_t)(ra_hi - lead);
-    if (!ra_filling && ahead < (ra_refill_at ? ra_refill_at : ra_size / ra_refill_div)) { ra_filling = true; ra_slept = false; ra_bursts++; }
-    if (!ra_filling) return;
     room = ra_size - (uint32_t)(ra_hi - ra_lo);
+    if (!ra_filling && ahead < (ra_refill_at ? ra_refill_at : ra_size / ra_refill_div) && room >= 65536)   /* v108: room */
+    { ra_filling = true; ra_slept = false; ra_bursts++; }
+    if (!ra_filling) return;
     n = room < 65536 ? room : 65536;
     if (ra_hi + n > ra_fsize) n = (uint32_t)(ra_fsize - ra_hi);
     if (n < 4096 || !ra_read_at(ra_hi, n) || ra_hi >= ra_fsize || room - n < 65536)
@@ -3678,7 +3702,7 @@ static int mp4_open(const char *path)
                 else mlen = 0;
             }
             if (ring >= 65536) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ring & ~65535u; }
-            ra_lo = ra_hi = 0; ra_pos[0] = ra_pos[1] = 0; ra_filling = false; ra_bursts = ra_misses = ra_read_kb = 0;
+            ra_lo = ra_hi = 0; ra_pos[0] = ra_pos[1] = 0; ra_pos_t[0] = ra_pos_t[1] = 0; ra_filling = false; ra_bursts = ra_misses = ra_read_kb = 0;
             BLOG("read-ahead: %s profile, moov %u KB in RAM (%ld ms), ring %u KB%s -- %s, %u kbit/s, refill at 1/%d%s", mp->name,
                  mv_buf ? mlen / 1024 : 0,
                  (current_tick - t0) * 1000 / HZ, ra_size / 1024, ata_disk_isssd() ? " (solid-state drive)" : "",
@@ -3780,6 +3804,97 @@ static int m4_next(uint32_t *ts_ms, bool *key)
     }
     *key = idr;
     return o ? (int)o : -1;
+}
+
+
+/* ---- v108: how the video was encoded, for the log: reference frames from the SPS, and x264's own settings text (x264
+   writes it into the first frame).  Only read and logged. */
+struct sps_bits { const uint8_t *b; uint32_t n, pos; bool bad; };
+static uint32_t sps_u(struct sps_bits *r, int k)
+{
+    uint32_t v = 0;
+    while (k--)
+    {
+        if (r->pos >= r->n * 8) { r->bad = true; return 0; }
+        v = (v << 1) | ((r->b[r->pos >> 3] >> (7 - (r->pos & 7))) & 1); r->pos++;
+    }
+    return v;
+}
+static uint32_t sps_ue(struct sps_bits *r)
+{
+    int z = 0;
+    while (!sps_u(r, 1)) { if (r->bad || ++z > 31) { r->bad = true; return 0; } }
+    return z ? ((1u << z) - 1) + sps_u(r, z) : 0;
+}
+static int m4_sps_refs(void)
+{
+    uint8_t raw[96]; uint32_t i, n = 0, z = 0, j;
+    struct sps_bits r;
+    for (i = 0; i + 3 < m4.ps_len; i++)
+        if (m4.ps[i] == 0 && m4.ps[i + 1] == 0 && m4.ps[i + 2] == 1 && (m4.ps[i + 3] & 0x1f) == 7) break;
+    if (i + 3 >= m4.ps_len) return -1;
+    for (i += 4; i < m4.ps_len && n < sizeof raw; i++)
+    {   /* drop the emulation-prevention bytes (00 00 03), stop at the next start code */
+        if (z >= 2 && m4.ps[i] == 3) { z = 0; continue; }
+        if (z >= 2 && m4.ps[i] <= 1) break;
+        raw[n++] = m4.ps[i]; z = m4.ps[i] ? 0 : z + 1;
+    }
+    r.b = raw; r.n = n; r.pos = 0; r.bad = false;
+    j = sps_u(&r, 8); sps_u(&r, 16); sps_ue(&r);                          /* profile, flags + level, sps id */
+    if (j == 100 || j == 110 || j == 122 || j == 244 || j == 44 || j == 83 || j == 86 || j == 118 || j == 128)
+    {
+        if (sps_ue(&r) == 3) sps_u(&r, 1);
+        sps_ue(&r); sps_ue(&r); sps_u(&r, 1);
+        if (sps_u(&r, 1)) return -1;                                          /* scaling lists: not followed here */
+    }
+    sps_ue(&r);                                                               /* log2_max_frame_num - 4 */
+    j = sps_ue(&r);                                                           /* pic_order_cnt_type */
+    if (j == 0) sps_ue(&r);
+    else if (j == 1)
+    {
+        uint32_t c;
+        sps_u(&r, 1); sps_ue(&r); sps_ue(&r); c = sps_ue(&r);
+        while (c-- && !r.bad) sps_ue(&r);
+    }
+    j = sps_ue(&r);                                                           /* max_num_ref_frames */
+    return r.bad ? -1 : (int)j;
+}
+static void m4_log_encoder(void)
+{
+    static char b[3072];
+    static const char * const keys[] = { "cabac", "ref", "bframes", "weightp", "8x8dct", "keyint", "rc", "crf",
+                                         "vbv_maxrate", "vbv_bufsize", "slices", NULL };
+    char out[150]; int refs = m4_sps_refs(), o, k;
+    uint32_t size, n, i;
+    const char *p = NULL, *opt;
+    BLOG("encoding: %d reference frame(s) in the SPS%s", refs,
+         refs > 1 ? " (Apple's 640x480 'low-complexity' Baseline: HandBrake's old iPod preset used 1)" : "");
+    if (m4.fd < 0 || !m4.stsz_n || !m4.stco_n) return;
+    size = m4.stsz_fixed ? m4.stsz_fixed : m4_u32(m4.stsz);
+    n = size < sizeof b - 1 ? size : sizeof b - 1;
+    if (!n || !m4_rd(m4_chunk_off(m4.stco, m4.co64, 1), b, n)) return;
+    b[n] = 0;
+    for (i = 0; i + 11 < n; i++) if (!memcmp(b + i, "x264 - core", 11)) { p = b + i; break; }
+    if (!p) { BLOG("encoding: no x264 settings text in the first frame"); return; }
+    o = snprintf(out, sizeof out, "encoding: x264 core %d:", atoi(p + 12));
+    opt = strstr(p, "options:");
+    for (k = 0; opt && keys[k] && o < (int)sizeof out - 24; k++)
+    {   /* " key=value" pairs */
+        const char *q = opt;
+        size_t kl = strlen(keys[k]);
+        while ((q = strstr(q, keys[k])) != NULL)
+        {
+            if (q[-1] == ' ' && q[kl] == '=')
+            {
+                int l = 0;
+                while (q[kl + 1 + l] && q[kl + 1 + l] != ' ' && l < 12) l++;
+                o += snprintf(out + o, sizeof out - o, " %s=%.*s", keys[k], l, q + kl + 1);
+                break;
+            }
+            q += kl;
+        }
+    }
+    BLOG("%s", out);
 }
 
 
@@ -4276,9 +4391,41 @@ static uint32_t tf_cur, tf_jump = 2000;
 static uint32_t tf_next_key(void);
 static bool v_stop, v_live;
 static long v_eos_tick;
+/* v108: the VideoCore's last requests, kept in RAM and written to the log when it stops (the v107 logs 2 and 4 stopped
+   after a fast-forward at the same place, with nothing to say what it was given last) */
+static long pds_act_tick;                /* its last frame request or seek */
+#define PEV_N 24
+static struct { long t; char k; uint32_t a, b, c; } pev[PEV_N];
+static unsigned pev_n;
+static void pev_add(char k, uint32_t a, uint32_t b, uint32_t c)
+{
+    unsigned i = pev_n++ % PEV_N;
+    pev[i].t = current_tick; pev[i].k = k; pev[i].a = a; pev[i].b = b; pev[i].c = c;
+    pds_act_tick = current_tick;
+}
+static void pev_dump(const char *why)
+{
+    unsigned i, n = pev_n < PEV_N ? pev_n : PEV_N;
+    BLOG("  the last %u answers to the VideoCore before %s (ms before now):", n, why);
+    for (i = pev_n - n; i != pev_n; i++)
+    {
+        unsigned j = i % PEV_N;
+        long ago = (current_tick - pev[j].t) * 1000 / HZ;
+        switch (pev[j].k)
+        {
+        case 'V': BLOG("    -%ld video sample %u (%u ms), %u B%s", ago, (unsigned)pev[j].a, (unsigned)pev[j].b,
+                       (unsigned)(pev[j].c & 0x7fffffffu), pev[j].c >> 31 ? ", key frame" : ""); break;
+        case 'A': BLOG("    -%ld sound %u ms, %u B", ago, (unsigned)pev[j].a, (unsigned)pev[j].b); break;
+        case 'S': BLOG("    -%ld seek to %u ms -> key frame sample %u (%u ms)", ago, (unsigned)pev[j].a, (unsigned)pev[j].b,
+                       (unsigned)pev[j].c); break;
+        default:  BLOG("    -%ld nothing sent (end, or not video: want %d)", ago, (int)pev[j].a); break;
+        }
+    }
+}
 static void v_start(int id, uint32_t w1)
 {
     BLOG("  PDS start: object=%d w1=%08x", id, (unsigned)w1);
+    pds_act_tick = current_tick; pev_n = 0;            /* v108 */
     m4_rewind();
     if (ma.ok) ma_rewind();
     a_frames = a_bytes = 0;
@@ -4305,14 +4452,14 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
             if (n <= 0)
             {
                 if (!a_eos) BLOG("  audio: end of the AAC track after %d frames", a_frames);
-                a_eos++; bcm_pds_send_empty();
+                a_eos++; bcm_pds_send_empty(); pev_add('E', (uint32_t)want, 0, 0);
                 return;
             }
             memset(&f, 0, sizeof f);
             f.stream_id = 1; f.f2 = 1; f.f4 = ts;      /* stock: audio f2 = 1, f4 = time */
             f.length = (uint32_t)n; f.data = ma_buf;
             r = bcm_pds_send_frame(&f);
-            a_frames++; a_bytes += n; a_last_ts = ts;
+            a_frames++; a_bytes += n; a_last_ts = ts; pev_add('A', ts, (uint32_t)n, 0);
             if (a_frames <= 6 || a_frames % 2000 == 0 || r < 0)
                 BLOG("  aac #%d len=%d ts=%ums send=%d (want=%d)", a_frames, n, (unsigned)ts, r, want);
             return;
@@ -4320,7 +4467,7 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     }
     if (want != -1 && want != 0)                        /* not the video stream (assumed 0 or "any") */
     {
-        v_empty++; bcm_pds_send_empty();
+        v_empty++; bcm_pds_send_empty(); pev_add('E', (uint32_t)want, 0, 0);
         if (v_empty <= 4) BLOG("  -> not video (want=%d): sent empty", want);
         return;
     }
@@ -4334,7 +4481,7 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     if (n <= 0)
     {
         if (!v_eos) { BLOG("  end of stream after %d frames (%d bytes)", v_frames, v_bytes); v_eos_tick = current_tick; }
-        v_eos++; bcm_pds_send_empty();
+        v_eos++; bcm_pds_send_empty(); pev_add('E', (uint32_t)want, 0, 0);
         return;
     }
     memset(&f, 0, sizeof f);
@@ -4345,6 +4492,9 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     f.length = (uint32_t)n; f.data = m4_out;
     r = bcm_pds_send_frame(&f);
     v_frames++; v_bytes += n; v_last_vts = ts;
+    pev_add('V', m4.idx - 1, ts, (uint32_t)n | (key ? 0x80000000u : 0));                   /* v108 */
+    if (tf_dir)                                                                            /* v108: every fast-forward frame */
+        BLOG("  ff frame: sample %u (%u ms), %d B%s, send=%d", (unsigned)(m4.idx - 1), (unsigned)ts, n, key ? ", key" : "", r);
     if (v_frames <= 12 || v_frames % (cfg_quiet ? 900 : 30) == 0 || r < 0)
         BLOG("  frame #%d sample=%u len=%d key=%d ts=%ums send=%d", v_frames, (unsigned)m4.idx, n, key, (unsigned)ts, r);
 }
@@ -4354,9 +4504,10 @@ static void v_seek(int id, uint32_t pos)
 {
     uint32_t k, kms;
     v_seeks++;
-    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; v_seek_kms = 0; v_seek_n++; BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
+    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; v_seek_kms = 0; v_seek_n++; pev_add('S', 0, 0, 0); BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
     k = m4_key_at(pos, &kms);                          /* v42: pos = milliseconds (it is the mp_seek argument) */
     v_seek_kms = kms; v_seek_n++;
+    pev_add('S', pos, k, kms);                         /* v108 */
     m4_seek_sample(k);
     if (ma.ok) { ma_seek_ms(kms); a_eos = 0; }         /* v53: the sound restarts at the key frame too */
     BLOG("  PDS seek: stream=%d pos=%u ms -> key frame sample %u at %u ms (chunk %u +%u)", id, (unsigned)pos, (unsigned)k, (unsigned)kms,
@@ -4495,7 +4646,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v107 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v108 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6289,7 +6440,14 @@ static void scrub_end(void)
         long t;
         tf_dir = 0;
         if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu && dt) sc_pos = dt;
-        pl_cmd("mp_play", true); pl_paused = false;
+        if (pl_cmd("mp_play", true) < 0 && current_tick - pds_act_tick > 3 * HZ)
+        {   /* v108: no answer, and nothing asked for since the FF: it has stopped -- the playback loop reboots it at once */
+            BLOG("  scrub: released at %u ms, but the VideoCore has asked for nothing for %ld ms -- it has stopped",
+                 (unsigned)sc_pos, (current_tick - pds_act_tick) * 1000 / HZ);
+            pl_paused = false; pl_el_ms = sc_pos; pl_target_ms = sc_pos; vr_el_tick = current_tick;
+            return;
+        }
+        pl_paused = false;
         /* v78: mp_play makes the VC seek by itself (to the key frame it reached); v47-v77 then seeked again to the frame on
            screen -- a second flush + refill (~1 s more before the picture moved; v76 log: 4.8 s from release to motion).
            Now the VC's own position is kept when it has one. */
@@ -6877,6 +7035,7 @@ static void rc_arm(const char *why)
              (unsigned)rc_pos);
     }
     else BLOG("  %s -- no recovery (%s)", why, qz_on ? "movie quiz" : !bcm_player_mode ? "test mode" : "attempts used up");
+    if (bcm_log_fd >= 0) { fsync(bcm_log_fd); bcm_last_sync = current_tick; }   /* v108: on the disk before the reboot */
 }
 
 /* ---- v96: continuing at a point (resume point or recovery): like the quiz -- covered and muted until the picture moves,
@@ -7054,6 +7213,7 @@ static void bcm_video_run(int secs)
         if (pl_fail_run >= 4)
         {   /* v96: four player commands in a row without an answer: the VideoCore has stalled */
             BLOG("  STALL: %d player commands in a row unanswered", pl_fail_run);
+            pev_dump("the stall");
             rc_arm("commands unanswered");
             break;
         }
@@ -7256,14 +7416,38 @@ static void bcm_video_run(int secs)
                seconds (it asks ~70 times a second while it plays): it has stopped.  Leave like MENU does -- the display goes
                back to Rockbox -- instead of a frozen or white screen until a reboot. */
             BLOG("  HANG: no frame request for %d s while playing -- stopping the video", cfg_hang_s);
+            pev_dump("the hang");
             rc_arm("no frame requests");               /* v96: reboot the VideoCore and continue, else back to Rockbox */
+            if (!rc_want) st_toast("VideoCore stopped");
+            break;
+        }
+        if (sc_active && (sc_method == SM_FF || sc_method == SM_FFK) && !v_eos && current_tick - sc_t0 > HZ
+            && current_tick - pds_act_tick > 3 * HZ)
+        {   /* v108: while it fast-forwards the VideoCore asks for a key frame or seeks several times a second.  Silent for
+               3 s = it has stopped (v107 logs 2 and 4: after 24 s of FF; v107 only noticed 12 s after the button came up,
+               by then the screen had been frozen for half a minute).  Reboot it and continue where the picture was. */
+            BLOG("  HANG while %s: no frame request or seek for %ld ms", sc_dir > 0 ? "fast-forwarding" : "rewinding",
+                 (current_tick - pds_act_tick) * 1000 / HZ);
+            pev_dump("it stopped");
+            rc_arm("stopped during fast-forward / rewind");
+            sc_active = false; tf_dir = 0;
+            if (!rc_want) st_toast("VideoCore stopped");
+            break;
+        }
+        if (!sc_active && !pl_paused && !v_eos && pl_fail_run > 0 && current_tick - run_t0 > 20 * HZ
+            && current_tick - pds_act_tick > 4 * HZ)
+        {   /* v108: a player command went unanswered and no frame request for 4 s while playing: stopped (v107 waited for
+               four unanswered commands, 12 s or more) */
+            BLOG("  HANG: a player command went unanswered and no frame request for %ld ms", (current_tick - pds_act_tick) * 1000 / HZ);
+            pev_dump("the hang");
+            rc_arm("no answer and no frame requests");
             if (!rc_want) st_toast("VideoCore stopped");
             break;
         }
     }
     bcm_video_running = false;                         /* v63 */
     sc_remote = false;
-    bcm_sync_every = 0;
+    bcm_sync_every = 0; bcm_sync_startup = false;      /* v108 */
     if (!rc_want && !v_fallback) rbm_save(bcm_video_finished);   /* v96 */
     if (rs_vol >= 0) { av_set_vol(rs_vol); rs_vol = -1; }
     rs_state = 0;
@@ -7784,6 +7968,7 @@ static void bcm_playback_probe(void)
                 if (m4.width * m4.height > 640 * 480 || fps10 > 305 || m4.level > 30)
                     BLOG("WARNING: over 640x480 / 30 fps / level 3.0 -- the VideoCore may refuse it or drop frames");
             }
+            m4_log_encoder();                           /* v108 */
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
             if (pre == -100) st_begin(video);           /* v73: subtitles (v78: done by the helper when it ran) */
             {   /* v45: the overlay shows the file name without folder and extension */
@@ -7793,7 +7978,10 @@ static void bcm_playback_probe(void)
             }
             if (cfg_quiet && cfg_log_sync > 0)
             {
-                BLOG("log: from here on flushed every %d s (quiet=1); PDS 0x42 traces after the first 24 are not written", cfg_log_sync);
+                BLOG("log: from here on flushed every %d s (quiet=1); PDS 0x42 traces after the first 24 are not written; "
+                     "start-up: %u flushes, slowest %u ms%s", cfg_log_sync, (unsigned)bcm_sync_n, (unsigned)(bcm_sync_max_us / 1000),
+                     bcm_sync_startup ? "" : " (too slow: stopped)");
+                bcm_sync_startup = false;                /* v108 */
                 bcm_sync_every = cfg_log_sync * HZ;      /* v45: frames start flowing at mp_selectplay (pre-buffer) */
             }
             bcm_pds_map_stream(0, cfg_map);                 /* type 1 (video) -> buffer A (cap 0x10000, stock); audio would be B */
@@ -8429,7 +8617,8 @@ static bool bcm_run(const char *play_path)
     if ((bcm_standby || warm) && bcm_log_fd >= 0)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
-    BLOG("bcm host test v107, built %s %s", __DATE__, __TIME__);
+    bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
+    BLOG("bcm host test v108, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
