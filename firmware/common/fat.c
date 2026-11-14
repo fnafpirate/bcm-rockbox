@@ -391,6 +391,36 @@ static void * cache_sector(struct bpb *fat_bpb, sector_t secnum)
     return buf;
 }
 
+#if !defined(BOOTLOADER)
+/* bcm overlay v113: an exFAT directory sector through the disk cache.  A miss reads it together with the following
+   sectors of the same cluster (up to 16) in ONE command and keeps them all in the cache; sectors already cached (maybe
+   with newer, dirty contents) are left alone.  Up to v112 every directory scan read the directory again, one direct,
+   uncached sector per command: ~28 reads to create a file in a 100-file folder, ~60 to rename one.  The caller holds
+   the cache lock; 'left' = sectors from secnum to the end of its cluster. */
+#define EXFAT_DIR_PREFETCH 16
+static uint8_t exfat_pf_buf[EXFAT_DIR_PREFETCH * DC_CACHE_BUFSIZE] STORAGE_ALIGN_ATTR;
+static void * exfat_dir_sector(struct bpb *fat_bpb, sector_t secnum, unsigned long left)
+{
+    unsigned int ss = LOG_SECTOR_SIZE(fat_bpb), flags;
+    if (left == 0 || left > fat_bpb->bpb_secperclus)
+        left = 1;                                        /* position unknown: this sector only */
+    unsigned long n = MIN(left, (unsigned long)(sizeof exfat_pf_buf / ss));
+    if (n > 1 && !dc_find_sector(IF_MV(fat_bpb->volume,) secnum) &&
+        storage_read_sectors(IF_MD(fat_bpb->drive,) secnum + fat_bpb->startsector, n, exfat_pf_buf) >= 0)
+    {
+        for (unsigned long i = n; i-- > 0; )             /* the wanted sector last: it ends up most recent */
+        {
+            if (dc_find_sector(IF_MV(fat_bpb->volume,) secnum + i))
+                continue;
+            void *d = dc_cache_probe(IF_MV(fat_bpb->volume,) secnum + i, &flags);
+            if (!flags)
+                memcpy(d, exfat_pf_buf + i * ss, ss);
+        }
+    }
+    return cache_sector(fat_bpb, secnum);
+}
+#endif
+
 /* returns a raw buffer for a sector; buffer counts as INUSE but filesystem
  * contents are NOT loaded before returning - use when completely overwriting
  * a sector's contents in order to avoid a fill */
@@ -1431,7 +1461,13 @@ static union raw_dirent * cache_direntry(struct bpb *fat_bpb,
         }
     }
 
+#ifndef BOOTLOADER
+    union raw_dirent *ent = fat_bpb->is_exfat ?                       /* bcm overlay v113 */
+        exfat_dir_sector(fat_bpb, filestr->lastsector, fat_bpb->bpb_secperclus - filestr->sectornum) :
+        cache_sector(fat_bpb, filestr->lastsector);
+#else
     union raw_dirent *ent = cache_sector(fat_bpb, filestr->lastsector);
+#endif
 
     if (ent)
         ent += entry % DIR_ENTRIES_PER_SECTOR;
@@ -2887,6 +2923,26 @@ static int exfat_readdir(struct bpb *fat_bpb, struct fat_filestr *dirstr,
         unsigned long sector = direntry / DIR_ENTRIES_PER_SECTOR;
         if (cachep->sector != sector)
         {
+#ifndef BOOTLOADER
+            /* bcm overlay v113: through the disk cache, a cluster's sectors per read (exfat_dir_sector) */
+            if (fat_query_sectornum(dirstr) != sector + 1)
+            {
+                int rc2 = fat_seek(dirstr, sector + 1);
+                if (rc2 < 0)
+                {
+                    if (rc2 == FAT_SEEK_EOF)
+                        break;
+                    FAT_ERROR(rc2 * 10 - 2);
+                }
+            }
+            dc_lock_cache();
+            void *sb = exfat_dir_sector(fat_bpb, dirstr->lastsector, fat_bpb->bpb_secperclus - dirstr->sectornum);
+            if (sb)
+                memcpy(cachep->buffer, sb, LOG_SECTOR_SIZE(fat_bpb));
+            dc_unlock_cache();
+            if (!sb)
+                FAT_ERROR(-13);
+#else
             if (cachep->sector + 1 != sector)
             {
                 int rc2 = fat_seek(dirstr, sector);
@@ -2905,6 +2961,7 @@ static int exfat_readdir(struct bpb *fat_bpb, struct fat_filestr *dirstr,
                     break; /* eof */
                 FAT_ERROR(rc2 * 10 - 3);
             }
+#endif
             cachep->sector = sector;
         }
 

@@ -99,6 +99,12 @@
 #if MEMORYSIZE < 8
 #define DC_NUM_ENTRIES      32
 #define DC_MAP_NUM_ENTRIES  128
+#elif MEMORYSIZE >= 32 && !defined(BOOTLOADER)
+/* bcm overlay v113: 256 sectors (128 KB) on the 32 / 64 MB iPods: a directory of a few hundred entries, the parent
+   directories, the FAT and bitmap sectors in use and the open files' buffers all fit at once (64 = 32 KB did not: every
+   create / rename / delete in a 100-file folder re-read the folder).  The boot loader keeps 64. */
+#define DC_NUM_ENTRIES      256
+#define DC_MAP_NUM_ENTRIES  1024
 #else
 #define DC_NUM_ENTRIES      64
 #define DC_MAP_NUM_ENTRIES  256

@@ -3153,6 +3153,12 @@ static uint32_t m4_raw_max = M4_RAW_STATIC, m4_out_max = M4_OUT_STATIC;
 static int m4_big_h = -1;
 static int cfg_big_frames = 1;
 static int cfg_recover = 2;                       /* v96: VideoCore recovery attempts per video */
+/* v109: seeks the VideoCore made since it was booted.  v107 log 2, v107 log 4 and v108 log 2 all died at its 125th-126th
+   seek (PDS 0x43; a long FF makes ~5 a second), and in v108 log 2 it played at a third of the speed from the 124th on.
+   From cfg seek_budget on, FF / REW stop showing pictures (the time still moves) and on release the VideoCore is booted
+   again and the video continues there (about as long as starting a video) -- instead of dying. */
+static int vc_seeks_boot;
+static int cfg_seek_budget = 110;                 /* v110: 90 -> 110 (deaths at 125-126) */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
 static bool bcm_warm_run;                         /* v100: this run started on a VideoCore that was kept ready */
 static bool warm_play_logged;                     /* v102: "the picture moves after N s" written for this warm start */
@@ -3681,27 +3687,37 @@ static int mp4_open(const char *path)
             ra_refill_div = div[ra_mode];
             ra_sleep_on = ra_mode != 2;
         }
-        want = mlen + ring;
+        /* v111: + room to start the moov copy on a 512-byte boundary of the file and to put both parts on 32-byte
+           boundaries in RAM: the PP ATA driver reads by DMA only into 16-byte aligned buffers (ata_dma_setup), else
+           by PIO with the CPU busy all along.  Rockbox's allocator gives 4-byte alignment: up to v110 the moov and the
+           ring were read by PIO (the "card 4225 KB/s" in the logs; the 9.4 MB moov of a 3-hour video took 2.2 s). */
+        want = mlen + ring + (mlen ? 512 : 0) + 64;
         /* v79: ask for the ring + the reserve, then give the reserve back: whatever comes next (subtitles, fonts) still
            finds that much free, however full memory was.  Smaller rings when even that does not fit. */
         while (want && (ra_handle = core_alloc_ex(want + reserve, NULL)) <= 0 && ring > (1u << 20))
         {   /* not that much free memory: a smaller ring */
-            ring = (ring / 2) & ~65535u; want = mlen + ring;
+            ring = (ring / 2) & ~65535u; want = mlen + ring + (mlen ? 512 : 0) + 64;
         }
         if (want && ra_handle <= 0) ra_handle = core_alloc_ex(want, NULL);   /* no room for the reserve: the ring anyway */
         else if (want && ra_handle > 0) core_shrink(ra_handle, core_get_data(ra_handle), want);
         if (want && ra_handle > 0)
         {
             uint8_t *p;
+            uint32_t lead = 0;
             core_pin(ra_handle);
-            p = core_get_data(ra_handle);
+            p = (uint8_t *)(((uintptr_t)core_get_data(ra_handle) + 31) & ~(uintptr_t)31);   /* v111: DMA alignment */
             if (mlen)
-            {
+            {   /* v111: from the start of the file sector the moov starts in, so whole sectors land on aligned addresses */
                 mv_s = moov_s - 8; mv_e = mv_s + mlen;
-                if (m4_seek(m4.fd, mv_s) && read(m4.fd, p, mlen) == (ssize_t)mlen) mv_buf = p;
-                else mlen = 0;
+                lead = (uint32_t)(mv_s & 511);
+                if (m4_seek(m4.fd, mv_s - lead) && read(m4.fd, p, lead + mlen) == (ssize_t)(lead + mlen)) mv_buf = p + lead;
+                else { mlen = 0; lead = 0; }
             }
-            if (ring >= 65536) { ra_buf = p + ((mlen + 31) & ~31u); ra_size = ring & ~65535u; }
+            if (ring >= 65536)
+            {
+                ra_buf = (uint8_t *)(((uintptr_t)(p + lead + mlen) + 31) & ~(uintptr_t)31);
+                ra_size = ring & ~65535u;
+            }
             ra_lo = ra_hi = 0; ra_pos[0] = ra_pos[1] = 0; ra_pos_t[0] = ra_pos_t[1] = 0; ra_filling = false; ra_bursts = ra_misses = ra_read_kb = 0;
             BLOG("read-ahead: %s profile, moov %u KB in RAM (%ld ms), ring %u KB%s -- %s, %u kbit/s, refill at 1/%d%s", mp->name,
                  mv_buf ? mlen / 1024 : 0,
@@ -4247,7 +4263,8 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "big_frames")) cfg_big_frames = v;   /* v96 */
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
         else if (!strcmp(p, "keep_min")) cfg_keep_min = v < 1 ? 1 : v;
-        else if (!strcmp(p, "recover"))  cfg_recover = v;        /* v96: VideoCore reboots per video (0 = off) */
+        else if (!strcmp(p, "recover"))  cfg_recover = v;
+        else if (!strcmp(p, "seek_budget")) cfg_seek_budget = v;      /* v109: 0 = no limit */        /* v96: VideoCore reboots per video (0 = off) */
         else if (!strcmp(p, "moov_kb"))  cfg_moov_kb = v;
         else if (!strcmp(p, "ra_sleep")) cfg_ra_sleep = v;
         else if (!strcmp(p, "ra_mode"))  cfg_ra_mode = v;
@@ -4504,9 +4521,9 @@ static void v_seek(int id, uint32_t pos)
 {
     uint32_t k, kms;
     v_seeks++;
-    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; v_seek_kms = 0; v_seek_n++; pev_add('S', 0, 0, 0); BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
+    if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; v_seek_kms = 0; v_seek_n++; vc_seeks_boot++; pev_add('S', 0, 0, 0); BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
     k = m4_key_at(pos, &kms);                          /* v42: pos = milliseconds (it is the mp_seek argument) */
-    v_seek_kms = kms; v_seek_n++;
+    v_seek_kms = kms; v_seek_n++; vc_seeks_boot++;    /* v109 */
     pev_add('S', pos, k, kms);                         /* v108 */
     m4_seek_sample(k);
     if (ma.ok) { ma_seek_ms(kms); a_eos = 0; }         /* v53: the sound restarts at the key frame too */
@@ -4646,7 +4663,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v108 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v113 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4959,8 +4976,8 @@ static int av_vol_pct;                 /* v51: volume 0..100 % (audio section be
 static long av_vol_until, av_vol_drawn;
 static bool av_vol_dirty;
 /* scrubber */
-enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5 };
-static const char * const sm_name[6] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step" };
+enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5, SM_MARK = 6 };
+static const char * const sm_name[7] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step", "time only (seek budget)" };
 static int sc_btn, sc_dir, sc_ticks, sc_method, sc_rate;
 static bool sc_remote;                   /* v63: FF/REW started by a dock / remote (StartFF ... EndFFRew) */
 static int sm_ff = SM_FFK, sm_rew = SM_FFK;      /* v47: the v46 probe: ff+keys 454 pictures / +21.5 s, rew+keys 452 / -22.2 s in 2.4 s */
@@ -6350,6 +6367,8 @@ static void av_tick(void)
 }
 
 /* ---- scrubbing */
+static void rc_plan(uint32_t pos);                     /* v109 */
+static bool seek_budget_out(int extra);
 static uint32_t sc_speed_jump(long held)
 {   /* ms of video per second of holding: 4x, 10x, 30x, 90x */
     return held < 2 * HZ ? 4000 : held < 5 * HZ ? 10000 : held < 9 * HZ ? 30000 : 90000;
@@ -6363,7 +6382,16 @@ static void scrub_begin(int dir)
     sc_was_playing = !pl_paused;
     sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : (dir > 0 ? sm_ff : sm_rew);
     if (sc_method == SM_STEP && dir < 0) sc_method = SM_JUMP;
-    BLOG("  scrub: %s held at %u ms, method %s", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, sm_name[sc_method]);
+    if (seek_budget_out(0)) sc_method = SM_MARK;       /* v109 */
+    BLOG("  scrub: %s held at %u ms, method %s (%d seeks since boot)", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, sm_name[sc_method],
+         vc_seeks_boot);
+    if (sc_method == SM_MARK)
+    {   /* v109: the picture stays (paused); only the time moves; the release boots the VideoCore again there */
+        if (sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
+        av_hold();
+        osd_show_for(0);
+        return;
+    }
     av_hold();
     if (sc_method == SM_FF || sc_method == SM_FFK)
     {
@@ -6395,6 +6423,14 @@ static void scrub_tick(void)
     {
     case SM_FF: case SM_FFK:
         sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
+        if (seek_budget_out(0))
+        {   /* v109: out of seeks: stop the VideoCore's FF (pause it), keep moving the time only */
+            BLOG("  scrub: %d seeks since boot (budget %d) -- the picture stops, the time keeps moving", vc_seeks_boot, cfg_seek_budget);
+            tf_dir = 0;
+            pl_cmd("mp_pause", true); pl_paused = true;
+            sc_method = SM_MARK;
+            break;
+        }
         tf_jump = sc_speed_jump(held) / 8;                  /* key frames fed per second of video shown: ~8 */
         if (cfg_ff_accel)
         {   /* v47: faster the longer the button is held: rate x1 (~9x, v46 probe), x2 after 3 s, x4 after 7 s */
@@ -6407,6 +6443,11 @@ static void scrub_tick(void)
             }
         }
         if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
+        break;
+    case SM_MARK:                                       /* v109 */
+        sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
+        sc_jump = sc_speed_jump(held) * (unsigned)cfg_scrub_tick / 1000;
+        sc_pos = pl_key_step(sc_pos, sc_dir, sc_jump); pl_target_ms = sc_pos;
         break;
     case SM_STEP:
         sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
@@ -6434,6 +6475,13 @@ static void scrub_end(void)
 {
     char c[40]; uint32_t k, dt = 0;
     sc_active = false;
+    if (sc_method == SM_MARK)
+    {   /* v109 */
+        BLOG("  scrub: released at %u ms after %d ticks (%s)", (unsigned)sc_pos, sc_ticks, sm_name[sc_method]);
+        pl_el_ms = sc_pos; pl_target_ms = sc_pos; vr_el_tick = current_tick;
+        rc_plan(sc_pos);
+        return;
+    }
     if (sc_method == SM_FF || sc_method == SM_FFK)
     {
         int n0 = v_seek_n;
@@ -6480,6 +6528,7 @@ static void pl_tap(int dir)
     if (cfg_tap_secs <= 0) return;
     pl_status();
     k = pl_key_step(pl_el_ms, dir, (uint32_t)cfg_tap_secs * 1000u);
+    if (seek_budget_out(0)) { pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; rc_plan(k); return; }   /* v109 */
     av_hold();
     snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
     pl_cmd(c, true);
@@ -7025,6 +7074,15 @@ static void rbm_save(bool finished)
 static bool rc_want;
 static int rc_n;
 static uint32_t rc_pos;
+static bool rc_planned;                  /* v109: a reboot for the seek budget, not a failure (does not use up an attempt) */
+static void rc_plan(uint32_t pos)
+{
+    rc_pos = pos; rc_want = true; rc_planned = true;
+    BLOG("  REFRESH: %d seeks since the VideoCore was booted (budget %d) -- booting it again, the video continues at %u ms",
+         vc_seeks_boot, cfg_seek_budget, (unsigned)pos);
+    if (bcm_log_fd >= 0) { fsync(bcm_log_fd); bcm_last_sync = current_tick; }
+}
+static bool seek_budget_out(int extra) { return cfg_seek_budget > 0 && vc_seeks_boot + extra >= cfg_seek_budget; }
 static void rc_arm(const char *why)
 {
     rc_pos = pl_pos_now();
@@ -7199,6 +7257,7 @@ static void bcm_video_run(int secs)
     BLOG("  buffering %s, frame buffer %u KB", ra_adaptive ? "adaptive" : "fixed", (unsigned)(m4_raw_max / 1024));
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
+        if (rc_want) break;                            /* v109: a refresh asked for by the scrub / tap code */
         bcm_host_service();
         if (pl_paused != was_paused)
         {   /* v96: pause bookkeeping for the resume point */
@@ -7318,8 +7377,8 @@ static void bcm_video_run(int secs)
             if (ra_buf)
                 BLOG("  read-ahead: %u KB ahead of the picture, %u bursts, %u restarts, %u KB read, drive %s", ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1]) > ra_size ? 0u :
                      (unsigned)((ra_hi - (ra_pos[0] > ra_pos[1] ? ra_pos[0] : ra_pos[1])) / 1024), ra_bursts, ra_misses, ra_read_kb, ra_filling ? "reading" : "idle");
-            BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d skipped=%d  cache misses: tables %u data %u",
-                 v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
+            BLOG("  video: get_frame=%d (+%d/2s) sent=%d (%d B) empty=%d eos=%d seeks=%d (%d since boot) skipped=%d  cache misses: tables %u data %u",
+                 v_getframes, v_getframes - gf_log, v_frames, v_bytes, v_empty, v_eos, v_seeks, vc_seeks_boot, v_skips, (unsigned)m4c_miss, (unsigned)m4d_miss);
             gf_log = v_getframes;
             if (v_sound == 2 && ma.ok)
                 BLOG("  sound (VC): aac frames=%d (%d B) last ts=%u ms asked=%d eos=%d", a_frames, a_bytes, (unsigned)a_last_ts, a_req, a_eos);
@@ -7875,10 +7934,16 @@ static void bcm_scan_vc_ram(uint32_t w0, uint32_t w1)
    the result.  Rockbox threads only switch at sleeps / yields / disk waits, which is where the main thread waits for the
    VideoCore. */
 static struct { char path[MAX_PATH]; volatile int state; int mr; long ms; } prep;   /* state 0 none, 1 running, 2 done */
+/* v111: the helper waits until the VideoCore has booted.  v110 logs 1 and 2: the boot started while the helper was reading
+   a 9.4 MB moov (by PIO, the CPU busy for 2.2 s); the boot then took 2.3 s instead of 0.8 and the VideoCore was dead
+   (log 1: host interface all zero) or the iPod hung (log 2).  When the boot started first (logs 3 and 4) it was fine. */
+static volatile bool prep_boot_done;
 static long prep_stack[(16 * 1024) / sizeof(long)];
 static void prep_thread(void)
 {
-    long t0 = current_tick;
+    long t0 = current_tick, until = current_tick + 5 * HZ;
+    while (!prep_boot_done && TIME_BEFORE(current_tick, until)) sleep(1);   /* v111 */
+    t0 = current_tick;
     prep.mr = mp4_open(prep.path);
     if (prep.mr == 0) st_begin(prep.path);
     prep.ms = (current_tick - t0) * 1000 / HZ;
@@ -7888,6 +7953,7 @@ static void prep_thread(void)
 static void prep_start(const char *path)
 {
     snprintf(prep.path, sizeof prep.path, "%s", path);
+    prep_boot_done = false;                              /* v111 */
     prep.state = 1;
     if (!create_thread(prep_thread, prep_stack, sizeof prep_stack, 0, "bcm prepare"
                        IF_PRIO(, PRIORITY_USER_INTERFACE) IF_COP(, CPU)))
@@ -7904,6 +7970,31 @@ static int prep_join(void)                               /* -100 = no helper ran
     BLOG("start-up helper: video + subtitles ready (%ld ms of work; waited %ld ms for it)", prep.ms, (current_tick - t0) * 1000 / HZ);
     prep.state = 0;
     return prep.mr;
+}
+
+/* v110: the end of a video, step by step in the log.  The v108 log 2 (recovery) and the v109 log (MENU) both ended right
+   after "VIDEO RESULT", in these frees, both times after the TV subtitle canvas and its 35 px font had been made; a
+   refresh without them (v109, 46 s) got through.  Each line below reaches the disk before the next step. */
+static void pl_free_traced(void)
+{
+    BLOG("exit: freeing -- subtitle store %d, canvas %d, font %d, ring %d, frame buffer %d, file %d; %u KB free",
+         st_store_h, st_cv_h, st_font, ra_handle, m4_big_h, m4.fd, (unsigned)(core_available() / 1024));
+    st_free_store();
+    BLOG("exit: subtitle store freed");
+    if (st_cv_h > 0) { core_unpin(st_cv_h); core_free(st_cv_h); }
+    st_cv_h = -1; st_cv = NULL; st_wk = NULL; st_ext = NULL;
+    BLOG("exit: subtitle canvas freed");
+    if (st_font >= 0) font_unload(st_font);
+    st_font = -1;
+    BLOG("exit: subtitle font unloaded");
+    st_end();
+    if (m4.fd >= 0) close(m4.fd);
+    m4.fd = -1;
+    BLOG("exit: video file closed");
+    m4c_reset(); ra_free();
+    BLOG("exit: read-ahead ring freed");
+    m4_big_free();
+    BLOG("exit: frame buffer freed, %u KB free", (unsigned)(core_available() / 1024));
 }
 
 static void bcm_playback_probe(void)
@@ -8079,8 +8170,7 @@ again:
         if (m4_big_seen) BLOG("large frames: %u over 64 KB, the largest %u KB", (unsigned)m4_big_seen, (unsigned)(m4_big_max / 1024));
         if (rc_want)
         {   /* v96: the VideoCore stopped -- bcm_run reboots it; nothing more is asked of this one */
-            st_end();
-            m4_close();
+            pl_free_traced();                          /* v110 */
             bcm_tv_dac = false;
             return;
         }
@@ -8115,8 +8205,7 @@ again:
             BLOG("restart: mp_selectplay again with the video stream only");
             goto again;
         }
-        st_end();                                      /* v73 */
-        m4_close();
+        pl_free_traced();                              /* v73; v110: logged */
     }
     else
     {
@@ -8618,7 +8707,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v108, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v113, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -8666,6 +8755,7 @@ static bool bcm_run(const char *play_path)
                 BLOG("warm start: mplayer.vll loaded again (task %d, %ld ms)", bcm_mp_task, (current_tick - t0) * 1000 / HZ);
                 bcm_warm_run = true;
                 bcm_warm_clock();                      /* v102 */
+                prep_boot_done = true;                 /* v111: no boot this time */
                 goto warm_start;
             }
         }
@@ -8713,7 +8803,11 @@ vc_boot:                                               /* v96: recovery comes ba
     if (!bcm_player_mode) splash(0, "Booting VideoCore from file...");   /* v47: the player starts without a message */
     BLOG("boot splash shown; calling bcm_use_vmcs_image");
     vmcs_len = (unsigned)r;
-    r = (rc_n || power_cycle) ? bcm_vc_reboot(bcm_vmcs_buf, vmcs_len) : bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);   /* v96 */
+    if (bcm_log_fd >= 0) { fsync(bcm_log_fd); bcm_last_sync = current_tick; }   /* v109: v108 log 1 ended before this */
+    r = (rc_n || power_cycle || rc_planned) ? bcm_vc_reboot(bcm_vmcs_buf, vmcs_len) : bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);   /* v96 */
+    vc_seeks_boot = 0;                                 /* v109 */
+    prep_boot_done = true;                             /* v111: the start-up helper may read the disk now */
+    rc_planned = false;
     boots = bcm_get_boot_info(snap);
     BLOG("bcm_use_vmcs_image = %d (0 ok, -1 no NOR vmcs, -2 BCM not rebooted); boots so far %u", r, boots);
     BLOG("VC[1F0..1FC] right after boot = %08x %08x %08x %08x",
@@ -8729,9 +8823,12 @@ vc_boot:                                               /* v96: recovery comes ba
         {
             BLOG("BAD BOOT (r=%d, VC[1F8]=%08x VC[1FC]=%08x): retrying the VC boot (%d/2)", r, snap[2], snap[3], tries + 1);
             sleep(HZ);
-            r = (rc_n || power_cycle) ? bcm_vc_reboot(bcm_vmcs_buf, vmcs_len) : bcm_use_vmcs_image(bcm_vmcs_buf, vmcs_len);
+            /* v112: retries always cut the BCM's power first (bcm_vc_reboot, the recovery boot).  The v111 log: the normal
+               boot (lcd_sleep, then upload) returned -2 with VC[1F8]=00373056 three times in a row -- the BCM never
+               restarted -- and the iPod rebooted (white screen).  A power-cycled boot does not depend on that state. */
+            r = bcm_vc_reboot(bcm_vmcs_buf, vmcs_len);
             boots = bcm_get_boot_info(snap);
-            BLOG("retry: bcm_use_vmcs_image = %d; boots so far %u; VC[1F0..1FC] = %08x %08x %08x %08x", r, boots,
+            BLOG("retry (power-cycled): bcm_vc_reboot = %d; boots so far %u; VC[1F0..1FC] = %08x %08x %08x %08x", r, boots,
                  snap[0], snap[1], snap[2], snap[3]);
         }
         if ((r != 0 || snap[2] != 1 || snap[3] == 0) && (rc_n || power_cycle) && bcm_player_mode)
@@ -8854,13 +8951,15 @@ warm_start:                                            /* v99: a kept VideoCore 
     bcm_playback_probe();
     if (rc_want && bcm_play_path)
     {   /* v96: recovery -- power-cycle, boot vmcs.bin (still in RAM) again, the same start-up, continue at rc_pos */
-        rc_want = false; rc_n++;
+        rc_want = false;
+        if (!rc_planned) rc_n++;                       /* v109: a planned refresh is not a failure */
+        bcm_sync_startup = true;                       /* v109: the v108 log ended at the reboot (10 s flushes) */
         bcm_host_detach();
         bcm_reset_run_state();
         bcm_resume_ms = rc_pos;
         bcm_wd_last = current_tick; bcm_wd_secs = 20;
         power_cycle = true; bcm_warm_run = false;
-        BLOG("RECOVERY %d: rebooting the VideoCore, then back to %u ms", rc_n, (unsigned)rc_pos);
+        BLOG("%s %d: rebooting the VideoCore, then back to %u ms", rc_planned ? "REFRESH" : "RECOVERY", rc_n, (unsigned)rc_pos);
         goto vc_boot;
     }
     run_ok = !bcm_dead_seen && !bcm_io_dead() && !bcm_vc_stopped && v_live;
@@ -8877,6 +8976,7 @@ warm_start:                                            /* v99: a kept VideoCore 
     if (v_live && !cfg_nolcd && !bcm_check_dead())
         splashf(HZ*3, "v26: sent %d video frames", v_frames);
 out:
+    prep_boot_done = true;                             /* v111 */
     if (prep.state != 0)
     {   /* v78: the start-up helper was not taken (the VideoCore start failed): let it finish, give its memory back */
         while (prep.state == 1) yield();
