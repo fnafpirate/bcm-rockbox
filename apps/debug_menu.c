@@ -4116,6 +4116,8 @@ static int cfg_osd = 1, cfg_osd_layer = 100;                                    
 /* v73: subtitles: subs -1 = the setting, 0 off, 1 on; subs_layer 0 = just below the controls; subs_sync = ms between
    position reads while playing; subs_delay = ms added to the video position (+ = subtitles later) */
 static int cfg_subs = -1, cfg_subs_layer = 0, cfg_subs_sync = 1500, cfg_subs_delay = 0;
+static int cfg_stock_step_ms = 200;                  /* v114: SM_STOCK's time per step (see sm_name) */
+static int cfg_scan_fb_ms = 2000;                    /* v115: SM_SCAN: no new picture in this long -> time only */
 static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
 static int cfg_ff_accel = 1;                                                        /* v47 */
@@ -4264,7 +4266,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
         else if (!strcmp(p, "keep_min")) cfg_keep_min = v < 1 ? 1 : v;
         else if (!strcmp(p, "recover"))  cfg_recover = v;
-        else if (!strcmp(p, "seek_budget")) cfg_seek_budget = v;      /* v109: 0 = no limit */        /* v96: VideoCore reboots per video (0 = off) */
+        else if (!strcmp(p, "seek_budget")) cfg_seek_budget = v;      /* v109: 0 = no limit */
+        else if (!strcmp(p, "stock_step_ms")) cfg_stock_step_ms = v > 20 ? v : 20;   /* v114 */
+        else if (!strcmp(p, "scan_fallback_ms")) cfg_scan_fb_ms = v;                 /* v115: 0 = never */        /* v96: VideoCore reboots per video (0 = off) */
         else if (!strcmp(p, "moov_kb"))  cfg_moov_kb = v;
         else if (!strcmp(p, "ra_sleep")) cfg_ra_sleep = v;
         else if (!strcmp(p, "ra_mode"))  cfg_ra_mode = v;
@@ -4663,7 +4667,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v113 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v115 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -4976,8 +4980,34 @@ static int av_vol_pct;                 /* v51: volume 0..100 % (audio section be
 static long av_vol_until, av_vol_drawn;
 static bool av_vol_dirty;
 /* scrubber */
-enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5, SM_MARK = 6 };
-static const char * const sm_name[7] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step", "time only (seek budget)" };
+enum { SM_AUTO = 0, SM_SEEKSTEP = 1, SM_JUMP = 2, SM_FF = 3, SM_FFK = 4, SM_STEP = 5, SM_MARK = 6, SM_STOCK = 7, SM_SCAN = 8 };
+static const char * const sm_name[9] = { "auto", "seek+step", "jump", "ff", "ff+keys", "step", "time only (seek budget)",
+                                         "time only (stock click-wheel scrub)", "stock scan (paused, key frames, mp_step 0)" };
+/* v115: SM_SCAN, Apple's FF / REW button scan (Firmware-25.6.3):
+     begin (movie app rt 0x246bc4 -> backend rt 0x1f8ef0 FF / rt 0x1fa624 REW): the track engine is put in scan mode
+       (rt 0x179064: [track+0x1d8] = 1 FF / 2 REW), then rt 0x1f9028: the position is kept, "mp_pause", "mp_seek 0" (a
+       flush: the host's own scanning demuxer decides what comes next), "mp_step 0";
+     while held: a 200 ms timer (+0x14c; after 17 ticks 66 ms) sends "mp_step 0" -- the paused VideoCore shows the next
+       frame the host feeds; the host's demuxer in scan mode feeds frames from further and further on;
+     end (rt 0x24776c -> rt 0x1f8f44): scan mode off, ONE "mp_seek <position reached>", then "mp_play" if it was playing.
+   The VideoCore is never put in its own FF mode (mp_ff / mp_rewind are not in the firmware): 2 seeks per FF, any length.
+   Here: our trick feed (key frames tf_jump apart, the v46 tf_* code) is the scanning demuxer; the flush is a seek to the
+   key frame where the scan starts.  If no new picture shows within 2 s, the hold carries on as time only (SM_STOCK). */
+static uint32_t scan_seq0;
+static bool scan_moved;
+/* v114: SM_STOCK, as Apple's firmware does it (Firmware-25.6.3, read from the ARM code):
+     - the ARM side never sends mp_ff or mp_rewind (neither string is in the firmware); its only seek is mp_seek %d,
+       sent by the movie player's SeekTo (rt 0x246340: mp_seek, then mp_step 0 when paused, to show the new picture);
+     - scrubbing (rt 0x2469b0) only moves a target time ([this+0x268]) -- the picture keeps playing, the time display
+       shows the target -- and a 500 ms timer (rt 0x246b1c) seeks ONCE, 250 ms after the last scrub input;
+     - the step (rt 0x247f80): 5 s per input step (a video under 5 min: its length / 60), times a multiplier that
+       doubles every 350 ms of continuous input (the click-wheel accelerator, rt 0x1c242c) up to a cap from the length:
+       x1 up to 15 min, x2 to 30 min, x4 to 1 h, x8 to 2 h, x16 to 4 h, x32 longer.
+   So a stock FF of any length costs the VideoCore one seek; the v107-v109 "ff+keys" preview cost ~5 a second, and the
+   VideoCore died at its 125th.  The input rate of a held button is not in that code; cfg stock_step_ms (default 200)
+   is the time per step here. */
+static uint32_t stk_base, stk_cap, stk_mult;
+static long stk_mult_at;
 static int sc_btn, sc_dir, sc_ticks, sc_method, sc_rate;
 static bool sc_remote;                   /* v63: FF/REW started by a dock / remote (StartFF ... EndFFRew) */
 static int sm_ff = SM_FFK, sm_rew = SM_FFK;      /* v47: the v46 probe: ff+keys 454 pictures / +21.5 s, rew+keys 452 / -22.2 s in 2.4 s */
@@ -6380,11 +6410,40 @@ static void scrub_begin(int dir)
     sc_active = true; sc_dir = dir; sc_ticks = 0; sc_t0 = current_tick; sc_next = current_tick;
     sc_pos = pl_el_ms; pl_target_ms = sc_pos; sc_jump = 4000;
     sc_was_playing = !pl_paused;
-    sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : (dir > 0 ? sm_ff : sm_rew);
+    sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : bcm_player_mode ? SM_SCAN : (dir > 0 ? sm_ff : sm_rew);
     if (sc_method == SM_STEP && dir < 0) sc_method = SM_JUMP;
     if (seek_budget_out(0)) sc_method = SM_MARK;       /* v109 */
     BLOG("  scrub: %s held at %u ms, method %s (%d seeks since boot)", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, sm_name[sc_method],
          vc_seeks_boot);
+    if (sc_method == SM_SCAN && seek_budget_out(2)) sc_method = SM_STOCK;   /* v115: a scan costs 2 seeks */
+    if (sc_method == SM_SCAN)
+    {   /* v115: Apple's button scan: pause, flush to the start key frame, then "mp_step 0" per picture (scrub_tick) */
+        uint32_t dt = 0, k;
+        if (pl_disp(&dt, &scan_seq0) != 0) scan_seq0 = 0xffffffffu;
+        tf_cur = dt && dt != 0xffffffffu ? dt : sc_pos; tf_jump = 1000; tf_fed = 0; tf_dir = dir;
+        scan_moved = false;
+        if (sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
+        av_hold();
+        m4_key_at(tf_cur, &k);
+        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
+        pl_cmd(c, true);
+        pl_cmd("mp_step 0", true);
+        sc_pos = tf_cur; pl_target_ms = sc_pos;
+        sc_next = current_tick + HZ / 5;
+        osd_show_for(0);
+        return;
+    }
+    if (sc_method == SM_STOCK)
+    {   /* v114: Apple's way: the picture plays on, only the time moves; one seek on release */
+        uint32_t d = pl_dur_ms ? pl_dur_ms : m4_dur_ms, t = 900000;
+        stk_base = d >= 300000 ? 5000 : (d * 5000u / 300000u ? d * 5000u / 300000u : 1);
+        for (stk_cap = 1; t < d && stk_cap < 32; stk_cap *= 2) t *= 2;
+        stk_mult = 1; stk_mult_at = current_tick + HZ * 35 / 100;
+        sc_next = current_tick;                         /* the first step at once, as a press does */
+        osd_show_for(0);
+        BLOG("  scrub: stock steps %u ms x1..x%u every %d ms", (unsigned)stk_base, (unsigned)stk_cap, cfg_stock_step_ms);
+        return;
+    }
     if (sc_method == SM_MARK)
     {   /* v109: the picture stays (paused); only the time moves; the release boots the VideoCore again there */
         if (sc_was_playing) { pl_cmd("mp_pause", true); pl_paused = true; }
@@ -6444,6 +6503,46 @@ static void scrub_tick(void)
         }
         if (pl_disp(&dt, NULL) == 0 && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
         break;
+    case SM_SCAN:                                       /* v115 */
+    {
+        long per = held < (HZ * 34) / 10 ? HZ / 5 : (HZ * 66) / 1000;   /* stock: 200 ms, after 17 ticks 66 ms */
+        uint32_t seq = 0;
+        if (per < 1) per = 1;
+        sc_next = current_tick + per;
+        tf_jump = sc_speed_jump(held) * (uint32_t)per / HZ;              /* video ms per picture shown */
+        if (tf_jump < 1000) tf_jump = 1000;
+        pl_cmd("mp_step 0", sc_ticks < 3);
+        if (sc_ticks % 3 == 0 && pl_disp(&dt, &seq) == 0 && seq != 0xffffffffu)
+        {
+            if (seq != scan_seq0) scan_moved = true;
+            if (dt && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
+        }
+        if (!scan_moved && cfg_scan_fb_ms > 0 && held * 1000 / HZ >= cfg_scan_fb_ms)
+        {   /* no new picture: carry on as time only from here */
+            uint32_t d = pl_dur_ms ? pl_dur_ms : m4_dur_ms, t = 900000;
+            BLOG("  scrub: scan showed no new picture in %d ms (Disp seq %u) -- time only from here", cfg_scan_fb_ms, (unsigned)seq);
+            tf_dir = 0;
+            sc_method = SM_STOCK;
+            stk_base = d >= 300000 ? 5000 : (d * 5000u / 300000u ? d * 5000u / 300000u : 1);
+            for (stk_cap = 1; t < d && stk_cap < 32; stk_cap *= 2) t *= 2;
+            stk_mult = 1; stk_mult_at = current_tick + HZ * 35 / 100;
+        }
+        else if (!(sc_ticks % 3 == 0)) { sc_pos = tf_cur; pl_target_ms = tf_cur; }
+        break;
+    }
+    case SM_STOCK:                                      /* v114 */
+        sc_next = current_tick + (cfg_stock_step_ms * HZ) / 1000;
+        while (stk_mult < stk_cap && !TIME_BEFORE(current_tick, stk_mult_at))
+        { stk_mult *= 2; stk_mult_at += HZ * 35 / 100; }
+        if (sc_dir < 0 && sc_pos < stk_base * stk_mult) sc_pos = 0;
+        else
+        {
+            uint32_t d = pl_dur_ms ? pl_dur_ms : m4_dur_ms;
+            sc_pos += sc_dir * (int32_t)(stk_base * stk_mult);
+            if (d && sc_pos > d) sc_pos = d;
+        }
+        pl_target_ms = sc_pos;
+        break;
     case SM_MARK:                                       /* v109 */
         sc_next = current_tick + (cfg_scrub_tick * HZ) / 1000;
         sc_jump = sc_speed_jump(held) * (unsigned)cfg_scrub_tick / 1000;
@@ -6475,6 +6574,43 @@ static void scrub_end(void)
 {
     char c[40]; uint32_t k, dt = 0;
     sc_active = false;
+    if (sc_method == SM_SCAN)
+    {   /* v115: scan off, ONE seek to where the picture got to, play again if it was playing (stock rt 0x1f8f44) */
+        tf_dir = 0;
+        if (pl_disp(&dt, NULL) == 0 && dt && dt != 0xffffffffu) sc_pos = dt;
+        m4_key_at(sc_pos, &k);
+        BLOG("  scrub: scan released at %u ms after %d ticks (picture %s) -> one seek to the key frame at %u ms",
+             (unsigned)sc_pos, sc_ticks, scan_moved ? "moved" : "did not move", (unsigned)k);
+        if (seek_budget_out(0)) { pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; rc_plan(k); return; }
+        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
+        pl_cmd(c, true);
+        if (sc_was_playing) { pl_cmd("mp_play", true); pl_paused = false; }
+        else pl_cmd("mp_step 0", true);
+        pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; st_seeked();
+        av_prep(k, false);
+        mon_start("scan released");
+        osd_show_for(pl_paused ? 0 : 3000);
+        return;
+    }
+    if (sc_method == SM_STOCK)
+    {   /* v114: one seek to the key frame at or before the target (stock's SeekTo); past the end = the end */
+        uint32_t d = pl_dur_ms ? pl_dur_ms : m4_dur_ms;
+        if (d && sc_pos + 1500 >= d) sc_pos = d > 1500 ? d - 1500 : 0;
+        m4_key_at(sc_pos, &k);
+        BLOG("  scrub: released at %u ms after %d ticks (stock: x%u at the end) -> one seek to the key frame at %u ms",
+             (unsigned)sc_pos, sc_ticks, (unsigned)stk_mult, (unsigned)k);
+        if (seek_budget_out(0)) { pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; rc_plan(k); return; }
+        av_hold();
+        snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
+        pl_cmd(c, true);
+        if (sc_was_playing && pl_paused) { pl_cmd("mp_play", true); pl_paused = false; }   /* v115: after a scan fallback */
+        else if (pl_paused) pl_cmd("mp_step 0", true);  /* stock: a paused seek shows its new picture */
+        pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; st_seeked();
+        av_prep(k, false);
+        mon_start("scrub released");
+        osd_show_for(pl_paused ? 0 : 3000);
+        return;
+    }
     if (sc_method == SM_MARK)
     {   /* v109 */
         BLOG("  scrub: released at %u ms after %d ticks (%s)", (unsigned)sc_pos, sc_ticks, sm_name[sc_method]);
@@ -8707,7 +8843,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v113, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v115, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
