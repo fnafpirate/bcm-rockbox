@@ -83,13 +83,26 @@ static inline unsigned int map_sector(sector_t sector)
 
 static struct lldc_head cache_lru; /* LRU cache list (head = LRU item) */
 static struct disk_cache_entry cache_entry[DC_NUM_ENTRIES];
+#if defined(HAVE_MULTIVOLUME) && !defined(BOOTLOADER)
+/* bcm overlay v117: one sector-hash map for all volumes (the probes also check the entry's volume).  A map per
+   volume was 4 x 32 KB with 256 cache entries, and the iPod has one volume: 96 KB of RAM that was never used. */
+#define DC_SHARED_MAP
+static cache_map_entry_t cache_map_entry[DC_MAP_NUM_ENTRIES];
+#define DCE_VOL_OK(dce, volume) ((dce)->volume == (volume))
+#else
 static cache_map_entry_t cache_map_entry[NUM_VOLUMES][DC_MAP_NUM_ENTRIES];
+#endif
 static cache_map_entry_t cache_vol_map[NUM_VOLUMES] IBSS_ATTR;
 static uint8_t cache_buffer[DC_NUM_ENTRIES][DC_CACHE_BUFSIZE] CACHEALIGN_ATTR;
 struct mutex disk_cache_mutex SHAREDBSS_ATTR;
 
+#ifdef DC_SHARED_MAP
+#define CACHE_MAP_ENTRY(volume, mapnum) \
+    cache_map_entry[mapnum]
+#else
 #define CACHE_MAP_ENTRY(volume, mapnum) \
     cache_map_entry[IF_MV_VOL(volume)][mapnum]
+#endif
 #define CACHE_VOL_MAP(volume) \
     cache_vol_map[IF_MV_VOL(volume)]
 
@@ -180,7 +193,11 @@ void * dc_cache_probe(IF_MV(int volume,) sector_t sector,
     {
         struct disk_cache_entry *dce = &cache_entry[index];
 
+#ifdef DC_SHARED_MAP
+        if (dce->sector == sector && DCE_VOL_OK(dce, IF_MV_VOL(volume)))
+#else
         if (dce->sector == sector)
+#endif
         {
             *flagsp = DCE_INUSE;
             touch_cache_entry(dce);
@@ -306,7 +323,11 @@ void * dc_find_sector(IF_MV(int volume,) sector_t sector)
     FOR_EACH_BITARRAY_SET_BIT(&CACHE_MAP_ENTRY(volume, map_sector(sector)), index)
     {
         struct disk_cache_entry *dce = &cache_entry[index];
+#ifdef DC_SHARED_MAP
+        if ((dce->flags & DCE_INUSE) && dce->sector == sector && DCE_VOL_OK(dce, IF_MV_VOL(volume)))
+#else
         if ((dce->flags & DCE_INUSE) && dce->sector == sector)
+#endif
             return cache_buffer[index];
     }
     return NULL;

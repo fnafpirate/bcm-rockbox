@@ -190,6 +190,9 @@ struct filestr_cache;
 int fat_readdir(struct fat_filestr *dirstr, struct fat_dirscan_info *scan,
                 struct filestr_cache *cachep, struct fat_direntry *entry);
 void fat_rewinddir(struct fat_dirscan_info *scan);
+#ifndef BOOTLOADER
+uint32_t fat_lookup_want(const char *name);   /* bcm overlay v117 */
+#endif
 
 /** Mounting and unmounting functions **/
 bool fat_ismounted(IF_MV_NONVOID(int volume));

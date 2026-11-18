@@ -49,7 +49,7 @@ Clock sync (1.5-1.6) is gone: bcm overlay v85 uses Rockbox's own USB code.  1.7 
 start-up if it was installed.
 
 1.8: the cluster size is chosen from the size of the card unless you pick one (--cluster-kb auto, the default):
-up to 300 MB 4 KB, up to 34 GB 32 KB, up to 550 GB 128 KB, up to 2.2 TB 256 KB, up to 4.4 TB 512 KB, above 1 MB.
+up to 300 MB 4 KB, up to 34 GB 32 KB, up to 2.2 TB 64 KB, up to 4.4 TB 128 KB, above 256 KB (1.11's sizes).
 
 1.9: no second (type 0xDA) entry for the firmware partition any more.  Windows gave it a drive letter and asked to
 format it ("You need to format the disk in drive E:"); formatting it would have erased the bootloader.  The firmware
@@ -59,24 +59,30 @@ also hides an existing 0xDA entry from the computer in the iPod's USB mode.)
 1.10: the iPod is paired with this computer for clock sync (bcm overlay v105): /.rockbox/timesync_pc.txt names it,
 so the iPod takes its time only from this computer (ipod_time_sync.pyw, in this package, sends it).  A pairing kept
 from the old /.rockbox wins.
+
+1.11: smaller automatic clusters on big cards (bcm overlay v117): 64 KB from 34 GB to 2.2 TB (was 128 KB up to 550 GB,
+256 KB up to 2.2 TB), 128 KB to 4.4 TB, 256 KB above.  Every file wastes half a cluster on average and every folder
+takes at least one: with 40,000 songs in 4,000 album folders that is about 6 GB at 256 KB and under 2 GB at 64 KB
+(the bigger FAT included).  Rockbox reads music and video files in long runs either way, so playback costs the same;
+the allocation bitmap is 4x bigger (3.8 MB on 2 TB) and is only read in full to show the free space.
+Applies to a new format / migration only; --cluster-kb still picks any size.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.10'
+VERSION = '1.11'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
 def auto_cluster(nbytes):
-    """1.8: the cluster size for an exFAT volume of nbytes.  Up to 2 TB this is what the SD Association's
-    formatter uses for SD / SDHC / SDXC cards (32 KB up to 32 GB, 128 KB up to 512 GB, 256 KB up to 2 TB; the
-    limits have some slack because a "32 GB" card holds a little less or more), 4 KB for tiny volumes.  Above
-    2 TB it keeps growing so the allocation bitmap Rockbox reads after start-up stays near 1 MB (8 million
-    clusters); small files waste at most one cluster each, under 0.1 % of a card that size."""
+    """the cluster size for an exFAT volume of nbytes.  1.8 used the SD Association's sizes (up to 256 KB on
+    2 TB); 1.11 uses 64 KB from 34 GB to 2.2 TB: half a cluster wasted per file and a whole one per folder add up
+    on a big library, while Rockbox reads files in long runs whatever the cluster size.  Above 2.2 TB it grows so
+    the allocation bitmap stays near 4-8 MB."""
     MB, GB, TB = 10 ** 6, 10 ** 9, 10 ** 12
-    for limit, kb in ((300 * MB, 4), (34 * GB, 32), (550 * GB, 128), (2200 * GB, 256), (4400 * GB, 512)):
+    for limit, kb in ((300 * MB, 4), (34 * GB, 32), (2200 * GB, 64), (4400 * GB, 128)):
         if nbytes <= limit:
             return kb * 1024
-    return 1024 * 1024
+    return 256 * 1024
 
 
 def cluster_arg(v):

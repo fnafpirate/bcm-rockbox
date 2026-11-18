@@ -405,7 +405,11 @@ void iap_tx_strlcpy(const unsigned char *str)
     ptrdiff_t txfree;
     int r;
 
-    txfree = TX_BUFLEN - (iap_txnext - iap_txstart);
+    if (!str)
+        str = (const unsigned char *)"";        /* v116: a missing tag (lingo 3 track info) */
+    txfree = 128 - (iap_txnext - iap_txstart);   /* v116: strings keep the old 128-byte frame limit */
+    if (txfree < 1)
+        txfree = 1;
     r = strlcpy(iap_txnext, str, txfree);
 
     if (r < txfree)
@@ -415,8 +419,8 @@ void iap_tx_strlcpy(const unsigned char *str)
          */
         iap_txnext += (r+1);
     } else {
-        /* Truncation occured, the TX buffer is now full. */
-        iap_txnext = iap_txstart + TX_BUFLEN;
+        /* Truncation occured, the string fills the frame. */
+        iap_txnext += txfree;
     }
 }
 

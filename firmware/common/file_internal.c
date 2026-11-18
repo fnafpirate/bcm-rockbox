@@ -59,6 +59,9 @@ void file_cache_init(struct filestr_cache *cachep)
     cachep->buffer = NULL;
     cachep->sector = INVALID_SECNUM;
     cachep->flags  = 0;
+#ifndef BOOTLOADER
+    cachep->want   = 0;
+#endif
 }
 
 /* discard and mark the cache buffer as unused */
@@ -66,6 +69,9 @@ void file_cache_reset(struct filestr_cache *cachep)
 {
     cachep->sector = INVALID_SECNUM;
     cachep->flags  = 0;
+#ifndef BOOTLOADER
+    cachep->want   = 0;
+#endif
 }
 
 /* allocate resources attached to the cache */
@@ -452,6 +458,10 @@ static NO_INLINE int open_path_component(struct pathwalk *walkp,
     stream->infop = &parentp->info;
     fat_filestr_init(&stream->fatstr, &parentp->info.fatfile);
     rewinddir_internal(&compp->info);
+#ifndef BOOTLOADER
+    /* bcm overlay v117: on exFAT, entry sets whose name hash / length cannot match are passed over unread */
+    stream->cachep->want = fat_lookup_want(compname);
+#endif
 
     while ((rc = readdir_internal(stream, &compp->info, &dir_fatent)) > 0)
     {
@@ -461,6 +471,9 @@ static NO_INLINE int open_path_component(struct pathwalk *walkp,
         if (!strcasecmp(compname, dir_fatent.name))
             break;
     }
+#ifndef BOOTLOADER
+    stream->cachep->want = 0;
+#endif
 
     if (rc == 0)
     {

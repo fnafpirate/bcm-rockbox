@@ -56,6 +56,9 @@ struct filestr_cache
     sector_t      sector;   /* file sector that is in buffer */
     uint8_t       *buffer;  /* buffer to hold sector */
     unsigned int  flags;    /* FSC_* bits */
+#ifndef BOOTLOADER
+    uint32_t      want;     /* bcm overlay v117: exFAT name lookup (fat_lookup_want), 0 = none */
+#endif
 };
 
 void file_cache_init(struct filestr_cache *cachep);

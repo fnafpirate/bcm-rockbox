@@ -397,14 +397,21 @@ static void * cache_sector(struct bpb *fat_bpb, sector_t secnum)
    with newer, dirty contents) are left alone.  Up to v112 every directory scan read the directory again, one direct,
    uncached sector per command: ~28 reads to create a file in a 100-file folder, ~60 to rename one.  The caller holds
    the cache lock; 'left' = sectors from secnum to the end of its cluster. */
-#define EXFAT_DIR_PREFETCH 16
-static uint8_t exfat_pf_buf[EXFAT_DIR_PREFETCH * DC_CACHE_BUFSIZE] STORAGE_ALIGN_ATTR;
+/* bcm overlay v117: one 16 KB buffer for the bitmap reads, the zeroing of new directory clusters and this read-ahead
+   (all of them run with the cache lock held); v113 had a separate 8 KB one here.  A directory's first read takes
+   8 sectors (4 KB, ~100 entries: a whole album folder), the reads after it 32 (16 KB): v113 read 16 every time, twice
+   what a small folder needs and twice the commands for a big one. */
+static uint8_t exfat_bitmap_buf[16384] STORAGE_ALIGN_ATTR;
+#define exfat_pf_buf exfat_bitmap_buf
+#define EXFAT_DIR_FIRST_READ 8
 static void * exfat_dir_sector(struct bpb *fat_bpb, sector_t secnum, unsigned long left)
 {
     unsigned int ss = LOG_SECTOR_SIZE(fat_bpb), flags;
     if (left == 0 || left > fat_bpb->bpb_secperclus)
         left = 1;                                        /* position unknown: this sector only */
     unsigned long n = MIN(left, (unsigned long)(sizeof exfat_pf_buf / ss));
+    if (left == fat_bpb->bpb_secperclus && n > EXFAT_DIR_FIRST_READ)
+        n = EXFAT_DIR_FIRST_READ;                        /* the start of a cluster: maybe a small folder */
     if (n > 1 && !dc_find_sector(IF_MV(fat_bpb->volume,) secnum) &&
         storage_read_sectors(IF_MD(fat_bpb->drive,) secnum + fat_bpb->startsector, n, exfat_pf_buf) >= 0)
     {
@@ -2208,7 +2215,9 @@ static uint8_t  exfat_upcase_map[256];     /* 0 = identity page, else pool slot 
 static uint16_t exfat_upcase_pool[EXFAT_UPCASE_PAGES][256];
 static unsigned int exfat_upcase_used;
 static bool exfat_upcase_ok;
+#ifdef BOOTLOADER
 static uint8_t exfat_bitmap_buf[16384] STORAGE_ALIGN_ATTR;
+#endif
 
 static void exfat_upcase_reset(void)
 {
@@ -2261,6 +2270,26 @@ static uint16_t exfat_name_hash(const uint16_t *name, unsigned int len)
     return hash;
 }
 
+#ifndef BOOTLOADER
+/* bcm overlay v117: the same sum without a test of every byte for the checksum field (bytes 2-3): the first entry's
+   first two bytes, then everything from byte 4 on.  Half the work of the set check every directory entry goes
+   through (listing a folder, building the directory cache at start-up). */
+static uint16_t exfat_set_checksum(const uint8_t *set, unsigned int count)
+{
+    uint32_t chk = set[0];
+    const uint8_t *p = set + 4, *end = set + count * DIR_ENTRY_SIZE;
+    chk = ((chk >> 1) | (chk << 15)) + set[1];
+    chk &= 0xffff;
+    while (p < end)
+    {
+        chk = (((chk >> 1) | (chk << 15)) + *p++) & 0xffff;
+        chk = (((chk >> 1) | (chk << 15)) + *p++) & 0xffff;
+        chk = (((chk >> 1) | (chk << 15)) + *p++) & 0xffff;
+        chk = (((chk >> 1) | (chk << 15)) + *p++) & 0xffff;
+    }
+    return chk;
+}
+#else
 static uint16_t exfat_set_checksum(const uint8_t *set, unsigned int count)
 {
     uint16_t chk = 0;
@@ -2273,6 +2302,7 @@ static uint16_t exfat_set_checksum(const uint8_t *set, unsigned int count)
     }
     return chk;
 }
+#endif
 
 /* --- length of NoFatChain runs (keyed by first cluster) --- */
 #ifndef EXFAT_RUNS
@@ -2532,29 +2562,61 @@ static int update_fat_entry_ex(struct bpb *fat_bpb, unsigned long entry,
    disk copy cannot make it hand out a used cluster.  Without this, the first file written after mounting a well-filled
    exFAT volume (a setting, a playlist, a log) went through the bitmap one 512-byte cached sector at a time from the
    start -- up to ~4000 single-sector reads on a full 2 TB volume with 128 KB clusters. */
-static unsigned long exfat_first_free_hint(struct bpb *fat_bpb)
+/* the first free cluster (+2) in bitmap sectors [from, to), from big direct reads; 0 if none */
+static unsigned long exfat_free_scan(struct bpb *fat_bpb, unsigned long from, unsigned long to)
 {
     const unsigned long total = fat_bpb->dataclusters;
-    const unsigned long per = sizeof(exfat_bitmap_buf) / LOG_SECTOR_SIZE(fat_bpb);
-    const unsigned long nsec = (total + LOG_SECTOR_SIZE(fat_bpb) * 8 - 1) / (LOG_SECTOR_SIZE(fat_bpb) * 8);
-    unsigned long bit0 = 0;
-    for (unsigned long s = 0; s < nsec; s += per, bit0 += per * LOG_SECTOR_SIZE(fat_bpb) * 8)
+    const unsigned long ss = LOG_SECTOR_SIZE(fat_bpb), per = sizeof(exfat_bitmap_buf) / ss;
+    for (unsigned long s = from; s < to; s += per)
     {
-        unsigned long n = MIN(per, nsec - s);
+        unsigned long n = MIN(per, to - s), i;
         if (storage_read_sectors(IF_MD(fat_bpb->drive,) fat_bpb->startsector + fat_bpb->ex_bitmap_sector + s,
                                  n, exfat_bitmap_buf) < 0)
             return 0;
         const uint32_t *w = (const uint32_t *)exfat_bitmap_buf;
-        for (unsigned long i = 0; i < n * LOG_SECTOR_SIZE(fat_bpb) / 4; i++)
+        for (i = 0; i < n * ss / 4; i++)
             if (w[i] != 0xffffffffu)
             {
-                unsigned long b = bit0 + i * 32;
+                unsigned long b = s * ss * 8 + i * 32;
                 uint32_t v = w[i];
                 while (v & 1) { v >>= 1; b++; }
                 return b < total ? b + 2 : 0;
             }
     }
     return 0;
+}
+
+/* bcm overlay v118: 32 one-sector probes spread over the bitmap first.  A card filled by a PC is full from the start
+   up to where its free space begins, so the first probe with a free bit tells roughly where that is; only the stretch
+   since the probe before it is then read (1/32 of the bitmap at most).  v86-v117 read the bitmap from the start: on
+   2 TB at 64 KB clusters, 1.5 TB used, ~180 16 KB reads before the first write after start-up; now ~40 at most.
+   Holes from deleted files before that point are not looked for here: the allocator reaches them when it wraps. */
+#define EXFAT_HINT_PROBES 32
+static unsigned long exfat_first_free_hint(struct bpb *fat_bpb)
+{
+    const unsigned long total = fat_bpb->dataclusters;
+    const unsigned long ss = LOG_SECTOR_SIZE(fat_bpb);
+    const unsigned long nsec = (total + ss * 8 - 1) / (ss * 8);
+    unsigned long found = 0, prev = 0;
+    dc_lock_cache();                    /* v117: the buffer is shared with the directory read-ahead */
+    if (nsec >= EXFAT_HINT_PROBES * 64)
+    {
+        for (unsigned int k = 0; k < EXFAT_HINT_PROBES; k++)
+        {
+            unsigned long ps = (unsigned long)((uint64_t)nsec * k / EXFAT_HINT_PROBES);
+            if (exfat_free_scan(fat_bpb, ps, ps + 1))
+            {
+                /* the free space starts after the probe before this one (or here, for the first probe) */
+                found = exfat_free_scan(fat_bpb, k ? prev + 1 : ps, ps + 1);
+                break;
+            }
+            prev = ps;
+        }
+    }
+    if (!found)
+        found = exfat_free_scan(fat_bpb, 0, nsec);
+    dc_unlock_cache();
+    return found;
 }
 #endif
 
@@ -2574,9 +2636,45 @@ static long find_free_cluster_ex(struct bpb *fat_bpb, long startcluster)
     }
 #endif
 
+#ifndef BOOTLOADER
+    bool skipping = false;      /* v118: a whole bitmap sector was full: the following ones may be too */
+#endif
     while (checked < total + 8)
     {
         unsigned long secidx = idx / bps;
+#ifndef BOOTLOADER
+        if (skipping && !(idx % bps))
+        {   /* bcm overlay v118: past a full sector, the next uncached ones are checked from 16 KB direct reads
+               (exfat_free_scan) instead of one cached 512-byte sector per command: a card that is full up to near
+               its end made the first write after a freed cluster near the start step through ~7,000 sectors one by
+               one.  Only where to look next: the loop below still checks that cluster through the cache, which may
+               hold newer bitmap sectors. */
+            dc_lock_cache();
+            bool cached = dc_find_sector(IF_MV(fat_bpb->volume,) fat_bpb->ex_bitmap_sector + secidx) != NULL;
+            unsigned long f = 0;
+            if (!cached)
+            {
+                unsigned long nsec = (total + bps - 1) / bps;
+                f = exfat_free_scan(fat_bpb, secidx, nsec);
+            }
+            dc_unlock_cache();
+            if (!cached)
+            {
+                unsigned long to = f >= 2 ? f - 2 : total;
+                if (to > idx)
+                {
+                    checked += to - idx;
+                    idx = to;
+                }
+                if (idx >= total)
+                {
+                    idx = 0;
+                    continue;
+                }
+                secidx = idx / bps;
+            }
+        }
+#endif
         unsigned long end = MIN((secidx + 1) * bps, total);
 
         dc_lock_cache();
@@ -2613,6 +2711,9 @@ static long find_free_cluster_ex(struct bpb *fat_bpb, long startcluster)
             checked++;
         }
         dc_unlock_cache();
+#ifndef BOOTLOADER
+        skipping = true;
+#endif
         if (idx >= total)
             idx = 0;
     }
@@ -2635,7 +2736,37 @@ static void fat_recalc_free_internal_ex(struct bpb *fat_bpb)
         if (storage_read_sectors(IF_MD(fat_bpb->drive,) fat_bpb->startsector + sec + s,
                                  n, exfat_bitmap_buf) < 0)
             return;
-        for (unsigned long i = 0; i < n * LOG_SECTOR_SIZE(fat_bpb) && bits < total; i++)
+        /* bcm overlay v117: 32 clusters at a time -- all used / all free words (nearly all of them on a real
+           volume) cost one compare, the rest a shift-and-add bit count; the ARM9 has no bit-count instruction and
+           the per-byte __builtin_popcount was a library call for each of the ~2 million bitmap bytes */
+        const uint32_t *w = (const uint32_t *)exfat_bitmap_buf;
+        unsigned long nw = MIN(n * LOG_SECTOR_SIZE(fat_bpb) / 4, (total - bits) / 32), i = 0;
+        for (unsigned long k = 0; k < nw; k++)
+        {
+            uint32_t v = w[k];
+            if (v == 0xffffffffu)
+                used += 32;
+            else
+            {
+                if (fat_bpb->fsinfo.nextfree == 0xffffffff)
+                {
+                    unsigned int b = 0;
+                    while (v >> b & 1)
+                        b++;
+                    fat_bpb->fsinfo.nextfree = bits + b + 2;
+                }
+                if (v)
+                {
+                    v = v - ((v >> 1) & 0x55555555u);
+                    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+                    v = (v + (v >> 4)) & 0x0f0f0f0fu;
+                    used += (v * 0x01010101u) >> 24;
+                }
+            }
+            bits += 32;
+        }
+        i = nw * 4;
+        for (; i < n * LOG_SECTOR_SIZE(fat_bpb) && bits < total; i++)
         {
             uint8_t v = exfat_bitmap_buf[i];
             unsigned int k = MIN(8ul, total - bits);
@@ -2874,6 +3005,18 @@ static int exfat_parse_set(struct bpb *fat_bpb, const uint8_t *set, unsigned int
         for (unsigned int i = 0; i < EXFAT_NAME_CHARS && got < namelen; i++, got++)
         {
             unsigned long ucs = exfat_le16(ne + 2 + 2 * i);
+#ifndef BOOTLOADER
+            if (ucs < 0x80 && ucs)
+            {   /* bcm overlay v117: plain ASCII straight across (most names), no UTF-8 encoder call */
+                if (p >= end)
+                {
+                    got = namelen;
+                    break;
+                }
+                *p++ = ucs;
+                continue;
+            }
+#endif
             if (ucs >= 0xd800 && ucs < 0xdc00 && got + 1 < namelen)
             {
                 /* surrogate pair, possibly split across two name entries */
@@ -2986,8 +3129,28 @@ static int exfat_readdir(struct bpb *fat_bpb, struct fat_filestr *dirstr,
             }
             if (have < EXFAT_MAX_SET)
                 memcpy(set + have * DIR_ENTRY_SIZE, ent, DIR_ENTRY_SIZE);
+#ifndef BOOTLOADER
+            ++have;
+            /* bcm overlay v117: a lookup by name passes over a set whose stream entry has another name length or
+               NameHash: no name entries copied, no checksum, no UTF-8 conversion (Linux's exFAT driver skips the
+               same way).  Names over 85 characters are always read: one of those may be cut to fit Rockbox's
+               255-byte names, and lookups compare the cut name. */
+            if (have == 2 && cachep->want)
+            {
+                unsigned int nl = set[DIR_ENTRY_SIZE + 3];
+                if (nl <= 85 && (nl != ((cachep->want >> 16) & 0xff) ||
+                                 exfat_le16(set + DIR_ENTRY_SIZE + 4) != (cachep->want & 0xffff)))
+                {
+                    need = 0;
+                    continue;
+                }
+            }
+            if (have < need)
+                continue;
+#else
             if (++have < need)
                 continue;
+#endif
 
             need = 0;
             unsigned int n = MIN(have, (unsigned int)EXFAT_MAX_SET);
@@ -4980,6 +5143,28 @@ fat_error:
 
     return rc;
 }
+
+#ifndef BOOTLOADER
+/* bcm overlay v117: the exFAT NameHash and length of a pure-ASCII name, for exfat_readdir to pass over the entry sets
+   that cannot be it.  0 (no shortcut) for other names: an ASCII name compares (strcasecmp) equal only to an ASCII
+   name, whose hash any writer computes the same way; for other characters the up-case table could differ. */
+uint32_t fat_lookup_want(const char *name)
+{
+    uint16_t hash = 0;
+    unsigned int len = 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++, len++)
+    {
+        unsigned int c = *p;
+        if (c >= 0x80 || len >= 255)
+            return 0;
+        if (c >= 'a' && c <= 'z')
+            c -= 32;
+        hash = ((hash & 1) ? 0x8000 : 0) + (hash >> 1) + c;
+        hash = ((hash & 1) ? 0x8000 : 0) + (hash >> 1);          /* the high byte, 0 */
+    }
+    return len ? 0x80000000u | (uint32_t)len << 16 | hash : 0;
+}
+#endif
 
 void fat_rewinddir(struct fat_dirscan_info *scan)
 {

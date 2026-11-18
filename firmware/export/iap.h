@@ -24,7 +24,7 @@
 /* This is just the payload size, without sync, length and checksum */
 #define RX_BUFLEN (64*1024)
 /* This is the entire frame length, sync, length, payload and checksum */
-#define TX_BUFLEN 128
+#define TX_BUFLEN 320   /* bcm overlay v116: 128 -> 320, for 255-byte artwork telegrams */
 
 #ifdef HAVE_IAP_MULTIPORT
 #define IF_IAP_MP(x...) x

@@ -66,6 +66,180 @@ static void cmd_ack(const unsigned int cmd, const unsigned char status)
 
 #define cmd_ok(cmd) cmd_ack((cmd), IAP_ACK_OK)
 
+/* ---- bcm overlay v116: track information and album artwork for accessories (car stereos and docks with a colour
+   screen ask for the cover as RGB565, the way Apple's firmware sends it from its 100x100 / 200x200 ArtworkDB formats).
+   The track index is the accessory's index in the playing list (0 = the list's first track), as in 0x0020-0x0024. */
+#include "metadata.h"
+#include "playlist.h"
+#include "albumart.h"
+#include "bmp.h"
+#include "jpeg_load.h"
+#include "file.h"
+
+static struct mp3entry trk_id3;     /* the iAP thread's own copy: mp3entry is too big for every handler's stack */
+
+/* the requested track's tags; false when the index is outside the playing list */
+static bool trk_info(unsigned long idx)
+{
+    int n = playlist_amount();
+    if (n <= 0 || idx >= (unsigned long)n)
+        return false;
+    iap_get_trackinfo(idx, &trk_id3);
+    return true;
+}
+
+/* a tag, or "" when the file has none */
+static const char *tag_s(const char *s)
+{
+    return s ? s : "";
+}
+
+/* the title, or the file name without its extension (what the iPod's own screens show for an untagged file) */
+static const char *trk_title(char *tmp, size_t n)
+{
+    const char *p;
+    char *dot;
+    if (trk_id3.title && *trk_id3.title)
+        return trk_id3.title;
+    p = strrchr(trk_id3.path, '/');
+    strmemccpy(tmp, p ? p + 1 : trk_id3.path, n);
+    dot = strrchr(tmp, '.');
+    if (dot && dot != tmp)
+        *dot = '\0';
+    return tmp;
+}
+
+#ifdef HAVE_ALBUMART
+/* the formats GetArtworkFormats offers: Apple's 5G ArtworkDB IDs 1028 / 1029, RGB565 little-endian */
+static int art_fmt_size(unsigned fmt)
+{
+    return fmt == 0x0404 ? 100 : fmt == 0x0405 ? 200 : 0;
+}
+
+#define ART_MAX 200
+#define ART_BUFSIZE (ART_MAX * ART_MAX * 2 + 40 * 1024 + 1024)   /* the bitmap + JPEG_DECODE_OVERHEAD (38 KB) */
+static unsigned char art_buf[ART_BUFSIZE] __attribute__((aligned(32)));
+static char art_key_path[MAX_PATH];     /* what art_buf holds */
+static unsigned art_key_fmt;
+static struct bitmap art_bm;
+
+/* a cover file beside trk_id3's file (cover.jpg, folder.jpg, <album>.bmp, ... as the WPS finds them) */
+static bool art_find(char *path, int n, int size)
+{
+    struct dim d = { size, size };
+    return find_albumart(&trk_id3, path, n, &d);
+}
+static bool art_embedded(void)
+{
+    return trk_id3.has_embedded_albumart &&
+           (trk_id3.albumart.type & AA_CLEAR_FLAGS_MASK) == AA_TYPE_JPG;
+}
+static bool art_exists(void)
+{
+    char path[MAX_PATH];
+    return art_embedded() || art_find(path, sizeof path, 100);
+}
+
+/* decode trk_id3's cover into art_bm at no more than size x size (the aspect is kept: one side may be shorter);
+   embedded art first, unless Album Art is set to prefer the image file */
+static bool art_load(unsigned fmt)
+{
+    char path[MAX_PATH];
+    const int format = FORMAT_NATIVE | FORMAT_DITHER | FORMAT_RESIZE | FORMAT_KEEP_ASPECT;
+    int size = art_fmt_size(fmt), fd, rc = -1, pass;
+    bool file_first = global_settings.album_art == AA_PREFER_IMAGE_FILE;
+
+    if (fmt == art_key_fmt && !strcmp(art_key_path, trk_id3.path))
+        return true;
+    art_key_path[0] = '\0';
+    for (pass = 0; pass < 2 && rc <= 0; pass++)
+    {
+        bool file = (pass == 0) == file_first;
+        memset(&art_bm, 0, sizeof art_bm);
+        art_bm.width = size;
+        art_bm.height = size;
+        art_bm.data = art_buf;
+        if (!file && art_embedded())
+        {
+            fd = open(trk_id3.path, O_RDONLY);
+            if (fd < 0)
+                continue;
+            lseek(fd, trk_id3.albumart.pos, SEEK_SET);
+            rc = clip_jpeg_fd(fd, trk_id3.albumart.type, trk_id3.albumart.size, &art_bm, ART_BUFSIZE, format, NULL);
+            close(fd);
+        }
+        else if (file && art_find(path, sizeof path, size))
+        {
+            fd = open(path, O_RDONLY);
+            if (fd < 0)
+                continue;
+            if (strcasecmp(path + strlen(path) - 4, ".bmp"))
+                rc = read_jpeg_fd(fd, &art_bm, ART_BUFSIZE, format, NULL);
+            else
+                rc = read_bmp_fd(fd, &art_bm, ART_BUFSIZE, format, NULL);
+            close(fd);
+        }
+    }
+    if (rc <= 0 || art_bm.width <= 0 || art_bm.height <= 0 || art_bm.width > size || art_bm.height > size)
+        return false;
+    strmemccpy(art_key_path, trk_id3.path, sizeof art_key_path);
+    art_key_fmt = fmt;
+    return true;
+}
+
+/* RetTrackArtworkData: the picture padded (black) to size x size and centred, the inset rectangle saying where it
+   is.  Short telegrams (payload <= 255 bytes), each followed by a yield: at 19200-57600 baud a 100x100 cover (20 KB)
+   takes 4-11 s and the UART send busy-waits, so the other threads (the codec) must get their turns. */
+static void art_send(unsigned fmt)
+{
+    const int size = art_fmt_size(fmt);
+    const int w = art_bm.width, h = art_bm.height;
+    const int ox = (size - w) / 2, oy = (size - h) / 2;
+    const unsigned long total = (unsigned long)size * size;    /* pixels */
+    const uint16_t *px = (const uint16_t *)art_bm.data;
+    unsigned long p = 0;
+    unsigned idx = 0;
+
+    while (p < total)
+    {
+        int room;
+        IAP_TX_INIT4(0x04, 0x0011);
+        IAP_TX_PUT_U16(idx);
+        if (idx == 0)
+        {
+            IAP_TX_PUT(0x02);                   /* RGB565 little-endian */
+            IAP_TX_PUT_U16(size);
+            IAP_TX_PUT_U16(size);
+            IAP_TX_PUT_U16(ox);
+            IAP_TX_PUT_U16(oy);
+            IAP_TX_PUT_U16(ox + w - 1);
+            IAP_TX_PUT_U16(oy + h - 1);
+            IAP_TX_PUT_U32(size * 2);           /* row size in bytes */
+        }
+        room = (255 - (iap_txnext - iap_txpayload)) / 2;
+        for (; room > 0 && p < total; room--, p++)
+        {
+            int x = p % size, y = p / size;
+            uint16_t c = 0;
+            if (x >= ox && x < ox + w && y >= oy && y < oy + h)
+                c = px[(y - oy) * w + (x - ox)];
+            IAP_TX_PUT(c & 0xff);
+            IAP_TX_PUT(c >> 8);
+        }
+        iap_send_tx();
+        idx++;
+        yield();
+    }
+}
+#endif /* HAVE_ALBUMART */
+
+/* Jan 1st's weekday (0 = Sunday) for the release date, which has only a year in the tags */
+static int jan1_weekday(int y)
+{
+    y--;
+    return (1 + 5 * (y % 4) + 4 * (y % 100) + 6 * (y % 400)) % 7;
+}
+
 static void get_playlist_name(unsigned char *dest,
                               unsigned long item_offset,
                               size_t max_length)
@@ -604,62 +778,89 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
                 cmd_ack(cmd, IAP_ACK_BAD_PARAM);
                 break;
             }
-            struct mp3entry *id3 = audio_current_track();
-
+            /* v116: the track the accessory asked for (it always got the playing one), its genre / composer /
+               description, the year as the release date, the capability bits, and the cover's formats */
+            unsigned long idx = get_u32(&buf[4]);
+            if (buf[3] > 0x07 || !trk_info(idx))
+            {
+                cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                break;
+            }
+            IAP_TX_INIT4(0x04, 0x000D);
+            IAP_TX_PUT(buf[3]);
             switch(buf[3])
             {
-                case 0x01: /* Podcast Not Supported */
-                case 0x04: /* Lyrics Not Supported */
-                case 0x03: /* Description */
-                case 0x05: /* Genre */
-                case 0x06: /* Composer */
+                case 0x00: /* capabilities, length (ms), chapter count */
                 {
-                    cmd_ack(cmd, IAP_ACK_BAD_PARAM);
-                    break;
-                }
-                default:
-                {
-                    IAP_TX_INIT4(0x04, 0x000D);
-                    IAP_TX_PUT(buf[3]);
-                    switch(buf[3])
-                    {
-                        case 0x00:
+                    uint32_t caps = 0, length = trk_id3.length;
+#ifdef HAVE_ALBUMART
+                    if (art_exists())
+                        caps |= BIT_N(2);
+#endif
+                    if (trk_id3.year > 0)
+                        caps |= BIT_N(5);
+                    if (trk_id3.comment && *trk_id3.comment)
+                        caps |= BIT_N(6);
+#ifdef IPOD_VIDEO
+                    {   /* a video playing is the playing track: "contains video, playing as video" */
+                        uint32_t vl;
+                        long cur = playlist_next(0) - playlist_get_first_index(NULL);
+                        if (cur < 0)
+                            cur += playlist_amount();
+                        if (bcm_video_status(&vl, NULL, NULL) && (unsigned long)cur == idx)
                         {
-                            /* Track Capabilities 10Bytes Data */
-                            IAP_TX_PUT_U32(0);   /* Track Capabilities. */
-                                                 /* Currently None Supported*/
-                            IAP_TX_PUT_U32(id3->length); /* Track Length */
-                            IAP_TX_PUT_U16(0x00);        /* Chapter Count */
-                            break;
-                        }
-                        case 0x02:
-                        {
-                            /* Track Release Date 7 Bytes Data
-                             * Currently only returns a fixed value,
-                             * Sunday 1st Feb 2011 3Hr 4Min 5Secs
-                             */
-                            IAP_TX_PUT(5);               /* Seconds 0-59 */
-                            IAP_TX_PUT(4);               /* Minutes 0-59 */
-                            IAP_TX_PUT(3);               /* Hours 0-23 */
-                            IAP_TX_PUT(1);               /* Day Of Month 1-31 */
-                            IAP_TX_PUT(2);               /* Month 1-12 */
-                            IAP_TX_PUT_U16(2011);        /* Year */
-                            IAP_TX_PUT(0);               /* Day 0=Sunday */
-                            break;
-                        }
-                         case 0x07:
-                        {
-                            /* Track Artwork Count */
-                            /* Currently not supported */
-                            IAP_TX_PUT_U16(0x00);        /* Format ID */
-                            IAP_TX_PUT_U16(0x00);        /* Image Count */
-                            break;
+                            caps |= BIT_N(7) | BIT_N(8);
+                            length = vl;
                         }
                     }
-                    iap_send_tx();
+#endif
+                    IAP_TX_PUT_U32(caps);
+                    IAP_TX_PUT_U32(length);
+                    IAP_TX_PUT_U16(0x00);
                     break;
                 }
+                case 0x02: /* release date: the tag's year, January 1st */
+                {
+                    int y = trk_id3.year > 0 ? trk_id3.year : 0;
+                    IAP_TX_PUT(0);
+                    IAP_TX_PUT(0);
+                    IAP_TX_PUT(0);
+                    IAP_TX_PUT(1);
+                    IAP_TX_PUT(1);
+                    IAP_TX_PUT_U16(y);
+                    IAP_TX_PUT(y ? jan1_weekday(y) : 0);
+                    break;
+                }
+                case 0x01: /* podcast name: no podcasts */
+                case 0x04: /* lyrics */
+                    cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                    iap_txnext = iap_txpayload;     /* nothing more to send */
+                    break;
+                case 0x03: /* description (the comment tag): one packet, index 0 */
+                    IAP_TX_PUT(0x00);
+                    IAP_TX_PUT_U16(0);
+                    IAP_TX_PUT_STRLCPY(tag_s(trk_id3.comment));
+                    break;
+                case 0x05:
+                    IAP_TX_PUT_STRLCPY(tag_s(trk_id3.genre_string));
+                    break;
+                case 0x06:
+                    IAP_TX_PUT_STRLCPY(tag_s(trk_id3.composer));
+                    break;
+                case 0x07: /* artwork count: (format, count) records */
+#ifdef HAVE_ALBUMART
+                    if (art_exists())
+                    {
+                        IAP_TX_PUT_U16(0x0404);
+                        IAP_TX_PUT_U16(1);
+                        IAP_TX_PUT_U16(0x0405);
+                        IAP_TX_PUT_U16(1);
+                    }
+#endif
+                    break;
             }
+            if (iap_txnext != iap_txpayload)
+                iap_send_tx();
             break;
         }
         case 0x000D: /* ReturnIndexedPlayingTrackInfo. See Above */
@@ -881,19 +1082,29 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
              * Subsequent packets omit bytes 8 - 24
              */
         {
-            unsigned char data[] = {0x04, 0x00, 0x11,
-                                    0x00, 0x00, /* DescriptorIndex */
-                                    0x00,       /* PixelFormat */
-                                    0x00, 0x00, /* ImageWidthPixels*/
-                                    0x00, 0x00, /* ImageHeightPixels*/
-                                    0x00, 0x00, /* InsetRectangleTopLeftX*/
-                                    0x00, 0x00, /* InsetRectangleTopLeftY*/
-                                    0x00, 0x00, /* InsetRectangleBotRightX*/
-                                    0x00, 0x00, /* InsetRectangleBotRoghtY*/
-                                    0x00, 0x00, 0x00, 0x00,/* RowSize*/
-                                    0x00        /* ImagePixelData Var Length*/
-                                   };
-            iap_send_pkt(data, sizeof(data));
+            /* v116: the cover, decoded and sent in the format asked for (it sent an empty 0x0 image) */
+#ifdef HAVE_ALBUMART
+            unsigned fmt;
+            if (len < 13)
+            {
+                cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                break;
+            }
+            fmt = get_u16(&buf[7]);
+            if (!art_fmt_size(fmt) || get_u32(&buf[9]) != 0 || !trk_info(get_u32(&buf[3])))
+            {
+                cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                break;
+            }
+            if (!art_load(fmt))
+            {
+                cmd_ack(cmd, IAP_ACK_CMD_FAILED);
+                break;
+            }
+            art_send(fmt);
+#else
+            cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+#endif
             break;
         }
         case 0x0011: /* RetTrackArtworkData. See Abobe */
@@ -1803,41 +2014,29 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
              *
              */
         {
+            /* v116: an index outside the list is refused, an untagged file's title is its file name, and a missing
+               tag is "" (it copied from a NULL pointer); a long name is cut at 63 bytes, where it sent the full
+               length's worth of bytes from a 70-byte buffer */
             unsigned char data[70] = {0x04, 0x00, 0xFF};
-            struct mp3entry id3;
-            size_t len;
-            long tracknum = get_u32(&buf[3]);
+            char tmp[64];
+            const char *str = "";
+            size_t n;
 
-            data[2] = cmd + 1;
-            memcpy(&id3, audio_current_track(), sizeof(id3));
-            tracknum += playlist_get_first_index(NULL);
-            if(tracknum >= playlist_amount())
-                tracknum -= playlist_amount();
-            /* If the tracknumber is not the current one,
-               read id3 from disk */
-            if(playlist_next(0) != tracknum)
+            if (len < 7 || !trk_info(get_u32(&buf[3])))
             {
-                struct playlist_track_info info;
-                playlist_get_track_info(NULL, tracknum, &info);
-                /* memset(&id3, 0, sizeof(struct mp3entry)); --get_metadata does this for us */
-                get_metadata(&id3, -1, info.filename);
+                cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                break;
             }
-            /* Return the requested track data */
+            data[2] = cmd + 1;
             switch(cmd)
             {
-                case 0x20:
-                    len = strlcpy((char *)&data[3], id3.title, 64);
-                    iap_send_pkt(data, 4+len);
-                    break;
-                case 0x22:
-                    len = strlcpy((char *)&data[3], id3.artist, 64);
-                    iap_send_pkt(data, 4+len);
-                    break;
-                case 0x24:
-                    len = strlcpy((char *)&data[3], id3.album, 64);
-                    iap_send_pkt(data, 4+len);
-                    break;
+                case 0x20: str = trk_title(tmp, sizeof tmp); break;
+                case 0x22: str = tag_s(trk_id3.artist); break;
+                case 0x24: str = tag_s(trk_id3.album); break;
             }
+            strmemccpy((char *)&data[3], str, 64);
+            n = strlen((char *)&data[3]);
+            iap_send_pkt(data, 4 + n);
             break;
         }
         case 0x0025: /* ReturnIndexedPlayingTrackAlbumName. See 0x0024 Above */
@@ -2162,9 +2361,25 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
              *
              */
         {
-            unsigned char data[] = {0x04, 0x00, 0x2B,
-                                    0x00, 0x00, 0x00, 0x00};
-            iap_send_pkt(data, sizeof(data));
+            /* v116: one picture, at 0 ms, when the track has a cover; none otherwise (it said "one at 0 ms" for
+               every track, and then sent an empty image) */
+            IAP_TX_INIT4(0x04, 0x002B);
+#ifdef HAVE_ALBUMART
+            if (len < 13)
+            {
+                cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                break;
+            }
+            if (!art_fmt_size(get_u16(&buf[7])) || !trk_info(get_u32(&buf[3])))
+            {
+                cmd_ack(cmd, IAP_ACK_BAD_PARAM);
+                break;
+            }
+            IAP_TX_INIT4(0x04, 0x002B);
+            if (get_u16(&buf[9]) == 0 && get_u16(&buf[11]) != 0 && art_exists())
+                IAP_TX_PUT_U32(0);
+#endif
+            iap_send_tx();
             break;
         }
         case 0x002B: /* ReturnTrackArtworkTimes. See Above */
@@ -3169,6 +3384,7 @@ void iap_handlepkt_mode4(const unsigned int len, const unsigned char *buf)
                     break;
                 }
             }
+            break;  /* v116: it fell through to the default and sent a second, "bad parameter" ACK */
         }
         default:
         {

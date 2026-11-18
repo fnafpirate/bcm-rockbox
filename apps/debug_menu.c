@@ -3207,6 +3207,8 @@ static struct {
     bool     co64;
     uint32_t idx, chunk, s_in_chunk, off_in_chunk, stsc_i, spc, next_first;   /* sample cursor */
     uint32_t stts_i, stts_left, stts_delta; uint64_t dts;
+    uint32_t sar_n, sar_d;                              /* v118: pixel aspect (pasp box, else the SPS's VUI); 1:1 if none */
+    uint8_t  sar_src;                                   /* v118: 0 none, 1 pasp, 2 SPS VUI */
 } m4 = { .fd = -1 };
 /* v53: the AAC track (stock route, see ma_trak) */
 static struct {
@@ -3484,6 +3486,15 @@ static bool m4_trak(m4off_t ps, m4off_t pe)
             m4off_t ent = s + 8, cs, ce; uint32_t esz = m4_u32(ent);
             if (m4_u32(ent + 4) != FOURCC('a','v','c','1') || esz < 86 + 8) return false;
             m4.width = m4_u16(ent + 32); m4.height = m4_u16(ent + 34);
+            m4.sar_n = m4.sar_d = 1; m4.sar_src = 0;
+            {   /* v118: an anamorphic file says its pixel shape in a 'pasp' box (ffmpeg: setsar / -aspect) */
+                m4off_t ps2, pe2;
+                if (m4_find(ent + 86, ent + esz, FOURCC('p','a','s','p'), &ps2, &pe2) && pe2 - ps2 >= 8)
+                {
+                    uint32_t h = m4_u32(ps2), v = m4_u32(ps2 + 4);
+                    if (h && v && h <= 1000 && v <= 1000) { m4.sar_n = h; m4.sar_d = v; m4.sar_src = 1; }
+                }
+            }
             if (!m4_find(ent + 86, ent + esz, FOURCC('a','v','c','C'), &cs, &ce) || ce - cs < 7) return false;
             m4.avcc_len = (ce - cs) <= sizeof m4.avcc ? (uint32_t)(ce - cs) : 0;
             if (m4.avcc_len && !m4_rd(cs, m4.avcc, m4.avcc_len)) m4.avcc_len = 0;
@@ -3607,6 +3618,7 @@ static m4off_t m4_moov_s, m4_moov_e;         /* v73: the moov payload (the subti
 static bool ma_trak(m4off_t ps, m4off_t pe);     /* v53: audio track (below) */
 static void ma_rewind(void);
 /* 0 = ok, <0 = reason */
+static void m4_vui_sar(void);
 static int mp4_open(const char *path)
 {
     m4off_t fsz, pos = 0, ps, pe, moov_s = 0, moov_e = 0;
@@ -3742,6 +3754,7 @@ static int mp4_open(const char *path)
                 ticks += (uint64_t)m4_u32(m4.stts + 8 * i) * m4_u32(m4.stts + 8 * i + 4);
             m4_dur_ms = (uint32_t)(ticks * 1000ULL / m4.timescale);
             m4_br = m4_dur_ms ? (uint32_t)((uint64_t)fsz * 8000ULL / m4_dur_ms) : 0;
+            m4_vui_sar();                        /* v118 */
             m4_rewind();
             return 0;
         }
@@ -3842,10 +3855,15 @@ static uint32_t sps_ue(struct sps_bits *r)
     while (!sps_u(r, 1)) { if (r->bad || ++z > 31) { r->bad = true; return 0; } }
     return z ? ((1u << z) - 1) + sps_u(r, z) : 0;
 }
+/* v118: the SPS read past the reference count into the VUI: the pixel aspect and the colour description */
+static struct { int refs; uint32_t sar_n, sar_d; int vfmt, full, prim, trc, matrix; } m4_vui;
 static int m4_sps_refs(void)
 {
-    uint8_t raw[96]; uint32_t i, n = 0, z = 0, j;
+    static const uint8_t sar_tab[17][2] = { {0,0}, {1,1}, {12,11}, {10,11}, {16,11}, {40,33}, {24,11}, {20,11}, {32,11},
+                                            {80,33}, {18,11}, {15,11}, {64,33}, {160,99}, {4,3}, {3,2}, {2,1} };
+    uint8_t raw[192]; uint32_t i, n = 0, z = 0, j;
     struct sps_bits r;
+    m4_vui.refs = -1; m4_vui.sar_n = m4_vui.sar_d = 0; m4_vui.vfmt = m4_vui.full = m4_vui.prim = m4_vui.trc = m4_vui.matrix = -1;
     for (i = 0; i + 3 < m4.ps_len; i++)
         if (m4.ps[i] == 0 && m4.ps[i + 1] == 0 && m4.ps[i + 2] == 1 && (m4.ps[i + 3] & 0x1f) == 7) break;
     if (i + 3 >= m4.ps_len) return -1;
@@ -3873,7 +3891,75 @@ static int m4_sps_refs(void)
         while (c-- && !r.bad) sps_ue(&r);
     }
     j = sps_ue(&r);                                                           /* max_num_ref_frames */
-    return r.bad ? -1 : (int)j;
+    if (r.bad) return -1;
+    m4_vui.refs = (int)j;
+    /* v118: on to the VUI */
+    sps_u(&r, 1); sps_ue(&r); sps_ue(&r);                                     /* gaps, width / height in MBs */
+    if (!sps_u(&r, 1)) sps_u(&r, 1);                                          /* frame_mbs_only, else mb_adaptive */
+    sps_u(&r, 1);                                                             /* direct_8x8_inference */
+    if (sps_u(&r, 1)) { sps_ue(&r); sps_ue(&r); sps_ue(&r); sps_ue(&r); }     /* frame cropping */
+    if (!r.bad && sps_u(&r, 1))                                               /* vui_parameters_present */
+    {
+        if (sps_u(&r, 1))                                                     /* aspect_ratio_info_present */
+        {
+            uint32_t idc = sps_u(&r, 8);
+            if (idc == 255) { m4_vui.sar_n = sps_u(&r, 16); m4_vui.sar_d = sps_u(&r, 16); }
+            else if (idc >= 1 && idc <= 16) { m4_vui.sar_n = sar_tab[idc][0]; m4_vui.sar_d = sar_tab[idc][1]; }
+        }
+        if (sps_u(&r, 1)) sps_u(&r, 1);                                       /* overscan info */
+        if (sps_u(&r, 1))                                                     /* video_signal_type_present */
+        {
+            m4_vui.vfmt = (int)sps_u(&r, 3); m4_vui.full = (int)sps_u(&r, 1);
+            if (sps_u(&r, 1))
+            { m4_vui.prim = (int)sps_u(&r, 8); m4_vui.trc = (int)sps_u(&r, 8); m4_vui.matrix = (int)sps_u(&r, 8); }
+        }
+        if (r.bad) { m4_vui.sar_n = m4_vui.sar_d = 0; m4_vui.vfmt = m4_vui.full = m4_vui.prim = m4_vui.trc = m4_vui.matrix = -1; }
+    }
+    return m4_vui.refs;
+}
+
+/* v118: no 'pasp' box: the pixel aspect from the SPS */
+static void m4_vui_sar(void)
+{
+    if (!m4.sar_src && m4_sps_refs() >= 0 && m4_vui.sar_n && m4_vui.sar_d && m4_vui.sar_n <= 1000 && m4_vui.sar_d <= 1000)
+    { m4.sar_n = m4_vui.sar_n; m4.sar_d = m4_vui.sar_d; m4.sar_src = 2; }
+}
+
+/* v118: the shape the picture is meant to be shown at: the stored width times the pixel aspect */
+static uint32_t m4_disp_w(void)
+{
+    if (!m4.sar_n || !m4.sar_d || m4.sar_n == m4.sar_d) return m4.width;
+    return (uint32_t)(((uint64_t)m4.width * m4.sar_n + m4.sar_d / 2) / m4.sar_d);
+}
+
+/* v118: the pixel aspect from the SPS when the file has no 'pasp' box, and the log lines about shape and colour */
+static void m4_log_picture(void)
+{
+    static const char * const mat[] = { "GBR", "BT.709", "unspecified", "?", "FCC", "BT.601 (625)", "BT.601 (525)",
+                                        "SMPTE 240M", "YCgCo", "BT.2020" };
+    m4_sps_refs();
+    if (m4.sar_n != m4.sar_d)
+    {
+        uint32_t dw = m4_disp_w();
+        BLOG("picture: %ux%u stored, pixel aspect %u:%u (%s) -> shown as %ux%u (%s)", (unsigned)m4.width,
+             (unsigned)m4.height, (unsigned)m4.sar_n, (unsigned)m4.sar_d, m4.sar_src == 1 ? "pasp box" : "H.264 VUI",
+             (unsigned)dw, (unsigned)m4.height,
+             dw * 9 > m4.height * 15 ? "16:9 or wider" : dw * 24 > m4.height * 33 ? "wider than 4:3" : "about 4:3");
+    }
+    else
+        BLOG("picture: %ux%u, square pixels%s", (unsigned)m4.width, (unsigned)m4.height,
+             m4.sar_src ? "" : " (no pixel aspect in the file)");
+    if (m4_vui.matrix >= 0 || m4_vui.full >= 0)
+    {
+        const char *mx = m4_vui.matrix >= 0 && m4_vui.matrix < 10 ? mat[m4_vui.matrix] : "?";
+        BLOG("colour: matrix %s, %s range", m4_vui.matrix >= 0 ? mx : "not given", m4_vui.full == 1 ? "FULL" : "limited (TV)");
+        if (m4_vui.matrix == 1 || m4_vui.full == 1)
+            BLOG("NOTE: TV out (composite / S-video) and the iPod screen use BT.601 limited-range colour; %s%s"
+                 " -- re-encode with -vf \"scale=out_color_matrix=bt601:out_range=tv\" -colorspace smpte170m"
+                 " -color_primaries smpte170m -color_trc smpte170m for exact colours",
+                 m4_vui.matrix == 1 ? "this file is BT.709 (reds / greens a little off)" : "",
+                 m4_vui.full == 1 ? (m4_vui.matrix == 1 ? " and full range (crushed blacks / whites)" : "this file is full range (crushed blacks / whites)") : "");
+    }
 }
 static void m4_log_encoder(void)
 {
@@ -4667,7 +4753,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v115 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v118 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -7888,11 +7974,23 @@ static void bcm_display_probe(void)
 /* v19: mp_region as the stock firmware builds it (rt 0x1f9354): display=0, dest="x y w h", and mode=fill or
    mode=letterbox pixel="1 1" -- those are the ONLY mode strings in the firmware. v18's "dest=fullscreen mode=yuv422i"
    was answered with error=2 "bad parameters". */
+static uint32_t m4_disp_w(void);
 static void bcm_region(const char *when)
 {
-    char cmd[96], resp[256]; int r;
-    snprintf(cmd, sizeof cmd, "mp_region display=0 dest=\"0 0 %d %d\" mode=%s", cfg_region_w, cfg_region_h,
-             cfg_region_mode ? "letterbox pixel=\"1 1\"" : "fill");
+    char cmd[112], resp[256]; int r;
+    long vw = (long)m4_disp_w(), vh = (long)m4.height, sw = cfg_region_w, sh = cfg_region_h;
+    if (!cfg_region_mode && !global_settings.bcm_tv_picture && vw > 0 && vh > 0 &&
+        (vw * sh * 100 > sw * vh * 103 || vw * sh * 103 < sw * vh * 100))
+    {   /* v118: a picture more than 3 % away from the screen's 4:3 (a 16:9 file, or an anamorphic one) is letterboxed
+           to its real shape on the iPod screen (TV Picture = Letterbox, the default); it was stretched to 320x240 */
+        long dw = sw, dh = sw * vh / vw;
+        if (dh > sh) { dh = sh; dw = sh * vw / vh; }
+        dw &= ~1; dh &= ~1;
+        snprintf(cmd, sizeof cmd, "mp_region display=0 dest=\"%ld %ld %ld %ld\" mode=fill", (sw - dw) / 2, (sh - dh) / 2, dw, dh);
+    }
+    else
+        snprintf(cmd, sizeof cmd, "mp_region display=0 dest=\"0 0 %d %d\" mode=%s", cfg_region_w, cfg_region_h,
+                 cfg_region_mode ? "letterbox pixel=\"1 1\"" : "fill");
     BLOG("mp_region (%s)", when);
     bcm_cmd_t0 = current_tick;
     r = bcm_gencmd_watched(cmd, resp, sizeof resp, 4);
@@ -7914,12 +8012,19 @@ static void bcm_tv_enable(bool on)
         else
         {   /* v56 letterbox computed here, for the TV's real shape: the raster is 720 x 480/576 shown as 4:3 (or 16:9 with
                Widescreen TV), so its pixels are not square.  v55's "dest=fullscreen mode=letterbox" assumed square pixels: a
-               4:3 video then filled the 4:3 TV exactly as "fill" did (no visible difference) and was stretched on a 16:9 TV. */
-            int tw = 720, th = global_settings.bcm_tv_signal ? 576 : 480, an = global_settings.bcm_tv_wide ? 16 : 4,
+               4:3 video then filled the 4:3 TV exactly as "fill" did (no visible difference) and was stretched on a 16:9 TV.
+               v118: (1) the video's own pixel aspect (an anamorphic 640x480 16:9 file fills a widescreen TV with all 480
+               lines, where a 640x360 file has 360 lines stretched to 480); (2) the TV's 4:3 / 16:9 picture is the middle 704
+               of the 720 samples (ITU-R BT.601, as DVD players do), so circles stay round -- the 8 samples each side are in
+               the TV's overscan.  "Fill" still uses all 720 x 480/576. */
+            int tw = 720, aw = 704, th = global_settings.bcm_tv_signal ? 576 : 480, an = global_settings.bcm_tv_wide ? 16 : 4,
                 ad = global_settings.bcm_tv_wide ? 9 : 3, dw, dh;
-            dh = (int)((long)an * th * m4.height / ((long)ad * m4.width));     /* full width */
-            dw = tw;
-            if (dh > th) { dh = th; dw = (int)((long)m4.width * tw * ad / ((long)m4.height * an)); }
+            long vw = (long)m4_disp_w(), vh = (long)m4.height;
+            dh = (int)((long)an * th * vh / ((long)ad * vw));                  /* full active width */
+            dw = aw;
+            if (dh > th) { dh = th; dw = (int)(vw * aw * ad / (vh * an)); }
+            if (dw > aw - 8 && dw < aw) dw = aw;                                /* within 1 %: no thin side bars */
+            if (dh > th - 8 && dh < th) dh = th;
             dw &= ~1; dh &= ~1;
             snprintf(cmd, sizeof cmd, "mp_region display=2 dest=\"%d %d %d %d\" mode=fill", (tw - dw) / 2, (th - dh) / 2, dw, dh);
         }
@@ -8175,9 +8280,10 @@ static void bcm_playback_probe(void)
     }
 
     if (cfg_tv >= 0) bcm_tv = cfg_tv;
-    if (!bcm_tv && (cfg_region_when & 1)) bcm_region("before mp_selectplay");
-
     {   int mr = pre != -100 ? pre : mp4_open(video);
+        /* v118: after mp4_open (it was just before it): the iPod-screen placement now depends on the picture's shape */
+        if (mr != 0) { m4.width = m4.height = 0; }
+        if (!bcm_tv && (cfg_region_when & 1)) bcm_region("before mp_selectplay");
         if (mr == 0)
         {
             BLOG("MP4 ok: %ux%u H.264 profile_idc=%u level_idc=%u nal_len=%u timescale=%u samples=%u SPS+PPS=%u B",
@@ -8195,6 +8301,7 @@ static void bcm_playback_probe(void)
                 if (m4.width * m4.height > 640 * 480 || fps10 > 305 || m4.level > 30)
                     BLOG("WARNING: over 640x480 / 30 fps / level 3.0 -- the VideoCore may refuse it or drop frames");
             }
+            m4_log_picture();                           /* v118 */
             m4_log_encoder();                           /* v108 */
             bcm_pds_set_ops(&pds_video_ops); v_live = true;
             if (pre == -100) st_begin(video);           /* v73: subtitles (v78: done by the helper when it ran) */
@@ -8843,7 +8950,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v115, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v118, built %s %s", __DATE__, __TIME__);
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
