@@ -3160,6 +3160,10 @@ static int cfg_recover = 2;                       /* v96: VideoCore recovery att
 static int vc_seeks_boot;
 static int cfg_seek_budget = 110;                 /* v110: 90 -> 110 (deaths at 125-126) */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
+static int cfg_sleep_after_s = 120;               /* v119: a paused video sleeps after this long untouched (0 = never) */
+static int cfg_sleep_off_min = 30;                /* v119: asleep this long = power off (0 = no sleep: power off as before) */
+static int cfg_sleep_32k = 1;                     /* v121: Apple's light sleep (SDRAM self-refresh, 32 kHz, CPU stopped) */
+static long pl_input_tick;                        /* v119: the last button / dock command (the sleep timer counts from it) */
 static bool bcm_warm_run;                         /* v100: this run started on a VideoCore that was kept ready */
 static bool warm_play_logged;                     /* v102: "the picture moves after N s" written for this warm start */
 static bool kp_warm_off;                          /* v102: a warm start failed: no standby again until the iPod restarts */
@@ -4351,6 +4355,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "big_frames")) cfg_big_frames = v;   /* v96 */
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
         else if (!strcmp(p, "keep_min")) cfg_keep_min = v < 1 ? 1 : v;
+        else if (!strcmp(p, "sleep_after_s")) cfg_sleep_after_s = v < 0 ? 0 : v < 10 ? 10 : v;   /* v119 */
+        else if (!strcmp(p, "sleep_off_min")) cfg_sleep_off_min = v < 0 ? 0 : v;
+        else if (!strcmp(p, "sleep_32k")) cfg_sleep_32k = v;
         else if (!strcmp(p, "recover"))  cfg_recover = v;
         else if (!strcmp(p, "seek_budget")) cfg_seek_budget = v;      /* v109: 0 = no limit */
         else if (!strcmp(p, "stock_step_ms")) cfg_stock_step_ms = v > 20 ? v : 20;   /* v114 */
@@ -4753,7 +4760,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v118 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v121 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6885,6 +6892,7 @@ static int vr_drain(char *resp, size_t rn)
     {
         int c = vr_q[vr_r & 15], a = vr_qarg[vr_r & 15];
         vr_r++;
+        pl_input_tick = current_tick;                  /* v119 */
         if (c == VR_VOL_SET) BLOG("  dock: volume set to %d %%", a);
         else BLOG("  dock: %s", c < (int)(sizeof vr_name / sizeof vr_name[0]) ? vr_name[c] : "?");
         av_boost_until = current_tick + 3 * HZ;
@@ -6940,6 +6948,8 @@ static int rc_to_local(int base)
 
 /* returns 1 when the user wants to stop.  The wheel is the volume (v51), never seeking. */
 static long pl_sys_event;                /* v96: SYS_POWEROFF / SYS_REBOOT that arrived during a video */
+static bool sl_ok(void);
+static void sl_arm(const char *why);
 static int bcm_player_input(char *resp, size_t rn)
 {
     int b, base, raw;
@@ -6963,11 +6973,19 @@ static int bcm_player_input(char *resp, size_t rn)
     if (b == SYS_POWEROFF || b == SYS_REBOOT)
     {   /* v96: idle power-off / sleep timer / a held PLAY while a video is up: stop it (the resume point is saved), give the
            display back, then do what was asked (bcm_run) -- before v96 the event was dropped and a paused video stayed up */
+        if (b == SYS_POWEROFF && sl_ok())
+        {   /* v119: like the iPod -- a held PLAY, the idle power-off or the sleep timer puts it to sleep (the video comes
+               back where it was at the next button press; asleep cfg sleep_off_min = 30 minutes, it powers off and the
+               next start continues the video) */
+            sl_arm("power off asked (held PLAY / idle power-off / sleep timer)");
+            return 1;
+        }
         BLOG("  system: %s requested -- stopping the video first", b == SYS_POWEROFF ? "power off" : "reboot");
         pl_sys_event = b;
         return 1;
     }
     if (IS_SYSEVENT(b)) return 0;
+    pl_input_tick = current_tick;                      /* v119 */
     if (qz_on)
     {   /* v88 quiz: MENU = make a guess (the normal MENU handling below: short = back to the quiz, held = TV / iPod);
            PLAY once the frame is up = a hint: 3 s more, muted, then paused again.  Nothing else (seeking, the wheel's
@@ -7237,11 +7255,12 @@ static uint32_t rbm_get(const char *path)
         char *sp = strchr(line, ' ');
         if (!sp) continue;
         *sp = 0;
-        if (!strcmp(sp + 1, path)) { ms = (uint32_t)strtoul(line, NULL, 10); break; }
+        if (!strcmp(sp + 1, path)) { ms = (uint32_t)strtoul(line[0] == '*' ? line + 1 : line, NULL, 10); break; }
     }
     close(fd);
     return ms;
 }
+static bool rbm_boot_flag;               /* v120: rbm_put marks its line "*": the next start plays that video on */
 static void rbm_put(const char *path, uint32_t ms)
 {
     static char old[RBM_MAX][MAX_PATH + 16];
@@ -7253,13 +7272,13 @@ static void rbm_put(const char *path, uint32_t ms)
         {
             char *sp = strchr(line, ' ');
             if (!sp || !strcmp(sp + 1, path)) continue;
-            strlcpy(old[n++], line, sizeof old[0]);
+            strlcpy(old[n++], line[0] == '*' ? line + 1 : line, sizeof old[0]);   /* v120: one flagged line at most */
         }
         close(fd);
     }
     fd = open(RBM_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return;
-    if (ms) fdprintf(fd, "%u %s\n", (unsigned)ms, path);
+    if (ms || rbm_boot_flag) fdprintf(fd, "%s%u %s\n", rbm_boot_flag ? "*" : "", (unsigned)ms, path);
     for (i = 0; i < n; i++) fdprintf(fd, "%s\n", old[i]);
     close(fd);
 }
@@ -7287,6 +7306,207 @@ static void rbm_save(bool finished)
     rbm_put(bcm_play_path, pos);
     fmt_time(t, sizeof t, pos);
     BLOG("  resume point: %s", pos ? t : "cleared");
+}
+
+/* ---- v119/v120: sleep, as the iPod does it ------------------------------------------------------------------------
+   Apple's firmware (25.6.3):
+   * idle timer 0x1d813c: 2 minutes (120000 ms) -- or 10 s (10000) when the display is already off (flag 0x1081e028,
+     kept by 0xb7c64) and the restart is not a user action (caller r1 = 0): something that woke it without a button
+     (charger, dock) lets it fall asleep again after 10 s.  The Sleep Timer runs in 30-minute pieces (0x1d85e8).
+   * light sleep 0xb43dc (event 16 "Enter Light Sleep" from 0x1ee8d0, which first suspends the movie app 0x246168):
+     the wheel controller set to its sleep mode (0x266b18(1) -> wheel command 0x8000052a, 0x8001052a awake), the
+     display off (0xb7c64(0)), the codec powered down (0x111cd8), the PMU to its low-power mode (0x265e54(4),
+     0x2840fc), TIMER1 / TIMER2 stopped (0x7f8; restored by 0x668), the clock manager to its sleep rate (it has a
+     32 kHz mode: 0x1b8620), the CPU waits for an interrupt (wheel 0x283e20 / GPIO / PMU).  The RAM keeps everything.
+   * deep sleep: when it falls asleep without a user action, 0x1ee8d0 asks (0x1eb900 -> 0xb49a0) for message 0x94 to
+     the power task at now + [0x1081e008] minutes (0x88454 adds minutes): 840 = 14 hours (1080 = 18 h on some models,
+     0xb30ec).  0x94 -> event 18 "Enter Deep Sleep" -> 0xb34f4: the PMU cuts the power; the next start is a full boot.
+   Here (v120): the video stops (its point stays in RAM), the VideoCore and panel off, the backlight off, the codec off
+   (Rockbox's pop-free sequence), the drive in standby then powered off, the CPU on 24 MHz with the PLL off, the kernel
+   tick 100 -> 4 Hz (Rockbox reads the buttons from it), and the thread waits.  No disk write.  The 32 kHz clock is not
+   used: Apple's code that keeps the SDRAM refreshed at that rate was not found, and a wrong guess loses the RAM.
+   A button, the wheel or a dock command wakes it: everything back, the same video continues.  A charger / dock event
+   leaves it asleep (Apple: awake 10 s with the screen off, then asleep again).  After cfg sleep_off_min (30) minutes,
+   counted on the PMU's clock: the resume point is written with a "*" (the one write) and it powers off; the next start
+   plays that video on and clears the "*". */
+static bool sl_want, sl_replay, sl_force;
+static uint32_t sl_pos;
+static char sl_path[MAX_PATH];
+static bool sl_ok(void)
+{
+    int bl = battery_level();
+    return cfg_sleep_off_min > 0 && bcm_play_path && !qz_on && (bl < 0 || bl > 10);
+}
+static void sl_arm(const char *why)
+{
+    char t[16];
+    sl_want = true;
+    sl_pos = rs_state == 1 ? rs_ms : pl_pos_now();
+    strlcpy(sl_path, bcm_play_path, sizeof sl_path);
+    fmt_time(t, sizeof t, sl_pos);
+    BLOG("  SLEEP (%s): the video stops at %s, the iPod sleeps (power off after %d min asleep)", why, t, cfg_sleep_off_min);
+}
+/* v120: the kernel tick, 100 Hz awake; 4 Hz asleep (Apple stops TIMER1 / TIMER2 outright, 0x7f8 / 0x668: Rockbox's
+   button driver reads the buttons from the tick, so it keeps a slow one -- a press is seen within 0.25 s) */
+static void sl_tick_hz(int hz)
+{
+    TIMER1_CFG = 0xc0000000 | (1000000 / hz - 1);
+}
+static time_t sl_now(void)
+{
+    return mktime(get_time());                         /* the PMU's clock: the slowed tick does not count real time */
+}
+extern int pp_sdram_sleep(void);                       /* v121: firmware/target/arm/pp/system-pp502x.c */
+static unsigned sl_n_deep, sl_n_wakes, sl_n_fail;       /* v121: the last sleep, for the next log */
+static int sl_last_mode = -1;
+static void sl_report_log(void)
+{
+    if (sl_last_mode < 0) return;
+    BLOG("last sleep: %s; %u self-refresh sleeps, %u wakes, %u refused", sl_last_mode == 2 ? "Apple light sleep (32 kHz, "
+         "SDRAM self-refresh)" : "slow tick (USB / charger, or sleep_32k=0)", sl_n_deep, sl_n_wakes, sl_n_fail);
+    sl_last_mode = -1;
+}
+static void sl_tick_us(unsigned long us)
+{
+    TIMER1_CFG = 0xc0000000 | (us - 1);
+}
+static void bcm_sleep(void)
+{
+    long ev = 0, off = 0;
+    bool woke = false, usb = false, deep = cfg_sleep_32k != 0;
+    time_t t0;
+    sl_n_deep = sl_n_wakes = sl_n_fail = 0;
+    /* what Apple's light sleep (0xb43dc) switches off, in Rockbox's terms; nothing is written to the disk */
+    backlight_off();
+    lcd_sleep();                                       /* the VideoCore and the panel off */
+    audiohw_close();                                   /* the codec off, its pop-free sequence (Apple: 0x111cd8) */
+    ata_set_ssd_poweroff(1);                           /* the drive: standby, then its power off a second later */
+    storage_sleepnow();
+    sleep(2 * HZ);                                     /* ... at the normal tick rate */
+    cpu_idle_mode(true);                               /* 24 MHz, PLL off */
+    t0 = sl_now();
+    button_clear_queue();
+    sl_tick_hz(4);
+    while (1)
+    {
+        time_t now;
+        bool deep_now = deep && !usb_inserted() && !charger_inserted() &&
+                        (PROC_CTL(COP) & PROC_SLEEP) && vr_r == vr_w;
+        reset_poweroff_timer();                        /* Rockbox's own idle power-off waits for this one */
+        if (vr_r != vr_w) { vr_r = vr_w; woke = true; break; }   /* a dock's play / pause: wake */
+        if (deep_now && button_get_w_tmo(0) == BUTTON_NONE)
+        {   /* v121: Apple's light sleep.  The tick (TIMER1) is the only timer left: once a minute (every 2 s with Hold
+               on, so Hold off is noticed) it wakes the CPU for the power-off deadline; the wheel / buttons wake it at
+               once.  After any wake, 40 ms at the normal tick so the button driver reads what woke it. */
+            sl_tick_us(button_hold() ? 2000000UL : 60000000UL);
+            if (pp_sdram_sleep() == 0) { sl_n_deep++; sl_n_wakes++; }
+            else
+            {
+                sl_n_fail++;
+                if (sl_n_fail >= 3) deep = false;      /* the SDRAM does not report self-refresh: the slow tick only */
+            }
+            sl_tick_hz(HZ);
+            sleep(4);
+            sl_tick_hz(4);
+            ev = button_get_w_tmo(0);
+        }
+        else
+            ev = button_get_w_tmo(4);                  /* 4 ticks = 1 s asleep */
+        if (ev == BUTTON_NONE)
+        {
+            now = sl_now();
+            if (now < t0 || now - t0 >= (time_t)cfg_sleep_off_min * 60) break;   /* Apple: deep sleep after 14 h */
+            continue;
+        }
+        if (ev == SYS_USB_CONNECTED) { usb = true; break; }
+        if (ev == SYS_POWEROFF || ev == SYS_REBOOT) { off = ev; break; }   /* the battery, or a held PLAY */
+        if (IS_SYSEVENT(ev)) continue;
+        if (ev & (BUTTON_REL | BUTTON_REPEAT)) continue;
+        woke = true;            /* any button or a turn of the wheel: Rockbox's button driver lights the screen for both anyway */
+        break;
+    }
+    sl_last_mode = sl_n_deep ? 2 : 1;
+    sl_tick_hz(HZ);
+    cpu_idle_mode(false);
+    ata_set_ssd_poweroff(global_settings.ssd_poweroff);
+    if (woke || usb)
+    {
+        long w = current_tick;
+        audiohw_preinit();                             /* the codec back: Rockbox's power-up sequence, then its settings */
+        lcd_awake();
+        backlight_on();
+        lcd_update();
+        sleep(HZ / 4);
+        audiohw_postinit();
+        sound_settings_apply();
+        lineout_set(global_settings.lineout_active);
+        while (button_status() && current_tick - w < 3 * HZ) sleep(HZ / 50);   /* the waking press does nothing else */
+        button_clear_queue();
+        sl_replay = woke;
+        if (usb) default_event_handler(SYS_USB_CONNECTED);
+        return;
+    }
+    /* deep sleep = off (Apple: power task message 0x94 -> 0xb34f4, the PMU cuts the power).  The one write of the whole
+       sleep: the resume point, marked for the next start */
+    rbm_boot_flag = true;
+    rbm_put(sl_path, sl_pos);
+    rbm_boot_flag = false;
+    default_event_handler(off == SYS_REBOOT ? SYS_REBOOT : SYS_POWEROFF);
+    /* still here: Rockbox did not shut down (clean_shutdown refused) -- awake in the browser, nothing to continue */
+    rbm_put(sl_path, sl_pos);
+    audiohw_preinit();
+    lcd_awake();
+    backlight_on();
+    lcd_update();
+    sleep(HZ / 4);
+    audiohw_postinit();
+    sound_settings_apply();
+    lineout_set(global_settings.lineout_active);
+}
+/* the same video again after a wake, at the point it slept */
+static bool bcm_run(const char *play_path);
+static bool bcm_run_sl(const char *path)
+{
+    bool r = bcm_run(path);
+    while (sl_replay)
+    {
+        sl_replay = false;
+        bcm_video_finished = false;
+        bcm_video_next_request = 0;
+        bcm_resume_ms = sl_pos;
+        r = bcm_run(path);
+    }
+    return r;
+}
+/* v119: at start-up (apps/root_menu.c): a video that slept until the power went off plays on from where it was.
+   Returns the video played (for the file browser to show it), or NULL. */
+bool bcm_video_play(const char *path);
+const char *bcm_boot_resume(void)
+{   /* v120: the "*" line of the resume list (v119 had its own file, written at every sleep and removed at every wake) */
+    static char path[MAX_PATH];
+    char line[MAX_PATH + 16];
+    int fd = open(RBM_PATH, O_RDONLY);
+    path[0] = 0;
+    if (fd < 0) return NULL;
+    if (read_line(fd, line, sizeof line) > 0 && line[0] == '*')
+    {
+        char *sp = strchr(line, ' ');
+        if (sp)
+        {
+            *sp = 0;
+            sl_pos = (uint32_t)strtoul(line + 1, NULL, 10);
+            strlcpy(path, sp + 1, sizeof path);
+        }
+    }
+    close(fd);
+    if (!path[0]) return NULL;
+    rbm_put(path, sl_pos);                             /* the flag off first: once only, even if the video crashes */
+    if (!file_exists(path)) return NULL;
+    strlcpy(sl_path, path, sizeof sl_path);
+    sl_force = true;
+    bcm_video_play(path);
+    sl_force = false;
+    return path;
 }
 
 /* ---- v96: recovery.  A VideoCore that stops (no frame request for hang_s while playing, four player commands in a row
@@ -7476,6 +7696,7 @@ static void bcm_video_run(int secs)
     pl_fail_run = 0;
     bool was_paused = false, pause_saved = false;
     long pause_t = current_tick;
+    pl_input_tick = current_tick;                      /* v119 */
     BLOG("  buffering %s, frame buffer %u KB", ra_adaptive ? "adaptive" : "fixed", (unsigned)(m4_raw_max / 1024));
     while (TIME_BEFORE(current_tick, end) && !v_stop)
     {
@@ -7486,6 +7707,13 @@ static void bcm_video_run(int secs)
             was_paused = pl_paused; pause_t = current_tick; pause_saved = false;
         }
         if (pl_paused && !qz_on && !pause_saved && current_tick - pause_t > 5 * HZ) { pause_saved = true; rbm_save(false); }
+        if (cfg_sleep_after_s > 0 && pl_paused && !sc_active && sl_ok() &&
+            TIME_AFTER(current_tick, pause_t + cfg_sleep_after_s * HZ) &&
+            TIME_AFTER(current_tick, pl_input_tick + cfg_sleep_after_s * HZ))
+        {   /* v119: the iPod's 2 minutes paused and untouched -> sleep */
+            sl_arm("paused and untouched");
+            break;
+        }
         if (vr_status_asked && current_tick - vr_status_asked < 5 * HZ && !sc_active
             && (!vr_el_tick || current_tick - vr_el_tick > 2 * HZ))
             pl_status();                               /* v63: a dock shows the position: keep it fresh */
@@ -7729,7 +7957,7 @@ static void bcm_video_run(int secs)
     bcm_video_running = false;                         /* v63 */
     sc_remote = false;
     bcm_sync_every = 0; bcm_sync_startup = false;      /* v108 */
-    if (!rc_want && !v_fallback) rbm_save(bcm_video_finished);   /* v96 */
+    if (!rc_want && !v_fallback && !sl_want) rbm_save(bcm_video_finished);   /* v96; v120: not for a sleep (RAM keeps it) */
     if (rs_vol >= 0) { av_set_vol(rs_vol); rs_vol = -1; }
     rs_state = 0;
     av_close();
@@ -8535,6 +8763,12 @@ static void rbm_offer(const char *path, bool ask_ok)
     int mode = global_settings.bcm_video_resume;
     uint32_t ms;
     bcm_resume_ms = 0;
+    if (sl_force)
+    {   /* v119: the start after a sleep that ended in power off: where it was, no question */
+        sl_force = false;
+        bcm_resume_ms = sl_pos;
+        return;
+    }
     if (!mode || qz_on) return;
     ms = rbm_get(path);
     if (ms < 10000) return;
@@ -8572,7 +8806,7 @@ bool bcm_video_play(const char *path)
     else if (bcm_tv && vo == 0 && dock != 1)
         splash(HZ, ID2P(LANG_VIDEO_ON_TV_NOTICE));    /* v78: Video Out is On: say so (the iPod's screen stays dark) */
     rbm_offer(path, true);                             /* v96 */
-    return bcm_run(path);
+    return bcm_run_sl(path);
 }
 /* v63: the dock asked for the next / previous video: same TV choice, no question */
 bool bcm_video_play_again(const char *path)
@@ -8580,7 +8814,7 @@ bool bcm_video_play_again(const char *path)
     bcm_video_next_request = 0;
     bcm_video_finished = false;
     rbm_offer(path, false);                            /* v96 */
-    return bcm_run(path);
+    return bcm_run_sl(path);
 }
 /* v88: the movie quiz (apps/plugins/movie_quiz.c): muted, from `permille` of the film, paused on that frame */
 bool bcm_video_quiz(const char *path, int permille, bool first)
@@ -8950,7 +9184,8 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v118, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v121, built %s %s", __DATE__, __TIME__);
+    sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
              iap_dock_tv_choice(), global_settings.bcm_video_out, bcm_tv ? "on" : "off");
@@ -9237,7 +9472,7 @@ out:
         if (bcm_play_path)
         {
             av_48k_end();                                      /* v106: before standby or hand-back */
-            if (kp_wanted() && run_ok && !pl_sys_event && kp_enter())
+            if (kp_wanted() && run_ok && !pl_sys_event && !sl_want && kp_enter())
                 BLOG("player: the VideoCore stays on standby while the browser stays in the video folders");
             else bcm_handback();
         }
@@ -9245,8 +9480,13 @@ out:
         tick_remove_task(bcm_wd_tick);
         bcm_log_close();
         bcm_sync_every = 0; bcm_player_mode = false; bcm_play_path = NULL;
-        if (!(kp_hosted && kp_tv)) backlight_on();
+        if (!sl_want && !(kp_hosted && kp_tv)) backlight_on();
         lcd_update();                                  /* the frame buffer still holds the browser exactly as it was */
+        if (sl_want)
+        {   /* v119 */
+            sl_want = false;
+            bcm_sleep();
+        }
         if (pl_sys_event)
         {   /* v96: the power off / reboot that came during the video */
             long e = pl_sys_event; pl_sys_event = 0;

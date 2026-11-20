@@ -670,3 +670,146 @@ int system_memory_guard(int newmode)
     (void)newmode;
     return 0;
 }
+
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+/* bcm overlay v121: Apple's light sleep, as its firmware 25.6.3 does it (IRAM routine at 0x4000045c, copied from
+   the image at rt 0x71619c + 0x45c, called from the light-sleep code 0xb43dc through the veneer 0x843cc):
+     IRQ/FIQ off; DEV_INIT2, DEV_EN, DEV_EN2, CACHE_PRIORITY, PLL_CONTROL, CLOCK_SOURCE saved;
+     CLOCK_SOURCE slot 1 = 24 MHz and selected; PLL to bypass (0x0a000000);
+     XMB_RAM_CFG (0x7000003c) |= 0x400000 = SDRAM self-refresh request, wait for bit 30 (in self-refresh);
+     DEV_INIT2 |= 0x40, CACHE_PRIORITY = 0x3f, DEV_EN = 0xc0010108 (wheel, USB0 and three more), DEV_EN2 = 0;
+     CLOCK_SOURCE select 0 (the 32 kHz clock), PLL_CONTROL = 0x02000000 (PLL off);
+     CPU_CTL = PROC_SLEEP: stopped until an enabled interrupt (wheel, GPIO, ...);
+     the same steps backwards: 24 MHz, devices back, self-refresh off (wait for bit 30 to clear), PLL back,
+     2 x 250 us + 10 ms waits (CPU_CTL count modes), CLOCK_SOURCE restored, interrupts back.
+   Differences here: the COP is left alone (Rockbox keeps it in PROC_SLEEP; Apple halts it with COP_CTL 0x40000000),
+   DEV_SYSTEM stays enabled (the timers: Rockbox's tick wakes the CPU for the power-off deadline), and both
+   self-refresh waits give up after a bounded count instead of spinning forever: the routine then undoes what it did
+   and returns 1 (no sleep happened).  Nothing between the self-refresh request and its release touches the SDRAM:
+   the code and its constants are in IRAM, everything else is in registers (the pushes happen before).
+   Returns 0 after a sleep, 1 if the SDRAM did not report self-refresh. */
+int pp_sdram_sleep(void) ICODE_ATTR __attribute__((naked, noinline));
+int pp_sdram_sleep(void)
+{
+    asm volatile (
+        "stmfd  sp!, {r4-r11, lr}               \n"
+        "mrs    r2, cpsr                        \n"
+        "orr    r0, r2, #0xc0                   \n"
+        "msr    cpsr_c, r0                      \n"   /* IRQ + FIQ off */
+        "mov    r12, #0x70000000                \n"
+        "ldr    r6, [r12, #0x20]                \n"   /* DEV_INIT2 */
+        "mov    r1, #0x60000000                 \n"
+        "orr    r1, r1, #0x6000                 \n"   /* 0x60006000 */
+        "ldr    lr, [r1, #0x0c]                 \n"   /* DEV_EN */
+        "ldr    r4, [r1, #0x10]                 \n"   /* DEV_EN2 */
+        "ldr    r5, [r1, #0x44]                 \n"   /* CACHE_PRIORITY */
+        "ldr    r7, [r1, #0x34]                 \n"   /* PLL_CONTROL */
+        "ldr    r8, [r1, #0x20]                 \n"   /* CLOCK_SOURCE */
+        "orr    r3, r1, #0x1000                 \n"   /* 0x60007000 CPU_CTL */
+        "mov    r9, #0x48000000                 \n"
+        "orr    r9, r9, #0x0f                   \n"   /* wait 15 clocks */
+        "ldr    r0, [r1, #0x20]                 \n"
+        "bic    r0, r0, #0xf                    \n"
+        "orr    r0, r0, #2                      \n"
+        "str    r0, [r1, #0x20]                 \n"   /* slot 1 = 24 MHz */
+        "ldr    r0, [r1, #0x20]                 \n"
+        "bic    r0, r0, #0xf0000000             \n"
+        "orr    r0, r0, #0x10000000             \n"
+        "str    r0, [r1, #0x20]                 \n"   /* slot 1 selected */
+        "str    r9, [r3]                        \n"
+        "mov    r10, #0x0a000000                \n"
+        "str    r10, [r1, #0x34]                \n"   /* PLL bypassed */
+        "mov    r0, #0x42000000                 \n"
+        "str    r0, [r3]                        \n"
+        "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
+        "ldr    r10, [r12, #0x3c]               \n"
+        "orr    r10, r10, #0x400000             \n"
+        "str    r10, [r12, #0x3c]               \n"   /* SDRAM: self-refresh request */
+        "mov    r11, #0x100000                  \n"   /* ~1M polls: far more than it needs */
+    "1:                                         \n"
+        "ldr    r10, [r12, #0x3c]               \n"
+        "tst    r10, #0x40000000                \n"
+        "bne    2f                              \n"
+        "subs   r11, r11, #1                    \n"
+        "bne    1b                              \n"
+        /* no self-refresh: undo, report */
+        "ldr    r10, [r12, #0x3c]               \n"
+        "bic    r10, r10, #0x400000             \n"
+        "str    r10, [r12, #0x3c]               \n"
+        "str    r7, [r1, #0x34]                 \n"
+        "str    r8, [r1, #0x20]                 \n"
+        "str    r9, [r3]                        \n"
+        "msr    cpsr_c, r2                      \n"
+        "mov    r0, #1                          \n"
+        "ldmfd  sp!, {r4-r11, pc}               \n"
+    "2:                                         \n"
+        "mov    r0, #0x41000000                 \n"
+        "orr    r0, r0, #0x0a                   \n"
+        "str    r0, [r3]                        \n"   /* wait 10 ms */
+        "ldr    r0, [r12, #0x20]                \n"
+        "orr    r0, r0, #0x40                   \n"
+        "str    r0, [r12, #0x20]                \n"   /* DEV_INIT2 |= 0x40 */
+        "mov    r0, #0x3f                       \n"
+        "str    r0, [r1, #0x44]                 \n"   /* CACHE_PRIORITY */
+        "mov    r0, #0xc0000000                 \n"
+        "orr    r0, r0, #0x10000                \n"
+        "orr    r0, r0, #0x100                  \n"
+        "orr    r0, r0, #0x0c                   \n"   /* 0xc001010c: Apple's 0xc0010108 + DEV_SYSTEM */
+        "str    r0, [r1, #0x0c]                 \n"
+        "mov    r0, #0                          \n"
+        "str    r0, [r1, #0x10]                 \n"   /* DEV_EN2 = 0 */
+        "ldr    r0, [r1, #0x20]                 \n"
+        "bic    r0, r0, #0xf0000000             \n"
+        "str    r0, [r1, #0x20]                 \n"   /* the 32 kHz clock */
+        "nop\n nop\n nop\n nop\n"
+        "str    r9, [r3]                        \n"
+        "mov    r10, #0x02000000                \n"
+        "str    r10, [r1, #0x34]                \n"   /* PLL off */
+        "mov    r10, #0x80000000                \n"
+        "str    r10, [r3]                       \n"   /* PROC_SLEEP until an interrupt */
+        "nop\n nop\n nop\n nop\n"
+        /* awake */
+        "mov    r10, #0x0a000000                \n"
+        "str    r10, [r1, #0x34]                \n"
+        "mov    r10, #0x48000000                \n"
+        "orr    r10, r10, #0x13                 \n"
+        "str    r10, [r3]                       \n"   /* wait 19 clocks */
+        "ldr    r10, [r1, #0x20]                \n"
+        "bic    r10, r10, #0xf0000000           \n"
+        "orr    r10, r10, #0x10000000           \n"
+        "str    r10, [r1, #0x20]                \n"   /* 24 MHz */
+        "str    r9, [r3]                        \n"
+        "str    lr, [r1, #0x0c]                 \n"
+        "str    r4, [r1, #0x10]                 \n"
+        "str    r5, [r1, #0x44]                 \n"
+        "ldr    r10, [r12, #0x20]               \n"
+        "bic    r10, r10, #0x40                 \n"
+        "str    r10, [r12, #0x20]               \n"
+        "ldr    r10, [r12, #0x3c]               \n"
+        "bic    r10, r10, #0x400000             \n"
+        "str    r10, [r12, #0x3c]               \n"   /* SDRAM: self-refresh off */
+        "str    r7, [r1, #0x34]                 \n"   /* PLL as it was */
+        "mov    r10, #0x42000000                \n"
+        "orr    r10, r10, #0xfa                 \n"
+        "str    r10, [r3]                       \n"
+        "str    r10, [r3]                       \n"   /* 2 x 250 us */
+        "mov    r11, #0x100000                  \n"
+    "3:                                         \n"
+        "ldr    r10, [r12, #0x3c]               \n"
+        "tst    r10, #0x40000000                \n"
+        "beq    4f                              \n"
+        "subs   r11, r11, #1                    \n"
+        "bne    3b                              \n"
+    "4:                                         \n"
+        "mov    r10, #0x41000000                \n"
+        "orr    r10, r10, #0x0a                 \n"
+        "str    r10, [r3]                       \n"   /* 10 ms */
+        "str    r8, [r1, #0x20]                 \n"   /* CLOCK_SOURCE as it was */
+        "str    r9, [r3]                        \n"
+        "str    r6, [r12, #0x20]                \n"   /* DEV_INIT2 as it was */
+        "msr    cpsr_c, r2                      \n"
+        "mov    r0, #0                          \n"
+        "ldmfd  sp!, {r4-r11, pc}               \n"
+    );
+}
+#endif

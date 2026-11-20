@@ -946,6 +946,18 @@ void root_menu(void)
 
     push_current_activity(ACTIVITY_MAINMENU);
     next_screen = root_menu_setup_screens();
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    {   /* bcm overlay v119: a video that slept until the iPod powered off plays on from where it was, and the file
+           browser then shows it (apps/debug_menu.c) */
+        extern const char *bcm_boot_resume(void);
+        const char *v = bcm_boot_resume();
+        if (v)
+        {
+            set_current_file(v);
+            next_screen = GO_TO_FILEBROWSER;
+        }
+    }
+#endif
 
     while (true)
     {
