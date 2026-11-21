@@ -94,6 +94,10 @@
 #include "audio_thread.h"
 #include "playback.h"
 #include "tdspeed.h"
+#ifdef IPOD_VIDEO
+#include "bmp.h"                 /* bcm overlay v122: show_logo_user() */
+#include "jpeg_load.h"
+#endif
 #if defined(HAVE_RECORDING) && !defined(SIMULATOR)
 #include "pcm_record.h"
 #endif
@@ -294,6 +298,48 @@ int show_logo_boot( void )
 #endif
     return 0;
 }
+
+#ifdef IPOD_VIDEO
+/* bcm overlay v122: your own start-up picture.  The Apple logo before it is not on the disk: it is the "logo"
+ * image in the iPod's flash chip, which the boot ROM draws before it even starts the disk (checked in the ROM:
+ * the disk's image directory is read only after the logo is up).  Rockbox's own logo is drawn before the disk is
+ * mounted, so this picture takes its place the moment the disk is mounted and stays up until the menu (or the
+ * resumed video) is drawn.  /.rockbox/boot_logo.jpg (baseline JPEG) or /.rockbox/boot_logo.bmp, any size: shrunk
+ * to fit the screen, centred, the rest filled with the colour of its top-left pixel (as the boot ROM does). */
+static void INIT_ATTR show_logo_user(void)
+{
+    static const char * const names[] = {
+        ROCKBOX_DIR "/boot_logo.jpg", ROCKBOX_DIR "/boot_logo.jpeg", ROCKBOX_DIR "/boot_logo.bmp" };
+    /* + decoder and scaler room (a big photo is decoded at 1/2..1/8 size, then scaled down) */
+    const int size = LCD_WIDTH * LCD_HEIGHT * sizeof(fb_data) + JPEG_DECODE_OVERHEAD + 128 * 1024;
+    for (unsigned i = 0; i < ARRAYLEN(names); i++)
+    {
+        if (!file_exists(names[i]))
+            continue;
+        int h = core_alloc(size);
+        if (h <= 0)
+            return;
+        core_pin(h);
+        struct bitmap bm = { .width = LCD_WIDTH, .height = LCD_HEIGHT, .data = core_get_data(h) };
+        const int fmt = FORMAT_NATIVE | FORMAT_DITHER | FORMAT_RESIZE | FORMAT_KEEP_ASPECT;
+        int rc = (i < 2) ? read_jpeg_file(names[i], &bm, size, fmt, NULL)
+                         : read_bmp_file(names[i], &bm, size, fmt, NULL);
+        if (rc > 0 && bm.width > 0 && bm.height > 0 && bm.width <= LCD_WIDTH && bm.height <= LCD_HEIGHT)
+        {
+            const fb_data *p = (const fb_data *)bm.data;
+            unsigned bg = lcd_get_background();
+            lcd_set_background(FB_UNPACK_SCALAR_LCD(p[0]));
+            lcd_clear_display();
+            lcd_bitmap(p, (LCD_WIDTH - bm.width) / 2, (LCD_HEIGHT - bm.height) / 2, bm.width, bm.height);
+            lcd_update();
+            lcd_set_background(bg);
+        }
+        core_unpin(h);
+        core_free(h);
+        return;
+    }
+}
+#endif
 
 #ifdef HAVE_DIRCACHE
 static int INIT_ATTR init_dircache(bool preinit)
@@ -708,6 +754,10 @@ static void init(void)
 #endif
         }
     }
+
+#ifdef IPOD_VIDEO
+    show_logo_user();            /* bcm overlay v122 */
+#endif
 
     pcm_init();
     dsp_init();

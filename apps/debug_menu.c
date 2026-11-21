@@ -147,6 +147,7 @@
 #include "rbunicode.h"
 #include "bcm_subs.h"                     /* v73: soft subtitles */
 #include "bcm_dock.h"                     /* v74: docks */
+#include "bcm_cab2cav.h"                  /* v123: CABAC -> CAVLC */
 #endif
 
 #if defined(HIBY_LINUX) && !defined(SIMULATOR)
@@ -2927,6 +2928,10 @@ extern void bcm_lcd_set_hosted(void (*upd)(int, int, int, int), void (*slp)(void
 #define BCM_TESTFILE_PATH BCM_VC_ROOT "/../../testfile.txt"   /* -> /.rockbox/testfile.txt: first line = video path */
 
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
+/* v124: the CABAC tests (Debug > CABAC tests): log file, settings and a header line for one run */
+static const char *ct_log_path;
+static int ct_cop = -1, ct_escape = -1, ct_tv = -1;
+static char ct_header[120];
 static int bcm_log_fd = -1;
 static bool bcm_vc_flat;               /* v56: the VideoCore files are in /.rockbox/VideoCore/ */
 /* v56: the log file is overwritten in place (no truncate + new clusters: on the 2 TB FAT32 volume v55 spent 0.8 s before the
@@ -2934,6 +2939,12 @@ static bool bcm_vc_flat;               /* v56: the VideoCore files are in /.rock
 static void bcm_log_open(void)
 {
     bcm_log_fd = -1;
+    if (ct_log_path)
+    {   /* v124: a CABAC test run writes its own log, whatever the Debug Log setting says */
+        bcm_log_fd = open(ct_log_path, O_WRONLY | O_CREAT, 0666);   /* a wake-up replay adds to the same file */
+        if (bcm_log_fd >= 0) lseek(bcm_log_fd, 0, SEEK_END);
+        return;
+    }
     if (!global_settings.bcm_debug_log)
         return;                                 /* v89: Settings > General Settings > System > Debug Log is off */
     bcm_log_fd = open(BCM_LOG_PATH, O_WRONLY);
@@ -3532,15 +3543,19 @@ static bool m4_trak(m4off_t ps, m4off_t pe)
     return have[0] && have[1] && have[2] && have[3] && have[4] && m4.stsz_n && m4.stts_n && m4.stsc_n && m4.stco_n;
 }
 
+static uint32_t m4_gen;                           /* v123: bumped by every cursor jump (prefetch check) */
 static void m4_rewind(void)
 {
+    m4_gen++;
     m4.idx = 0; m4.chunk = 1; m4.s_in_chunk = 0; m4.off_in_chunk = 0; m4.stsc_i = 0;
     m4.spc = m4_u32(m4.stsc + 4); if (!m4.spc) m4.spc = 1;
     m4.next_first = m4.stsc_n > 1 ? m4_u32(m4.stsc + 12) : 0xffffffffu;
     m4.stts_i = 0; m4.stts_left = m4_u32(m4.stts); m4.stts_delta = m4_u32(m4.stts + 4); m4.dts = 0;
 }
 
-static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; m4c_reset(); ra_free(); m4_big_free(); }
+static void c2c_close(void);
+static void c2c_setup(void);
+static void m4_close(void) { if (m4.fd >= 0) close(m4.fd); m4.fd = -1; m4c_reset(); ra_free(); c2c_close(); m4_big_free(); }
 
 /* v42: random access, the way the stock player does it (ARM positions its demuxer on a key frame, then sends
    "mp_seek <ms>"; the VC flushes and answers with PDS 0x43 {session, ms}; the stock 0x43 handler (rt 0x20b304)
@@ -3606,6 +3621,7 @@ static void m4_seek_sample(uint32_t k)
         break;
     }
     m4.idx = k;
+    m4_gen++;                                       /* v123 */
     {   uint64_t t = 0; uint32_t base = 0;            /* stts cursor */
         for (i = 0; i < m4.stts_n; i++)
         {
@@ -3760,23 +3776,310 @@ static int mp4_open(const char *path)
             m4_br = m4_dur_ms ? (uint32_t)((uint64_t)fsz * 8000ULL / m4_dur_ms) : 0;
             m4_vui_sar();                        /* v118 */
             m4_rewind();
+            c2c_setup();                         /* v123 */
             return 0;
         }
     m4_close();
     return -4;                                   /* no usable H.264 (avc1) video track */
 }
 
-/* Next video sample as Annex B in m4_out. Returns its length, 0 at end of stream, -1 for a sample
-   that was skipped (too big / unreadable -- cursor still advances so the caller can just retry). */
-static int m4_next(uint32_t *ts_ms, bool *key)
+/* ---- v123: Main-profile videos coded with CABAC.  The VideoCore's decoder (h264dec.vll, 25.6.3) reads only CAVLC
+   (its macroblock reader has the CAVLC tables and no CABAC code; it accepts profile_idc 77 in the SPS).  bcm_cab2cav
+   rewrites every slice from CABAC into CAVLC on the ARM: the same syntax values, so the pictures are bit-identical to the
+   original, about 10-15 % more data for the VideoCore.  I and P slices only: B-frames, weighted prediction, interlace
+   and High-profile tools are refused (the log says so).  The PPS (entropy_coding_mode_flag) is rewritten in the avcC
+   record and the Annex B copy before the stream info is sent.  The ARM stays at full clock while such a video plays;
+   the log gets the time per frame every 10 s ("cabac:" lines).  cfg cabac=0: no transcoding (as before). */
+static int cfg_cabac = 1;
+static int cfg_cabac_escape = 0;               /* 1: oversized levels with level_prefix 16 (if the VideoCore reads it) */
+static int c2c_h = -1;
+static c2c_t *c2c;
+static uint8_t *c2c_tmp, *c2c_dst, *c2c_src[2];  /* RBSP scratch, output, and the two samples the COP works on */
+static uint32_t c2c_tmp_max, c2c_cap;
+static bool c2c_on, c2c_failed, c2c_cop_on;
+static int cfg_cabac_cop = 1;                   /* 1: transcode on the COP, one frame ahead; 0: on the CPU when asked */
+static bool c2c_busy, c2c_pend;
+static int m4_fetch(uint8_t *buf, uint32_t *psize, uint32_t *ts_ms, uint32_t *pidx);
+static int c2c_cop_next(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx);
+static int c2c_frame(uint32_t size, uint32_t ts_ms);
+static void c2c_cop_start(void);
+static void c2c_cop_stop(void);
+static uint32_t c2c_frames, c2c_us_sum, c2c_us_max, c2c_in, c2c_out, c2c_errs;
+static uint32_t c2c_tot_frames, c2c_tot_us, c2c_tot_max, c2c_tot_in, c2c_tot_out;
+static uint32_t c2c_next_ms;
+static uint16_t c2c_hist[34];                   /* frame times, 1 ms buckets, the last one = over 32 ms */
+static uint16_t c2c_tot_hist[34];
+
+static bool m4_pps_cabac(void)
+{   /* entropy_coding_mode_flag of the first PPS in m4.ps (Annex B, 4-byte start codes) */
+    uint32_t i;
+    for (i = 0; i + 6 < m4.ps_len; i++)
+        if (m4.ps[i] == 0 && m4.ps[i + 1] == 0 && m4.ps[i + 2] == 0 && m4.ps[i + 3] == 1 && (m4.ps[i + 4] & 0x1f) == 8)
+        {   /* pps_id ue, sps_id ue (small: no emulation bytes in reach), then the flag */
+            const uint8_t *b = m4.ps + i + 5;
+            uint32_t pos = 0, nb = (m4.ps_len - i - 5) * 8;
+            int f;
+            for (f = 0; f < 2; f++)
+            {
+                int z = 0;
+                while (pos < nb && !((b[pos >> 3] >> (7 - (pos & 7))) & 1)) { pos++; z++; }
+                pos += 1 + z;
+            }
+            return pos < nb && ((b[pos >> 3] >> (7 - (pos & 7))) & 1);
+        }
+    return false;
+}
+static void c2c_close(void)
+{
+    c2c_cop_stop();
+    if (c2c_on && c2c_tot_frames)
+    {
+        uint32_t p95 = 0, k = 0, i;
+        for (i = 0; i < 34; i++) { k += c2c_tot_hist[i]; if (k * 20 >= c2c_tot_frames * 19) { p95 = i; break; } }
+        BLOG("cabac: total %u frames, %u.%u ms a frame on average, 95 %% within %u ms, longest %u ms; %u KB in -> %u KB to the "
+             "VideoCore (+%d %%)%s", (unsigned)c2c_tot_frames, (unsigned)(c2c_tot_us / c2c_tot_frames / 1000),
+             (unsigned)(c2c_tot_us / c2c_tot_frames / 100 % 10), (unsigned)p95 + 1, (unsigned)(c2c_tot_max / 1000),
+             (unsigned)(c2c_tot_in / 1024), (unsigned)(c2c_tot_out / 1024),
+             c2c_tot_in ? (int)((uint64_t)c2c_tot_out * 100 / c2c_tot_in) - 100 : 0, c2c_errs ? " -- with errors" : "");
+        if (c2c && (c2c_stats(c2c)->clamped || c2c_stats(c2c)->escaped))
+            BLOG("cabac: %u coefficient(s) too large for CAVLC Main were %s -- encode with x264 qpmin=12 to avoid this",
+                 (unsigned)(c2c_stats(c2c)->clamped + c2c_stats(c2c)->escaped),
+                 c2c_stats(c2c)->escaped ? "sent with the High-profile escape (cabac_escape=1)" : "clipped (a block can look wrong until the next key frame)");
+    }
+    if (c2c_h > 0) { core_unpin(c2c_h); core_free(c2c_h); }
+    c2c_h = -1; c2c = NULL; c2c_on = false; c2c_pend = false;
+}
+/* rebuild m4.ps (Annex B) and m4.avcc (avcC record) from transcoded SPS / PPS */
+static bool c2c_params(void)
+{
+    uint8_t ps[sizeof m4.ps], av[sizeof m4.avcc], *outn = c2c_dst;
+    uint32_t pl = 0, al = 0, i, s;
+    int pass, nsps = 0, npps = 0;
+    for (pass = 0; pass < 2; pass++)
+    {   /* pass 0: SPS, pass 1: PPS (avcC keeps them in two lists) */
+        if (pass == 0) { if (m4.avcc_len < 6) return false; memcpy(av, m4.avcc, 5); al = 6; }
+        else { av[5] = (uint8_t)(0xe0 | nsps); s = al++; }
+        for (i = 0; i + 4 < m4.ps_len; )
+        {
+            uint32_t a = i + 4, b = a, n;
+            int r;
+            while (b + 3 < m4.ps_len && !(m4.ps[b] == 0 && m4.ps[b + 1] == 0 && m4.ps[b + 2] == 0 && m4.ps[b + 3] == 1)) b++;
+            if (b + 3 >= m4.ps_len) b = m4.ps_len;
+            i = b;
+            n = b - a;
+            if (((m4.ps[a] & 0x1f) == 7) != (pass == 0)) continue;
+            r = c2c_nal(c2c, m4.ps + a, (int)n, outn, (int)c2c_cap, c2c_tmp);
+            if (r <= 0) { BLOG("cabac: parameter set refused: %s", c2c_errstr(r)); return false; }
+            if (pl + 4 + r > sizeof ps || al + 2 + r > sizeof av) return false;
+            ps[pl++] = 0; ps[pl++] = 0; ps[pl++] = 0; ps[pl++] = 1; memcpy(ps + pl, outn, r); pl += r;
+            av[al++] = (uint8_t)(r >> 8); av[al++] = (uint8_t)r; memcpy(av + al, outn, r); al += r;
+            if (pass == 0) nsps++; else npps++;
+        }
+        if (pass == 1) av[s] = (uint8_t)npps;
+    }
+    memcpy(m4.ps, ps, pl); m4.ps_len = pl;
+    if (m4.avcc_len) { memcpy(m4.avcc, av, al); m4.avcc_len = al; }
+    return nsps && npps;
+}
+static void c2c_setup(void)
+{
+    uint32_t need;
+    c2c_close();
+    c2c_failed = false;
+    c2c_frames = c2c_us_sum = c2c_us_max = c2c_in = c2c_out = c2c_errs = 0;
+    c2c_tot_frames = c2c_tot_us = c2c_tot_max = c2c_tot_in = c2c_tot_out = 0;
+    memset(c2c_hist, 0, sizeof c2c_hist); memset(c2c_tot_hist, 0, sizeof c2c_tot_hist);
+    c2c_next_ms = 10000;
+    if (!m4_pps_cabac()) return;
+    if (!cfg_cabac) { BLOG("cabac: CABAC video, cabac=0 -- sent unchanged (the VideoCore cannot decode it)"); return; }
+    c2c_cap = m4_raw_max + 64;
+    c2c_tmp_max = 4 * c2c_cap;                         /* scratch, output, 2 samples */
+    need = c2c_state_size() + c2c_tmp_max + 32;
+    c2c_h = core_alloc_ex(need, NULL);
+    if (c2c_h <= 0) { c2c_h = -1; BLOG("cabac: no room for the transcoder (%u KB)", (unsigned)(need / 1024)); return; }
+    core_pin(c2c_h);
+    {
+        uint8_t *mem = (uint8_t *)(((uintptr_t)core_get_data(c2c_h) + 15) & ~(uintptr_t)15);
+        c2c = c2c_init(mem, c2c_state_size());
+        c2c_tmp = mem + ((c2c_state_size() + 15) & ~15u);
+        c2c_dst = c2c_tmp + c2c_cap; c2c_src[0] = c2c_dst + c2c_cap; c2c_src[1] = c2c_src[0] + c2c_cap;
+        if (c2c) c2c_set_escape(c2c, cfg_cabac_escape);
+    }
+    if (!c2c || !c2c_params()) { BLOG("cabac: could not set up the transcoder -- sent unchanged"); c2c_close(); return; }
+    c2c_on = true;
+    if (cfg_cabac_cop) c2c_cop_start();
+    BLOG("cabac: Main-profile video coded with CABAC: the ARM rewrites it to CAVLC for the VideoCore (same pictures, "
+         "about 10-15 %% more data); %u KB for the transcoder; %s", (unsigned)(need / 1024),
+         c2c_cop_on ? "on the second core (COP), one frame ahead" : "on the CPU at full speed");
+}
+static void c2c_report(uint32_t ts_ms)
+{
+    uint32_t p95 = 0, k = 0, i, per = m4_dur_ms && m4.stsz_n ? (uint32_t)((uint64_t)m4_dur_ms * 1000 / m4.stsz_n) : 33333;
+    if (!c2c_frames) return;
+    for (i = 0; i < 34; i++) { k += c2c_hist[i]; if (k * 20 >= c2c_frames * 19) { p95 = i; break; } }
+    BLOG("cabac: at %u s: %u frames, %u.%u ms a frame (ARM %u %% of real time), 95 %% within %u ms, longest %u ms, "
+         "%u -> %u kbit/s", (unsigned)(ts_ms / 1000), (unsigned)c2c_frames, (unsigned)(c2c_us_sum / c2c_frames / 1000),
+         (unsigned)(c2c_us_sum / c2c_frames / 100 % 10), (unsigned)((uint64_t)c2c_us_sum * 100 / ((uint64_t)c2c_frames * per)),
+         (unsigned)p95 + 1, (unsigned)(c2c_us_max / 1000),
+         (unsigned)((uint64_t)c2c_in * 8 * 1000 / ((uint64_t)c2c_frames * per)),
+         (unsigned)((uint64_t)c2c_out * 8 * 1000 / ((uint64_t)c2c_frames * per)));
+    c2c_frames = c2c_us_sum = c2c_us_max = c2c_in = c2c_out = 0;
+    memset(c2c_hist, 0, sizeof c2c_hist);
+}
+/* one sample (length-prefixed NAL units) -> transcoded into dst; returns the new size or a C2C_ERR_* code.
+   No logging: it also runs on the COP. */
+static int c2c_xcode(const uint8_t *src, uint32_t size, uint8_t *dst, uint32_t cap, uint8_t *scratch)
+{
+    uint32_t p = 0, o = 0, k, n;
+    while (p + m4.nal_len <= size)
+    {
+        int r;
+        n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | src[p + k];
+        if (n == 0 || p + m4.nal_len + n > size) break;
+        if (o + m4.nal_len + 16 > cap) return C2C_ERR_SPACE;
+        r = c2c_nal(c2c, src + p + m4.nal_len, (int)n, dst + o + m4.nal_len, (int)(cap - o - m4.nal_len), scratch);
+        if (r < 0) return r;
+        for (k = 0; k < m4.nal_len; k++) dst[o + k] = (uint8_t)((uint32_t)r >> (8 * (m4.nal_len - 1 - k)));
+        o += m4.nal_len + r;
+        p += m4.nal_len + n;
+    }
+    return o ? (int)o : C2C_ERR_SYNTAX;
+}
+/* statistics and error messages for one frame (CPU side) */
+static void c2c_account(uint32_t in, int out, uint32_t us, uint32_t ts_ms)
+{
+    if (out < 0)
+    {
+        if (c2c_errs++ < 3)
+            BLOG("cabac: frame at %u ms: %s%s", (unsigned)ts_ms, c2c_errstr(out),
+                 out == C2C_ERR_UNSUPPORTED ? " -- re-encode with: -profile:v main -x264-params bframes=0:weightp=0:8x8dct=0 (or -profile:v baseline)" : "");
+        if (out == C2C_ERR_UNSUPPORTED || out == C2C_ERR_NOPARAM) c2c_failed = true;   /* every later frame would fail the same way */
+        return;
+    }
+    c2c_frames++; c2c_us_sum += us; if (us > c2c_us_max) c2c_us_max = us;
+    c2c_in += in; c2c_out += (uint32_t)out;
+    c2c_hist[us / 1000 < 33 ? us / 1000 : 33]++;
+    c2c_tot_frames++; c2c_tot_us += us; if (us > c2c_tot_max) c2c_tot_max = us;
+    c2c_tot_in += in; c2c_tot_out += (uint32_t)out;
+    c2c_tot_hist[us / 1000 < 33 ? us / 1000 : 33]++;
+    if (ts_ms >= c2c_next_ms) { c2c_report(ts_ms); c2c_next_ms = ts_ms + 10000; }
+}
+/* on the CPU: the sample in m4_raw, transcoded back into m4_raw; new size or -1 */
+static int c2c_frame(uint32_t size, uint32_t ts_ms)
+{
+    uint32_t t0 = USEC_TIMER;
+    int r;
+    if (c2c_failed) return -1;
+    r = c2c_xcode(m4_raw, size, c2c_dst, c2c_cap, c2c_tmp);
+    if (r > 0 && (uint32_t)r > m4_raw_max) r = C2C_ERR_SPACE;
+    if (r > 0) memcpy(m4_raw, c2c_dst, r);
+    c2c_account(size, r, USEC_TIMER - t0, ts_ms);
+    return r > 0 ? r : -1;
+}
+
+/* ---- the COP: transcodes the next frame while the CPU sends this one.  The two cores' caches are not coherent:
+   the CPU writes its cache back before it hands a sample over, the COP writes back + drops its cache before it reads
+   one and writes back after it wrote the result, and the CPU drops its cache before it reads the result.  The job
+   record and the semaphores are in uncached memory. */
+static struct { const uint8_t *src; uint32_t size; int result; uint32_t us; int quit; } c2c_job SHAREDBSS_ATTR;
+static struct semaphore c2c_job_sem SHAREDBSS_ATTR, c2c_done_sem SHAREDBSS_ATTR;
+static long c2c_cop_stack[(8 * 1024) / sizeof(long)];
+static unsigned int c2c_cop_id;
+static uint32_t c2c_pend_gen, c2c_pend_size, c2c_pend_ts, c2c_pend_idx;
+static int c2c_si;
+static void c2c_cop_thread(void)
+{
+    for (;;)
+    {
+        uint32_t t0;
+        semaphore_wait(&c2c_job_sem, TIMEOUT_BLOCK);
+        commit_discard_dcache();
+        if (c2c_job.quit) break;
+        t0 = USEC_TIMER;
+        c2c_job.result = c2c_xcode(c2c_job.src, c2c_job.size, c2c_dst, c2c_cap, c2c_tmp);
+        c2c_job.us = USEC_TIMER - t0;
+        commit_dcache();
+        semaphore_release(&c2c_done_sem);
+    }
+    commit_dcache();
+    semaphore_release(&c2c_done_sem);
+    thread_exit();
+}
+static void c2c_cop_submit(const uint8_t *src, uint32_t size)
+{
+    commit_dcache();                               /* the sample (and everything the CPU set up) into memory */
+    c2c_job.src = src; c2c_job.size = size; c2c_job.quit = 0;
+    c2c_busy = true;
+    semaphore_release(&c2c_job_sem);
+}
+static int c2c_cop_wait(void)
+{
+    if (!c2c_busy) return C2C_ERR_SYNTAX;
+    semaphore_wait(&c2c_done_sem, TIMEOUT_BLOCK);
+    c2c_busy = false;
+    commit_discard_dcache();                       /* read the COP's result, not old cache lines */
+    return c2c_job.result;
+}
+static void c2c_cop_drain(void) { if (c2c_busy) c2c_cop_wait(); c2c_pend = false; }
+static int c2c_cop_next(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
+{
+    uint32_t ts, idx, insz;
+    int r, ret = -1;
+    if (c2c_failed) { c2c_cop_drain(); return m4_fetch(m4_raw, size, ts_ms, sidx) > 0 ? -1 : 0; }
+    if (!(c2c_pend && c2c_pend_gen == m4_gen))
+    {   /* nothing usable prefetched (start, or the cursor jumped): this frame now */
+        c2c_cop_drain();
+        r = m4_fetch(c2c_src[c2c_si], &c2c_pend_size, &c2c_pend_ts, &c2c_pend_idx);
+        if (r <= 0) return r;
+        c2c_cop_submit(c2c_src[c2c_si], c2c_pend_size);
+    }
+    r = c2c_cop_wait();
+    ts = c2c_pend_ts; idx = c2c_pend_idx; insz = c2c_pend_size;
+    c2c_pend = false;
+    if (r > 0 && (uint32_t)r > m4_raw_max) r = C2C_ERR_SPACE;
+    if (r > 0) { memcpy(m4_raw, c2c_dst, r); ret = 1; *size = (uint32_t)r; }
+    c2c_account(insz, r, c2c_job.us, ts);
+    c2c_si ^= 1;                                   /* the next frame goes to the COP while this one is sent */
+    if (!c2c_failed && m4_fetch(c2c_src[c2c_si], &c2c_pend_size, &c2c_pend_ts, &c2c_pend_idx) > 0)
+    {
+        c2c_cop_submit(c2c_src[c2c_si], c2c_pend_size);
+        c2c_pend = true; c2c_pend_gen = m4_gen;
+    }
+    *ts_ms = ts; *sidx = idx;
+    return ret;
+}
+static void c2c_cop_start(void)
+{
+    c2c_busy = c2c_pend = false; c2c_si = 0;
+    semaphore_init(&c2c_job_sem, 1, 0);
+    semaphore_init(&c2c_done_sem, 1, 0);
+    commit_dcache();                               /* the transcoder state set up by the CPU */
+    c2c_cop_id = create_thread(c2c_cop_thread, c2c_cop_stack, sizeof c2c_cop_stack, 0, "bcm cabac"
+                               IF_PRIO(, PRIORITY_PLAYBACK) IF_COP(, COP));
+    c2c_cop_on = c2c_cop_id != 0;
+}
+static void c2c_cop_stop(void)
+{
+    if (!c2c_cop_on) return;
+    c2c_cop_drain();
+    c2c_job.quit = 1;
+    semaphore_release(&c2c_job_sem);
+    semaphore_wait(&c2c_done_sem, TIMEOUT_BLOCK);
+    thread_wait(c2c_cop_id);
+    commit_discard_dcache();                       /* the COP's statistics */
+    c2c_cop_on = false;
+}
+
+/* v123: the cursor part of m4_next: the next video sample into buf.  1 = read, 0 = end of stream, -1 = skipped */
+static int m4_fetch(uint8_t *buf, uint32_t *psize, uint32_t *ts_ms, uint32_t *pidx)
 {
     m4off_t off;
-    uint32_t size, p, o = 0, n, k;
-    bool idr = false, first = (m4.idx == 0);
+    uint32_t size;
     if (m4.fd < 0 || m4.idx >= m4.stsz_n || m4.chunk > m4.stco_n) return 0;
     size = m4.stsz_fixed ? m4.stsz_fixed : m4_u32(m4.stsz + 4 * (m4off_t)m4.idx);
     off  = m4_chunk_off(m4.stco, m4.co64, m4.chunk) + m4.off_in_chunk;
     *ts_ms = (uint32_t)(m4.dts * 1000ULL / m4.timescale);
+    *pidx = m4.idx;
 
     m4.idx++; m4.off_in_chunk += size;                                   /* advance the cursors first */
     if (++m4.s_in_chunk >= m4.spc)
@@ -3794,7 +4097,6 @@ static int m4_next(uint32_t *ts_ms, bool *key)
         m4.stts_i++; m4.stts_left = m4_u32(m4.stts + 8 * m4.stts_i); m4.stts_delta = m4_u32(m4.stts + 8 * m4.stts_i + 4);
     }
 
-    *key = false;
     ra_stream = 0;
     if (size > m4_raw_max)
     {   /* v86: say why; v96: the limit is the frame buffer this file got (512 / 256 KB, or 60 KB without room) */
@@ -3811,7 +4113,34 @@ static int m4_next(uint32_t *ts_ms, bool *key)
                                     (unsigned)((size + 65535) / 65536));
         if (size > m4_big_max) m4_big_max = size;
     }
-    if (size == 0 || !m4_rdd(off, m4_raw, size)) return -1;
+    if (size == 0 || !m4_rdd(off, buf, size)) return -1;
+    *psize = size;
+    return 1;
+}
+
+static int m4_next(uint32_t *ts_ms, bool *key)
+{
+    uint32_t size = 0, p, o = 0, n, k, sidx = 0;
+    bool idr = false, first;
+    int r;
+    *key = false;
+    if (c2c_on && c2c_cop_on)
+    {   /* v123: transcoded on the COP, one frame ahead */
+        r = c2c_cop_next(ts_ms, &size, &sidx);
+        if (r <= 0) return r;
+    }
+    else
+    {
+        r = m4_fetch(m4_raw, &size, ts_ms, &sidx);
+        if (r <= 0) return r;
+        if (c2c_on)
+        {   /* v123: CABAC -> CAVLC before anything else looks at the sample */
+            int t = c2c_frame(size, *ts_ms);
+            if (t <= 0) return -1;
+            size = (uint32_t)t;
+        }
+    }
+    first = (sidx == 0);
     for (p = 0; p + m4.nal_len <= size; )                               /* pass 1: is there an IDR? */
     {
         n = 0; for (k = 0; k < m4.nal_len; k++) n = (n << 8) | m4_raw[p + k];
@@ -4351,6 +4680,9 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "tv_extra")) cfg_tv_extra = v;
         else if (!strcmp(p, "tv_osd"))   cfg_tv_osd = v;
         else if (!strcmp(p, "boost"))    cfg_boost = v;
+        else if (!strcmp(p, "cabac"))    cfg_cabac = v;             /* v123 */
+        else if (!strcmp(p, "cabac_escape")) cfg_cabac_escape = v;
+        else if (!strcmp(p, "cabac_cop")) cfg_cabac_cop = v;
         else if (!strcmp(p, "ra_kb"))    cfg_ra_kb = v;
         else if (!strcmp(p, "big_frames")) cfg_big_frames = v;   /* v96 */
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
@@ -4760,7 +5092,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v121 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v124 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -7114,7 +7446,7 @@ static void av_boost(bool on)
 static void av_boost_tick(long run_t0)
 {
     if (cfg_boost != 2) return;
-    if (sc_active || current_tick - run_t0 < 10 * HZ || v_sound != 2 || TIME_BEFORE(current_tick, av_boost_until)) av_boost(true);
+    if (sc_active || c2c_on || current_tick - run_t0 < 10 * HZ || v_sound != 2 || TIME_BEFORE(current_tick, av_boost_until)) av_boost(true);
     else av_boost(false);
 }
 static int bcm_hw_model(int log);
@@ -8517,7 +8849,7 @@ static void bcm_playback_probe(void)
             BLOG("MP4 ok: %ux%u H.264 profile_idc=%u level_idc=%u nal_len=%u timescale=%u samples=%u SPS+PPS=%u B",
                  (unsigned)m4.width, (unsigned)m4.height, m4.profile, m4.level, m4.nal_len,
                  (unsigned)m4.timescale, (unsigned)m4.stsz_n, (unsigned)m4.ps_len);
-            if (m4.profile != 66)
+            if (m4.profile != 66 && !c2c_on)
                 BLOG("WARNING: profile_idc=%u, not Baseline (66). The VC may refuse CABAC/B-frames/High -- re-encode with -profile:v baseline", m4.profile);
             {   /* v86: the stock firmware stops at 320x240 / 768 kbit/s; the decoder itself is meant for VGA (640x480) at
                    up to 30 fps.  Above that: a warning (it is still tried). */
@@ -9184,7 +9516,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v121, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v124, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -9209,6 +9541,14 @@ static bool bcm_run(const char *play_path)
     bcm_wd_secs = bcm_player_mode ? 20 : BCM_WD_SECS;   /* v87: a start that goes quiet for 20 s has hung (white screen): reboot */
     tick_add_task(bcm_wd_tick);
     bcm_load_cfg();
+    if (ct_log_path)
+    {   /* v124: the test's own settings win over bcm_test.cfg */
+        cfg_cabac = 1;
+        if (ct_cop >= 0) cfg_cabac_cop = ct_cop;
+        if (ct_escape >= 0) cfg_cabac_escape = ct_escape;
+        cfg_tv = ct_tv;
+        BLOG("%s", ct_header);
+    }
     if (!cfg_fast) bcm_sync_every = 0;
     else if (bcm_player_mode && cfg_log_sync > 0)
         bcm_sync_every = cfg_log_sync * HZ;            /* v78: a flush costs 0.1-0.6 s on a big FAT32 volume: not during start-up */
@@ -9659,6 +9999,101 @@ static bool dbg_flash_dump(void)
 }
 #endif
 
+/* v124: Debug > CABAC tests.  The test clips are in the root of the iPod's drive (copy cabac_test_clips.zip's files
+   to M:\ on the PC).  SELECT runs the highlighted test: the clip plays from its start with the test's settings (no
+   bcm_test.cfg needed) and its log goes to /cabac_test_NN_<name>.txt -- a second run of the same test gets _run2, _run3,
+   ... so nothing is overwritten.  When the clip ends (or MENU stops it) the list comes back with the next test
+   highlighted.  Then send me the /cabac_test_*.txt files. */
+struct ct_test { const char *name, *clip, *desc; int cop, escape, tv; };
+static const struct ct_test ct_tests[] = {
+    { "240p_tv_cop",        "/cabac_240p_tv.mp4",         "240p TV, 2nd core",              1, 0, 0 },
+    { "480p_tv_cop",        "/cabac_480p_tv.mp4",         "480p TV, 2nd core",              1, 0, 0 },
+    { "240p_stress_cop",    "/cabac_240p30_stress.mp4",   "240p 30fps stress, 2nd core",    1, 0, 0 },
+    { "480p_stress_cop",    "/cabac_480p30_stress.mp4",   "480p 30fps stress, 2nd core",    1, 0, 0 },
+    { "480p_tv_cpu",        "/cabac_480p_tv.mp4",         "480p TV, main CPU",              0, 0, 0 },
+    { "480p_stress_cpu",    "/cabac_480p30_stress.mp4",   "480p 30fps stress, main CPU",    0, 0, 0 },
+    { "bigcoef_clip",       "/cabac_480p_bigcoef.mp4",    "big levels clipped (bar grey?)", 1, 0, 0 },
+    { "bigcoef_escape",     "/cabac_480p_bigcoef.mp4",    "big levels escaped (bar black?)", 1, 1, 0 },
+    { "480p_tv_tvout",      "/cabac_480p_tv.mp4",         "480p TV on TV out",              1, 0, 1 },
+    { "480p_stress_tvout",  "/cabac_480p30_stress.mp4",   "480p 30fps stress on TV out",    1, 0, 1 },
+};
+#define CT_N ((int)ARRAYLEN(ct_tests))
+static int ct_next;
+static void ct_logname(int i, int run, char *buf, size_t n)
+{
+    if (run <= 1) snprintf(buf, n, "/cabac_test_%02d_%s.txt", i + 1, ct_tests[i].name);
+    else snprintf(buf, n, "/cabac_test_%02d_%s_run%d.txt", i + 1, ct_tests[i].name, run);
+}
+static int ct_runs(int i)
+{
+    char p[MAX_PATH]; int r = 0;
+    while (r < 99) { ct_logname(i, r + 1, p, sizeof p); if (!file_exists(p)) break; r++; }
+    return r;
+}
+static const char *ct_getname(int item, void *data, char *buf, size_t n)
+{
+    int runs = ct_runs(item);
+    char mark[16] = "";
+    (void)data;
+    if (!file_exists(ct_tests[item].clip)) snprintf(mark, sizeof mark, "  [no clip]");
+    else if (runs == 1) snprintf(mark, sizeof mark, "  [done]");
+    else if (runs > 1) snprintf(mark, sizeof mark, "  [done x%d]", runs);
+    snprintf(buf, n, "%d. %s%s", item + 1, ct_tests[item].desc, mark);
+    return buf;
+}
+static int ct_pick;
+static int ct_action(int action, struct gui_synclist *lists)
+{
+    if (action == ACTION_STD_OK)
+    {
+        ct_pick = gui_synclist_get_sel_pos(lists);
+        return ACTION_STD_CANCEL;                     /* leave the list; the test runs outside it */
+    }
+    return action;
+}
+static bool dbg_cabac_tests(void)
+{
+    for (;;)
+    {
+        struct simplelist_info info;
+        const struct ct_test *t;
+        char path[MAX_PATH];
+        int run, i;
+        bool tv_save; int cop_save = cfg_cabac_cop, esc_save = cfg_cabac_escape, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac;
+        simplelist_info_init(&info, "CABAC tests (clips in the drive root)", CT_N, NULL);
+        info.get_name = ct_getname;
+        info.action_callback = ct_action;
+        info.selection = ct_next;
+        ct_pick = -1;
+        simplelist_show_list(&info);
+        if (ct_pick < 0 || ct_pick >= CT_N) return false;
+        i = ct_pick;
+        t = &ct_tests[i];
+        if (!file_exists(t->clip))
+        {
+            splashf(HZ * 3, "%s is missing: copy the test clips to the root of the iPod's drive", t->clip + 1);
+            continue;
+        }
+        run = ct_runs(i) + 1;
+        ct_logname(i, run, path, sizeof path);
+        snprintf(ct_header, sizeof ct_header, "CABAC TEST %d (%s), run %d: %s -- %s, escape %s, %s", i + 1, t->name, run,
+                 t->clip, t->cop ? "2nd core" : "main CPU", t->escape ? "on" : "off", t->tv ? "TV out" : "iPod screen");
+        splashf(HZ * 2, "Test %d: %s", i + 1, t->desc);
+        ct_log_path = path; ct_cop = t->cop; ct_escape = t->escape; ct_tv = t->tv;
+        tv_save = bcm_tv;
+        bcm_tv = t->tv;
+        bcm_video_next_request = 0;
+        bcm_video_finished = false;
+        bcm_resume_ms = 0;                             /* always from the start */
+        bcm_run_sl(t->clip);
+        ct_log_path = NULL; ct_cop = ct_escape = ct_tv = -1;
+        bcm_tv = tv_save;
+        cfg_cabac_cop = cop_save; cfg_cabac_escape = esc_save; cfg_tv = tv_cfg_save; cfg_cabac = cabac_save;
+        ct_next = i + 1 < CT_N ? i + 1 : 0;
+        splashf(HZ * 2, "Saved %s", path + 1);
+    }
+}
+
 /****** The menu *********/
 static const struct {
     unsigned char *desc; /* string or ID */
@@ -9672,6 +10107,7 @@ static const struct {
 #endif
 #ifdef IPOD_VIDEO
         { "BCM host test", dbg_bcm_host },
+        { "CABAC tests", dbg_cabac_tests },
         { "Storage report (exFAT prep)", dbg_storage_report },
         { "Dump flash ROM (exFAT prep)", dbg_flash_dump },
 #endif
