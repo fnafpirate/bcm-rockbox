@@ -2930,7 +2930,7 @@ extern void bcm_lcd_set_hosted(void (*upd)(int, int, int, int), void (*slp)(void
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
 /* v124: the CABAC tests (Debug > CABAC tests): log file, settings and a header line for one run */
 static const char *ct_log_path;
-static int ct_cop = -1, ct_iram = -1, ct_tv = -1;
+static int ct_cop = -1, ct_iram = -1, ct_tv = -1, ct_scrub = -1;
 static char ct_header[120];
 static int bcm_log_fd = -1;
 static bool bcm_vc_flat;               /* v56: the VideoCore files are in /.rockbox/VideoCore/ */
@@ -3988,16 +3988,6 @@ static int c2c_cop_wait(void)
     c2c_w[1].result = c2c_job.result; c2c_w[1].us = c2c_job.us;
     return c2c_w[1].result;
 }
-/* v126: has the COP finished?  (no waiting) */
-static bool c2c_cop_poll(void)
-{
-    if (!c2c_busy) return true;
-    if (semaphore_wait(&c2c_done_sem, TIMEOUT_NOBLOCK) != OBJ_WAIT_SUCCEEDED) return false;
-    c2c_busy = false;
-    commit_discard_dcache();
-    c2c_w[1].result = c2c_job.result; c2c_w[1].us = c2c_job.us;
-    return true;
-}
 static void c2c_cop_start(void)
 {
     c2c_busy = false;
@@ -4219,13 +4209,15 @@ static int c2c_take(int k, uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
     memcpy(m4_raw, w->dst, r); *size = (uint32_t)r;
     return 1;
 }
-/* FF / REW (v126).  v125 transcoded each key frame the VideoCore asked for while it waited (0.2 s at 480p, 0.06 s at
-   240p): its scan asked again and again, ran to the end of the file without showing a picture, and the main loop sat in
-   mp_step the whole time (no time bar).  Now a request never waits once a picture is ready: the COP transcodes the
-   wanted key frame in the background, and until it is done the VideoCore gets the newest key frame finished so far
-   (v_get_frame then keeps the scan position at that frame, so the scan moves as fast as the COP gets through key
-   frames).  Only the first one is waited for.  Mode 0 (CPU only): each key frame on the CPU, as v125.  No statistics:
-   these are not playback. */
+/* FF / REW.  v125 transcoded each key frame the VideoCore asked for while it waited (0.2 s at 480p).  v126 sent the
+   newest finished key frame again while the wanted one was being transcoded: the VideoCore queued those copies (30 in
+   the first step of the v126 test 3 log) and showed them one per step -- the picture stood still for seconds.
+   v127: every key frame is sent once.  The COP transcodes ahead: after a key frame is sent it starts on the one the
+   scan will want next (tf_jump further in tf_dir), so the next request usually finds it done; otherwise the request
+   waits for it.  Mode 0 (CPU only): each key frame on the CPU.  No statistics: these are not playback. */
+static int tf_dir;                                     /* (below) the trick feed */
+static uint32_t tf_jump;
+static uint32_t pl_key_step(uint32_t cur, int dir, uint32_t jump);
 static void c2c_kc_store(struct c2c_wk *w)
 {
     if (w->result <= 0 || (uint32_t)w->result > m4_raw_max) return;
@@ -4237,10 +4229,19 @@ static int c2c_kc_give(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
     memcpy(m4_raw, c2c_kc, c2c_kc_len); *size = (uint32_t)c2c_kc_len; *ts_ms = c2c_kc_ts; *sidx = c2c_kc_idx;
     return 1;
 }
+static void c2c_cop_collect(void)
+{   /* the COP's key frame (finished) into the cache */
+    struct c2c_wk *cop = &c2c_w[1];
+    if (!cop->have) return;
+    c2c_cop_wait(); cop->have = false;
+    if (cop->result <= 0) c2c_account(1, cop->size, cop->result, 0, cop->ts);   /* the error message */
+    else c2c_kc_store(cop);
+}
 static int c2c_trick_next(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
 {
     struct c2c_wk *cpu = &c2c_w[0], *cop = &c2c_w[1];
-    uint32_t want = m4.idx;                            /* v_get_frame put the cursor on the key frame it wants */
+    uint32_t want = m4.idx, nk, k;                     /* v_get_frame put the cursor on the key frame it wants */
+    int r;
     if (!c2c_in_trick) { c2c_drop(); c2c_in_trick = true; }
     if (c2c_mode == 0)
     {
@@ -4251,23 +4252,35 @@ static int c2c_trick_next(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
         c2c_kc_store(cpu);
         return c2c_kc_give(ts_ms, size, sidx);
     }
-    if (cop->have && c2c_cop_poll())
+    if (!(c2c_kc_len > 0 && c2c_kc_idx == want))
     {
-        cop->have = false;
-        if (cop->result <= 0) c2c_account(1, cop->size, cop->result, 0, cop->ts);   /* the error message */
-        c2c_kc_store(cop);
+        if (cop->have && cop->idx == want) c2c_cop_collect();          /* the prefetch guessed right */
+        else
+        {
+            c2c_cop_collect();                                          /* a wrong guess: let it finish, then this one */
+            if (!(c2c_kc_len > 0 && c2c_kc_idx == want))
+            {
+                m4_seek_sample(want);
+                if (!c2c_fetch(cop)) return 0;
+                c2c_cop_submit(); cop->have = true;
+                c2c_cop_collect();
+            }
+        }
     }
-    if (c2c_kc_len > 0 && c2c_kc_idx == want) return c2c_kc_give(ts_ms, size, sidx);
-    if (!cop->have)
+    if (!(c2c_kc_len > 0 && c2c_kc_idx == want)) return -1;
+    r = c2c_kc_give(ts_ms, size, sidx);
+    /* the next one the scan will want (tf_next_key from this picture), started now */
+    if (tf_dir && !cop->have)
     {
-        if (!c2c_fetch(cop)) return c2c_kc_len > 0 ? c2c_kc_give(ts_ms, size, sidx) : 0;
-        c2c_cop_submit(); cop->have = true;
+        nk = pl_key_step(*ts_ms, tf_dir, tf_jump);
+        k = m4_key_at(nk, NULL);
+        if (k != want)
+        {
+            m4_seek_sample(k);
+            if (c2c_fetch(cop)) { c2c_cop_submit(); cop->have = true; }
+        }
     }
-    if (c2c_kc_len > 0) return c2c_kc_give(ts_ms, size, sidx);   /* the newest picture now, the wanted one later */
-    c2c_cop_wait(); cop->have = false;                 /* the first one: wait */
-    if (cop->result <= 0) { c2c_account(1, cop->size, cop->result, 0, cop->ts); return -1; }
-    c2c_kc_store(cop);
-    return c2c_kc_give(ts_ms, size, sidx);
+    return r;
 }
 /* v125: the next video sample, transcoded, into m4_raw.  1 = ok, 0 = end of stream, -1 = this frame failed.
    Both cores (mode 2): the COP holds one frame; when that one is asked for, the CPU transcodes the frame after it in
@@ -5339,7 +5352,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v126 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v127 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -7188,8 +7201,9 @@ static void scrub_tick(void)
         if (sc_ticks % 3 == 0 && pl_disp(&dt, &seq) == 0 && seq != 0xffffffffu)
         {
             if (seq != scan_seq0) scan_moved = true;
-            if (dt && dt != 0xffffffffu) { sc_pos = dt; pl_target_ms = dt; }
-        }
+            if (dt && dt != 0xffffffffu && (sc_dir > 0 ? dt > sc_pos : dt < sc_pos)) { sc_pos = dt; pl_target_ms = dt; }
+        }   /* v127: the time only moves the way the button points (the v126 bar jumped between the picture on screen,
+               a few behind, and the key frame sent) */
         if (!scan_moved && cfg_scan_fb_ms > 0 && held * 1000 / HZ >= cfg_scan_fb_ms)
         {   /* no new picture: carry on as time only from here */
             uint32_t d = pl_dur_ms ? pl_dur_ms : m4_dur_ms, t = 900000;
@@ -7200,7 +7214,7 @@ static void scrub_tick(void)
             for (stk_cap = 1; t < d && stk_cap < 32; stk_cap *= 2) t *= 2;
             stk_mult = 1; stk_mult_at = current_tick + HZ * 35 / 100;
         }
-        else if (!(sc_ticks % 3 == 0)) { sc_pos = tf_cur; pl_target_ms = tf_cur; }
+        else if (!(sc_ticks % 3 == 0) && (sc_dir > 0 ? tf_cur > sc_pos : tf_cur < sc_pos)) { sc_pos = tf_cur; pl_target_ms = tf_cur; }
         break;
     }
     case SM_STOCK:                                      /* v114 */
@@ -9768,7 +9782,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v126, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v127, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -9798,6 +9812,7 @@ static bool bcm_run(const char *play_path)
         cfg_cabac = 1;
         if (ct_cop >= 0) cfg_cabac_cop = ct_cop;
         if (ct_iram >= 0) cfg_cabac_iram = ct_iram;
+        if (ct_scrub >= 0) cfg_scrub_mode = ct_scrub;   /* v127 */
         cfg_tv = ct_tv;
         BLOG("%s", ct_header);
     }
@@ -10257,17 +10272,18 @@ static bool dbg_flash_dump(void)
    bcm_test.cfg needed) and its log goes to /cabac125_NN_<name>.txt (v125) -- a second run of the same test gets _run2, _run3,
    ... so nothing is overwritten.  When the clip ends (or MENU stops it) the list comes back with the next test
    highlighted.  Then send me the /cabac_test_*.txt files. */
-struct ct_test { const char *name, *clip, *desc; int cop, iram, tv; };
+struct ct_test { const char *name, *clip, *desc; int cop, iram, tv, scrub; };   /* scrub: -1 = as set, 7 = time only (v127) */
 /* v125: cop 0 = CPU, 1 = COP one ahead, 2 = both cores; iram 1 = the transcoder runs from IRAM.  clip NULL = the bench */
 static const struct ct_test ct_tests[] = {
-    { "speed_bench",        NULL,                         "speed bench, no picture (~3 min)", 2, 1, 0 },
-    { "240p_tv",            "/cabac_240p_tv.mp4",         "240p TV",                          2, 1, 0 },
-    { "480p_tv",            "/cabac_480p_tv.mp4",         "480p TV",                          2, 1, 0 },
-    { "240p_stress",        "/cabac_240p30_stress.mp4",   "240p 30fps stress",                2, 1, 0 },
-    { "480p_stress",        "/cabac_480p30_stress.mp4",   "480p 30fps stress",                2, 1, 0 },
-    { "480p_stress_1core",  "/cabac_480p30_stress.mp4",   "480p 30fps stress, 2nd core only", 1, 1, 0 },
-    { "ffrew",              "/cabac_480p_bigcoef.mp4",    "FF to the end, REW to the start",  2, 1, 0 },
-    { "480p_tv_tvout",      "/cabac_480p_tv.mp4",         "480p TV on TV out",                2, 1, 1 },
+    { "speed_bench",        NULL,                         "speed bench, no picture (~3 min)", 2, 1, 0, 0 },
+    { "240p_tv",            "/cabac_240p_tv.mp4",         "240p TV",                          2, 1, 0, 0 },
+    { "480p_tv",            "/cabac_480p_tv.mp4",         "480p TV",                          2, 1, 0, 0 },
+    { "240p_stress",        "/cabac_240p30_stress.mp4",   "240p 30fps stress",                2, 1, 0, 0 },
+    { "480p_stress",        "/cabac_480p30_stress.mp4",   "480p 30fps stress",                2, 1, 0, 0 },
+    { "480p_stress_1core",  "/cabac_480p30_stress.mp4",   "480p 30fps stress, 2nd core only", 1, 1, 0, 0 },
+    { "ffrew",              "/cabac_480p_bigcoef.mp4",    "FF to the end, REW to the start",  2, 1, 0, 0 },
+    { "480p_tv_tvout",      "/cabac_480p_tv.mp4",         "480p TV on TV out",                2, 1, 1, 0 },
+    { "480p_tv_ff_timeonly","/cabac_480p_tv.mp4",         "480p TV, FF/REW time only",        2, 1, 0, 7 },
 };
 #define CT_N ((int)ARRAYLEN(ct_tests))
 static int ct_next;
@@ -10420,8 +10436,8 @@ static bool dbg_cabac_tests(void)
         const struct ct_test *t;
         char path[MAX_PATH];
         int run, i;
-        bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac;
-        simplelist_info_init(&info, "CABAC tests v126 (clips in the drive root)", CT_N, NULL);
+        bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode;
+        simplelist_info_init(&info, "CABAC tests v127 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -10439,14 +10455,14 @@ static bool dbg_cabac_tests(void)
         ct_logname(i, run, path, sizeof path);
         snprintf(ct_header, sizeof ct_header, "CABAC TEST %d (%s), run %d: %s -- %s, %s, %s", i + 1, t->name, run,
                  t->clip ? t->clip : "4 clips", t->cop == 2 ? "both cores" : t->cop ? "2nd core" : "main CPU",
-                 t->iram ? "IRAM" : "SDRAM", t->tv ? "TV out" : "iPod screen");
+                 t->iram ? "IRAM" : "SDRAM", t->scrub == 7 ? "iPod screen, FF/REW time only" : t->tv ? "TV out" : "iPod screen");
         splashf(HZ * 2, "Test %d: %s", i + 1, t->desc);
-        ct_log_path = path; ct_cop = t->cop; ct_iram = t->iram; ct_tv = t->tv;
+        ct_log_path = path; ct_cop = t->cop; ct_iram = t->iram; ct_tv = t->tv; ct_scrub = t->scrub ? t->scrub : -1;
         if (!t->clip)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v126, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v127, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
@@ -10461,8 +10477,8 @@ static bool dbg_cabac_tests(void)
             bcm_run_sl(t->clip);
             bcm_tv = tv_save;
         }
-        ct_log_path = NULL; ct_cop = ct_iram = ct_tv = -1;
-        cfg_cabac_cop = cop_save; cfg_cabac_iram = iram_save; cfg_tv = tv_cfg_save; cfg_cabac = cabac_save;
+        ct_log_path = NULL; ct_cop = ct_iram = ct_tv = ct_scrub = -1;
+        cfg_cabac_cop = cop_save; cfg_cabac_iram = iram_save; cfg_tv = tv_cfg_save; cfg_cabac = cabac_save; cfg_scrub_mode = scrub_save;
         ct_next = i + 1 < CT_N ? i + 1 : 0;
         splashf(HZ * 2, "Saved %s", path + 1);
     }
