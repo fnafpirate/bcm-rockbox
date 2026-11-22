@@ -3801,6 +3801,7 @@ static int cfg_cabac_cop = 2;
    model.  0 = always the SDRAM copy. */
 static int cfg_cabac_iram = 1;
 static bool av_vc_route;                        /* (below, v53) the VideoCore plays the sound */
+extern volatile unsigned bcm_bus_timeouts;      /* v126: lcd-video.c's bounded bus waits that ran out */
 static bool c2c_trick;                          /* v125: set by v_get_frame while FF / REW feeds key frames */
 
 /* the two copies of the transcoder: same code, linked for SDRAM and for the codec IRAM (bcm_cab2cav_iram.c) */
@@ -3830,8 +3831,9 @@ static uint32_t c2c_cap, c2c_ssz, c2c_need, c2c_q_gen;
 static uint8_t *c2c_ps0;                        /* the original (CABAC) parameter sets, Annex B: a new state reads them */
 static uint32_t c2c_ps0_len;
 static uint8_t *c2c_kc;                         /* the last key frame transcoded for FF / REW */
-static uint32_t c2c_kc_idx = 0xffffffffu;
+static uint32_t c2c_kc_idx = 0xffffffffu, c2c_kc_ts;
 static int c2c_kc_len;
+static bool c2c_in_trick;                       /* v126: the COP's job is a FF / REW key frame (c2c_trick_next) */
 static bool c2c_on, c2c_failed, c2c_cop_on, c2c_iram_on, c2c_iram_tried, c2c_cop_first;
 static int c2c_mode;                            /* 0 / 1 / 2 as cfg_cabac_cop, 0 when the COP thread did not start */
 static uint32_t c2c_clamped;                    /* counted by states that were set up again (engine switch) */
@@ -3915,6 +3917,7 @@ static void c2c_account(int core, uint32_t in, int out, uint32_t us, uint32_t ts
         if (out == C2C_ERR_UNSUPPORTED || out == C2C_ERR_NOPARAM) c2c_failed = true;   /* every later frame would fail the same way */
         return;
     }
+    if (!c2c_next_ms) c2c_next_ms = ts_ms + 10000;     /* v126: the first frame after FF / REW starts a new window */
     c2c_sum_add(&c2c_win, core, in, (uint32_t)out, us);
     c2c_sum_add(&c2c_tot, core, in, (uint32_t)out, us);
     if (ts_ms >= c2c_next_ms) { c2c_report(ts_ms); c2c_next_ms = ts_ms + 10000; }
@@ -3984,6 +3987,16 @@ static int c2c_cop_wait(void)
     commit_discard_dcache();                       /* read the COP's result, not old cache lines */
     c2c_w[1].result = c2c_job.result; c2c_w[1].us = c2c_job.us;
     return c2c_w[1].result;
+}
+/* v126: has the COP finished?  (no waiting) */
+static bool c2c_cop_poll(void)
+{
+    if (!c2c_busy) return true;
+    if (semaphore_wait(&c2c_done_sem, TIMEOUT_NOBLOCK) != OBJ_WAIT_SUCCEEDED) return false;
+    c2c_busy = false;
+    commit_discard_dcache();
+    c2c_w[1].result = c2c_job.result; c2c_w[1].us = c2c_job.us;
+    return true;
 }
 static void c2c_cop_start(void)
 {
@@ -4069,7 +4082,7 @@ static bool c2c_use(const struct c2c_eng *e)
     if (c2c_busy) c2c_cop_wait();
     for (i = 0; i < 2; i++) c2c_clamped += c2c_eng->stats(c2c_w[i].st)->clamped;
     c2c_eng = e;
-    c2c_kc_idx = 0xffffffffu;
+    c2c_kc_idx = 0xffffffffu; c2c_kc_len = 0;          /* c2c_feed_ps writes into the cache buffer */
     for (i = 0; i < 2; i++)
     {
         c2c_w[i].st = e->init(c2c_w[i].st, c2c_ssz);
@@ -4134,7 +4147,7 @@ static void c2c_close(void)
     if (c2c_h > 0) { core_unpin(c2c_h); core_free(c2c_h); }
     c2c_h = -1; c2c_on = false; c2c_mode = 0;
     memset(c2c_w, 0, sizeof c2c_w);
-    c2c_kc = NULL; c2c_kc_idx = 0xffffffffu;
+    c2c_kc = NULL; c2c_kc_idx = 0xffffffffu; c2c_kc_len = 0; c2c_in_trick = false;
 }
 static void c2c_setup(void)
 {
@@ -4206,23 +4219,55 @@ static int c2c_take(int k, uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
     memcpy(m4_raw, w->dst, r); *size = (uint32_t)r;
     return 1;
 }
-/* FF / REW: key frames one at a time, on the CPU; the same key frame again (held at the start or the end) comes from
-   the cache.  v124 transcoded it every time (0.15-0.4 s each) and prefetched a frame that was thrown away. */
+/* FF / REW (v126).  v125 transcoded each key frame the VideoCore asked for while it waited (0.2 s at 480p, 0.06 s at
+   240p): its scan asked again and again, ran to the end of the file without showing a picture, and the main loop sat in
+   mp_step the whole time (no time bar).  Now a request never waits once a picture is ready: the COP transcodes the
+   wanted key frame in the background, and until it is done the VideoCore gets the newest key frame finished so far
+   (v_get_frame then keeps the scan position at that frame, so the scan moves as fast as the COP gets through key
+   frames).  Only the first one is waited for.  Mode 0 (CPU only): each key frame on the CPU, as v125.  No statistics:
+   these are not playback. */
+static void c2c_kc_store(struct c2c_wk *w)
+{
+    if (w->result <= 0 || (uint32_t)w->result > m4_raw_max) return;
+    memcpy(c2c_kc, w->dst, w->result); c2c_kc_len = w->result; c2c_kc_idx = w->idx; c2c_kc_ts = w->ts;
+}
+static int c2c_kc_give(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
+{
+    if (c2c_kc_len <= 0) return -1;
+    memcpy(m4_raw, c2c_kc, c2c_kc_len); *size = (uint32_t)c2c_kc_len; *ts_ms = c2c_kc_ts; *sidx = c2c_kc_idx;
+    return 1;
+}
 static int c2c_trick_next(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
 {
-    struct c2c_wk *w = &c2c_w[0];
-    c2c_drop();
-    if (!c2c_fetch(w)) return 0;
-    *ts_ms = w->ts; *sidx = w->idx;
-    if (w->idx == c2c_kc_idx && c2c_kc_len > 0)
+    struct c2c_wk *cpu = &c2c_w[0], *cop = &c2c_w[1];
+    uint32_t want = m4.idx;                            /* v_get_frame put the cursor on the key frame it wants */
+    if (!c2c_in_trick) { c2c_drop(); c2c_in_trick = true; }
+    if (c2c_mode == 0)
     {
-        memcpy(m4_raw, c2c_kc, c2c_kc_len); *size = (uint32_t)c2c_kc_len;
-        return 1;
+        if (c2c_kc_len > 0 && c2c_kc_idx == want) return c2c_kc_give(ts_ms, size, sidx);
+        if (!c2c_fetch(cpu)) return 0;
+        c2c_cpu_run(cpu);
+        if (cpu->result <= 0) { c2c_account(0, cpu->size, cpu->result, 0, cpu->ts); return -1; }
+        c2c_kc_store(cpu);
+        return c2c_kc_give(ts_ms, size, sidx);
     }
-    c2c_cpu_run(w);
-    if (c2c_take(0, ts_ms, size, sidx) <= 0) return -1;
-    memcpy(c2c_kc, m4_raw, *size); c2c_kc_len = (int)*size; c2c_kc_idx = *sidx;
-    return 1;
+    if (cop->have && c2c_cop_poll())
+    {
+        cop->have = false;
+        if (cop->result <= 0) c2c_account(1, cop->size, cop->result, 0, cop->ts);   /* the error message */
+        c2c_kc_store(cop);
+    }
+    if (c2c_kc_len > 0 && c2c_kc_idx == want) return c2c_kc_give(ts_ms, size, sidx);
+    if (!cop->have)
+    {
+        if (!c2c_fetch(cop)) return c2c_kc_len > 0 ? c2c_kc_give(ts_ms, size, sidx) : 0;
+        c2c_cop_submit(); cop->have = true;
+    }
+    if (c2c_kc_len > 0) return c2c_kc_give(ts_ms, size, sidx);   /* the newest picture now, the wanted one later */
+    c2c_cop_wait(); cop->have = false;                 /* the first one: wait */
+    if (cop->result <= 0) { c2c_account(1, cop->size, cop->result, 0, cop->ts); return -1; }
+    c2c_kc_store(cop);
+    return c2c_kc_give(ts_ms, size, sidx);
 }
 /* v125: the next video sample, transcoded, into m4_raw.  1 = ok, 0 = end of stream, -1 = this frame failed.
    Both cores (mode 2): the COP holds one frame; when that one is asked for, the CPU transcodes the frame after it in
@@ -4238,8 +4283,13 @@ static int c2c_next(uint32_t *ts_ms, uint32_t *size, uint32_t *sidx)
         return m4_fetch(m4_raw, size, ts_ms, sidx) > 0 ? -1 : 0;
     }
     if (!c2c_iram_on && av_vc_route) c2c_iram_claim();   /* the VideoCore plays the sound: the codec IRAM is free */
+    if (c2c_trick) return c2c_trick_next(ts_ms, size, sidx);   /* (v126: before the jump check -- every key frame is one) */
+    if (c2c_in_trick)
+    {   /* FF / REW over: its COP job goes, the statistics start a new window */
+        c2c_drop(); c2c_in_trick = false;
+        memset(&c2c_win, 0, sizeof c2c_win); c2c_next_ms = 0;
+    }
     if (c2c_q_gen != m4_gen) { c2c_drop(); c2c_q_gen = m4_gen; }   /* the cursor jumped: what was fetched is stale */
-    if (c2c_trick) return c2c_trick_next(ts_ms, size, sidx);
     if (c2c_mode == 0)
     {
         if (!c2c_fetch(cpu)) return 0;
@@ -5135,6 +5185,7 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
     r = bcm_pds_send_frame(&f);
     v_frames++; v_bytes += n; v_last_vts = ts;
     pev_add('V', m4.idx - 1, ts, (uint32_t)n | (key ? 0x80000000u : 0));                   /* v108 */
+    if (tf_dir && c2c_on) tf_cur = ts;                 /* v126: the scan goes on from the picture actually sent */
     if (tf_dir)                                                                            /* v108: every fast-forward frame */
         BLOG("  ff frame: sample %u (%u ms), %d B%s, send=%d", (unsigned)(m4.idx - 1), (unsigned)ts, n, key ? ", key" : "", r);
     if (v_frames <= 12 || v_frames % (cfg_quiet ? 900 : 30) == 0 || r < 0)
@@ -5288,7 +5339,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v125 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v126 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -8991,6 +9042,7 @@ static void pl_free_traced(void)
     if (m4.fd >= 0) close(m4.fd);
     m4.fd = -1;
     BLOG("exit: video file closed");
+    if (bcm_bus_timeouts) BLOG("exit: %u LCD bus wait(s) timed out since boot (the BCM did not answer)", bcm_bus_timeouts);   /* v126 */
     c2c_close();                                       /* v125: its totals in this log (v124: in the next one), memory back */
     m4c_reset(); ra_free();
     BLOG("exit: read-ahead ring freed");
@@ -9716,7 +9768,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v125, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v126, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -9828,6 +9880,7 @@ vc_boot:                                               /* v96: recovery comes ba
     rc_planned = false;
     boots = bcm_get_boot_info(snap);
     BLOG("bcm_use_vmcs_image = %d (0 ok, -1 no NOR vmcs, -2 BCM not rebooted); boots so far %u", r, boots);
+    if (bcm_bus_timeouts) BLOG("LCD bus: %u wait(s) timed out since boot (v126: bounded; the BCM did not answer)", bcm_bus_timeouts);
     BLOG("VC[1F0..1FC] right after boot = %08x %08x %08x %08x",
          snap[0], snap[1], snap[2], snap[3]);
     /* v21: the v20 run that produced a one-line log booted "successfully" in 0.09 s (normal: 0.8 s) with
@@ -10368,7 +10421,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac;
-        simplelist_info_init(&info, "CABAC tests v125 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v126 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -10393,7 +10446,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v125, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v126, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();

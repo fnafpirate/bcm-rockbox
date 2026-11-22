@@ -175,11 +175,24 @@ static bool flash_get_section(const unsigned int imageid,
 }
 #endif /* HAVE_LCD_SLEEP */
 
+#ifndef BOOTLOADER
+/* bcm overlay v126: the LCD driver's bus waits are bounded.  They run with interrupts off (lcd_unblock_and_update), so a
+   BCM that stopped answering froze the iPod for good: no tick, so neither the BCM player's software watchdog nor the
+   backlight timeout ran (v125 CABAC test 7: hung while the VideoCore booted, manual reset; an earlier USB connect that
+   froze with the backlight off).  ~0.5 s at 80 MHz, then carry on as if ready; bcm_bus_timeouts counts them. */
+volatile unsigned bcm_bus_timeouts;
+#define BCM_SPIN(cond) do { unsigned _n = 4000000; while (!(cond)) if (--_n == 0) { bcm_bus_timeouts++; break; } } while (0)
+#endif
+
 static inline void bcm_write_addr(unsigned address)
 {
     BCM_WR_ADDR32 = address;       /* write destination address */
 
+#ifdef BOOTLOADER
     while (!(BCM_CONTROL & 0x2));  /* wait for it to be write ready */
+#else
+    BCM_SPIN(BCM_CONTROL & 0x2);
+#endif
 }
 
 static inline void bcm_write32(unsigned address, unsigned value)
@@ -192,11 +205,19 @@ static inline void bcm_write32(unsigned address, unsigned value)
 
 static inline unsigned bcm_read32(unsigned address)
 {
+#ifdef BOOTLOADER
     while (!(BCM_RD_ADDR & 1));
+#else
+    BCM_SPIN(BCM_RD_ADDR & 1);
+#endif
 
     BCM_RD_ADDR32 = address;       /* write source address */
 
+#ifdef BOOTLOADER
     while (!(BCM_CONTROL & 0x10)); /* wait for it to be read ready */
+#else
+    BCM_SPIN(BCM_CONTROL & 0x10);
+#endif
 
     return BCM_DATA32;             /* read value */
 }
