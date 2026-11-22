@@ -445,6 +445,12 @@ void iap_dock_ui(void)
         vpref_save_pending = false;
         settings_save();
     }
+    if (dk.ui_connect && dk.state != 2)
+    {   /* v128: it came and went before the UI got here (plugged in while a video played, say): no "connected" now.
+           v127 handled "disconnected" first and then this one, so the last notice said "Dock connected" with nothing
+           in the socket -- and the dock profile stayed applied. */
+        dk.ui_connect = false;
+    }
     if (dk.ui_disconnect)
     {
         int n = dk_read(dk_tab, DOCK_MAX), i;

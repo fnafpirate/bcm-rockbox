@@ -2930,7 +2930,7 @@ extern void bcm_lcd_set_hosted(void (*upd)(int, int, int, int), void (*slp)(void
 static unsigned char bcm_vmcs_buf[204800] __attribute__((aligned(4))); /* vmcs.bin is 201376 B */
 /* v124: the CABAC tests (Debug > CABAC tests): log file, settings and a header line for one run */
 static const char *ct_log_path;
-static int ct_cop = -1, ct_iram = -1, ct_tv = -1, ct_scrub = -1;
+static int ct_cop = -1, ct_iram = -1, ct_tv = -1, ct_scrub = -1, ct_exact = -1;
 static char ct_header[120];
 static int bcm_log_fd = -1;
 static bool bcm_vc_flat;               /* v56: the VideoCore files are in /.rockbox/VideoCore/ */
@@ -4796,6 +4796,13 @@ static int cfg_subs = -1, cfg_subs_layer = 0, cfg_subs_sync = 1500, cfg_subs_del
 static int cfg_stock_step_ms = 200;                  /* v114: SM_STOCK's time per step (see sm_name) */
 static int cfg_scan_fb_ms = 2000;                    /* v115: SM_SCAN: no new picture in this long -> time only */
 static int cfg_scrub_mode = 0, cfg_scrub_tick = 300, cfg_step_ms = 40, cfg_tap_secs = 10, cfg_ff_rate = 0xa00;   /* v45: FF/REW */
+/* v129: where a "time only" FF / REW release lands.  0: the nearest key frame (v128).  1: the exact second -- mp_seek
+   to the release point; the VideoCore is fed from the key frame before it (it needs those frames to decode), its clock
+   and the sound start at the release point, so the frames before it are late.  2: as 1, but those frames are sent
+   with the release point's time stamp.  Which of 1 / 2 the VideoCore shows cleanly is what the v129 tests find out. */
+static int cfg_seek_exact = 1;
+static uint32_t sx_target = 0xffffffffu, sx_squash_until;   /* v129: exact seek (cfg_seek_exact) */
+static int sx_mode, sx_pre;
 static int cfg_log_sync = 10, cfg_seekmon = 12, cfg_quiet = 1, cfg_m4cache = 1;                                 /* v45: feed speed */
 static int cfg_ff_accel = 1;                                                        /* v47 */
 static int cfg_sound = 2, cfg_av_tol = 150, cfg_av_lead = 0, cfg_vol_start = 50, cfg_vol_step = 3;  /* v51 (v53: sound 2 = stock route) */
@@ -4912,6 +4919,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "subs_sync")) cfg_subs_sync = v < 200 ? 200 : v;
         else if (!strcmp(p, "subs_delay")) cfg_subs_delay = v;
         else if (!strcmp(p, "scrub_mode")) cfg_scrub_mode = v;
+        else if (!strcmp(p, "seek_exact")) cfg_seek_exact = v;     /* v129 */
         else if (!strcmp(p, "scrub_tick")) cfg_scrub_tick = v < 100 ? 100 : v;
         else if (!strcmp(p, "step_ms"))  cfg_step_ms = v;
         else if (!strcmp(p, "tap_secs")) cfg_tap_secs = v;
@@ -5189,6 +5197,11 @@ static void v_get_frame(int id, uint32_t w1, uint32_t w2)
         v_eos++; bcm_pds_send_empty(); pev_add('E', (uint32_t)want, 0, 0);
         return;
     }
+    if (sx_squash_until && !tf_dir)
+    {   /* v129, seek_exact=2: the frames between the key frame and the seek point carry the seek point's time */
+        if (ts < sx_squash_until) { ts = sx_squash_until; sx_pre++; }
+        else { BLOG("  exact seek: %d frame(s) before %u ms sent with its time stamp", sx_pre, (unsigned)sx_squash_until); sx_squash_until = 0; }
+    }
     memset(&f, 0, sizeof f);
     (void)id;                                           /* v14: `id` is the object id string from the 0x41 message, NOT a stream id */
     f.stream_id = 0;                                    /* video-only file: video is stream 0 (ids count accepted streams in file order) */
@@ -5210,12 +5223,22 @@ static void v_seek(int id, uint32_t pos)
 {
     uint32_t k, kms;
     v_seeks++;
+    sx_squash_until = 0;
     if (pos == 0) { m4_rewind(); m4.need_ps = true; if (ma.ok) ma_rewind(); a_eos = 0; v_seek_kms = 0; v_seek_n++; vc_seeks_boot++; pev_add('S', 0, 0, 0); BLOG("  PDS seek: stream=%d pos=0 -> rewind", id); return; }
     k = m4_key_at(pos, &kms);                          /* v42: pos = milliseconds (it is the mp_seek argument) */
     v_seek_kms = kms; v_seek_n++; vc_seeks_boot++;    /* v109 */
     pev_add('S', pos, k, kms);                         /* v108 */
     m4_seek_sample(k);
-    if (ma.ok) { ma_seek_ms(kms); a_eos = 0; }         /* v53: the sound restarts at the key frame too */
+    if (sx_target != 0xffffffffu && pos == sx_target && pos > kms)
+    {   /* v129: an exact seek: the sound starts at the release point; the video from the key frame before it */
+        if (ma.ok) { ma_seek_ms(pos); a_eos = 0; }
+        if (sx_mode == 2) sx_squash_until = pos;
+        sx_pre = 0;
+        BLOG("  exact seek: %u ms, video from the key frame at %u ms (%u ms before), %s", (unsigned)pos, (unsigned)kms,
+             (unsigned)(pos - kms), sx_mode == 2 ? "those frames stamped with the seek time" : "those frames late");
+        sx_target = 0xffffffffu;
+    }
+    else if (ma.ok) { ma_seek_ms(kms); a_eos = 0; }    /* v53: the sound restarts at the key frame too */
     BLOG("  PDS seek: stream=%d pos=%u ms -> key frame sample %u at %u ms (chunk %u +%u)", id, (unsigned)pos, (unsigned)k, (unsigned)kms,
          (unsigned)m4.chunk, (unsigned)m4.off_in_chunk);
 }
@@ -5352,7 +5375,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v127 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v129 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -7096,7 +7119,10 @@ static void scrub_begin(int dir)
     sc_active = true; sc_dir = dir; sc_ticks = 0; sc_t0 = current_tick; sc_next = current_tick;
     sc_pos = pl_el_ms; pl_target_ms = sc_pos; sc_jump = 4000;
     sc_was_playing = !pl_paused;
-    sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : bcm_player_mode ? SM_SCAN : (dir > 0 ? sm_ff : sm_rew);
+    sc_method = cfg_scrub_mode != SM_AUTO ? cfg_scrub_mode : bcm_player_mode ? (c2c_on ? SM_STOCK : SM_SCAN) : (dir > 0 ? sm_ff : sm_rew);
+    /* v128: CABAC video scrubs "time only" by default.  The VideoCore's picture scan pulls 15-30 key frames per step
+       into its queue (v125-v127 logs); at 0.2 s per transcoded 480p key frame the scan either ran to the end before it
+       showed anything (v125, v127) or showed queued copies (v126).  scrub_mode=8 still selects the picture scan. */
     if (sc_method == SM_STEP && dir < 0) sc_method = SM_JUMP;
     if (seek_budget_out(0)) sc_method = SM_MARK;       /* v109 */
     BLOG("  scrub: %s held at %u ms, method %s (%d seeks since boot)", dir > 0 ? "FF" : "REW", (unsigned)sc_pos, sm_name[sc_method],
@@ -7284,12 +7310,24 @@ static void scrub_end(void)
         uint32_t d = pl_dur_ms ? pl_dur_ms : m4_dur_ms;
         if (d && sc_pos + 1500 >= d) sc_pos = d > 1500 ? d - 1500 : 0;
         m4_key_at(sc_pos, &k);
+        {   /* v128: the NEAREST key frame, not always the one before (v127 test 9: up to 4 s back with 5 s GOPs) */
+            uint32_t s2 = pl_key_after(sc_pos), kn;
+            if (s2 != 0xffffffffu && (kn = pl_key_ms(s2)) > sc_pos && kn - sc_pos < sc_pos - k && (!d || kn + 1500 < d)) k = kn;
+        }
         BLOG("  scrub: released at %u ms after %d ticks (stock: x%u at the end) -> one seek to the key frame at %u ms",
              (unsigned)sc_pos, sc_ticks, (unsigned)stk_mult, (unsigned)k);
-        if (seek_budget_out(0)) { pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; rc_plan(k); return; }
+        if (cfg_seek_exact)
+        {   /* v129: the exact release point (it lands there; the frames before it come from the key frame before) */
+            uint32_t kb;
+            m4_key_at(sc_pos, &kb);
+            if (sc_pos > kb + 40) { k = sc_pos; sx_target = k; sx_mode = cfg_seek_exact; }
+            BLOG("  scrub: exact seek (seek_exact=%d) to %u ms", cfg_seek_exact, (unsigned)k);
+        }
+        if (seek_budget_out(0)) { sx_target = 0xffffffffu; pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; rc_plan(k); return; }
         av_hold();
         snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
         pl_cmd(c, true);
+        sx_target = 0xffffffffu;                           /* (v_seek took it, or the VideoCore did not seek) */
         if (sc_was_playing && pl_paused) { pl_cmd("mp_play", true); pl_paused = false; }   /* v115: after a scan fallback */
         else if (pl_paused) pl_cmd("mp_step 0", true);  /* stock: a paused seek shows its new picture */
         pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; st_seeked();
@@ -9782,7 +9820,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v127, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v129, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -9813,6 +9851,7 @@ static bool bcm_run(const char *play_path)
         if (ct_cop >= 0) cfg_cabac_cop = ct_cop;
         if (ct_iram >= 0) cfg_cabac_iram = ct_iram;
         if (ct_scrub >= 0) cfg_scrub_mode = ct_scrub;   /* v127 */
+        if (ct_exact >= 0) cfg_seek_exact = ct_exact;   /* v129 */
         cfg_tv = ct_tv;
         BLOG("%s", ct_header);
     }
@@ -10272,18 +10311,20 @@ static bool dbg_flash_dump(void)
    bcm_test.cfg needed) and its log goes to /cabac125_NN_<name>.txt (v125) -- a second run of the same test gets _run2, _run3,
    ... so nothing is overwritten.  When the clip ends (or MENU stops it) the list comes back with the next test
    highlighted.  Then send me the /cabac_test_*.txt files. */
-struct ct_test { const char *name, *clip, *desc; int cop, iram, tv, scrub; };   /* scrub: -1 = as set, 7 = time only (v127) */
+struct ct_test { const char *name, *clip, *desc; int cop, iram, tv, scrub, exact; };   /* scrub: 0 = as set, 8 = picture scan (v128); exact: seek_exact + 1, 0 = as set (v129) */
 /* v125: cop 0 = CPU, 1 = COP one ahead, 2 = both cores; iram 1 = the transcoder runs from IRAM.  clip NULL = the bench */
 static const struct ct_test ct_tests[] = {
-    { "speed_bench",        NULL,                         "speed bench, no picture (~3 min)", 2, 1, 0, 0 },
-    { "240p_tv",            "/cabac_240p_tv.mp4",         "240p TV",                          2, 1, 0, 0 },
-    { "480p_tv",            "/cabac_480p_tv.mp4",         "480p TV",                          2, 1, 0, 0 },
-    { "240p_stress",        "/cabac_240p30_stress.mp4",   "240p 30fps stress",                2, 1, 0, 0 },
-    { "480p_stress",        "/cabac_480p30_stress.mp4",   "480p 30fps stress",                2, 1, 0, 0 },
-    { "480p_stress_1core",  "/cabac_480p30_stress.mp4",   "480p 30fps stress, 2nd core only", 1, 1, 0, 0 },
-    { "ffrew",              "/cabac_480p_bigcoef.mp4",    "FF to the end, REW to the start",  2, 1, 0, 0 },
-    { "480p_tv_tvout",      "/cabac_480p_tv.mp4",         "480p TV on TV out",                2, 1, 1, 0 },
-    { "480p_tv_ff_timeonly","/cabac_480p_tv.mp4",         "480p TV, FF/REW time only",        2, 1, 0, 7 },
+    { "speed_bench",        NULL,                         "speed bench, no picture (~3 min)", 2, 1, 0, 0, 0 },
+    { "240p_tv",            "/cabac_240p_tv.mp4",         "240p TV",                          2, 1, 0, 0, 0 },
+    { "480p_tv",            "/cabac_480p_tv.mp4",         "480p TV",                          2, 1, 0, 0, 0 },
+    { "240p_stress",        "/cabac_240p30_stress.mp4",   "240p 30fps stress",                2, 1, 0, 0, 0 },
+    { "480p_stress",        "/cabac_480p30_stress.mp4",   "480p 30fps stress",                2, 1, 0, 0, 0 },
+    { "480p_stress_1core",  "/cabac_480p30_stress.mp4",   "480p 30fps stress, 2nd core only", 1, 1, 0, 0, 0 },
+    { "ffrew",              "/cabac_480p_bigcoef.mp4",    "FF to the end, REW to the start",  2, 1, 0, 0, 0 },
+    { "480p_tv_tvout",      "/cabac_480p_tv.mp4",         "480p TV on TV out",                2, 1, 1, 0, 0 },
+    { "480p_tv_ff_scan",    "/cabac_480p_tv.mp4",         "480p TV, FF/REW picture scan",     2, 1, 0, 8, 0 },
+    { "480p_tv_exact2",     "/cabac_480p_tv.mp4",         "480p TV, exact FF stop, way 2",    2, 1, 0, 0, 3 },
+    { "480p_tv_keyframe",   "/cabac_480p_tv.mp4",         "480p TV, FF stops on key frame",   2, 1, 0, 0, 1 },
 };
 #define CT_N ((int)ARRAYLEN(ct_tests))
 static int ct_next;
@@ -10436,8 +10477,8 @@ static bool dbg_cabac_tests(void)
         const struct ct_test *t;
         char path[MAX_PATH];
         int run, i;
-        bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode;
-        simplelist_info_init(&info, "CABAC tests v127 (clips in the drive root)", CT_N, NULL);
+        bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, exact_save = cfg_seek_exact;
+        simplelist_info_init(&info, "CABAC tests v129 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -10455,14 +10496,14 @@ static bool dbg_cabac_tests(void)
         ct_logname(i, run, path, sizeof path);
         snprintf(ct_header, sizeof ct_header, "CABAC TEST %d (%s), run %d: %s -- %s, %s, %s", i + 1, t->name, run,
                  t->clip ? t->clip : "4 clips", t->cop == 2 ? "both cores" : t->cop ? "2nd core" : "main CPU",
-                 t->iram ? "IRAM" : "SDRAM", t->scrub == 7 ? "iPod screen, FF/REW time only" : t->tv ? "TV out" : "iPod screen");
+                 t->iram ? "IRAM" : "SDRAM", t->scrub == 8 ? "iPod screen, FF/REW picture scan" : t->exact ? (t->exact == 3 ? "iPod screen, seek_exact=2" : "iPod screen, seek_exact=0") : t->tv ? "TV out" : "iPod screen");
         splashf(HZ * 2, "Test %d: %s", i + 1, t->desc);
-        ct_log_path = path; ct_cop = t->cop; ct_iram = t->iram; ct_tv = t->tv; ct_scrub = t->scrub ? t->scrub : -1;
+        ct_log_path = path; ct_cop = t->cop; ct_iram = t->iram; ct_tv = t->tv; ct_scrub = t->scrub ? t->scrub : -1; ct_exact = t->exact ? t->exact - 1 : -1;
         if (!t->clip)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v127, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v129, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
@@ -10477,8 +10518,8 @@ static bool dbg_cabac_tests(void)
             bcm_run_sl(t->clip);
             bcm_tv = tv_save;
         }
-        ct_log_path = NULL; ct_cop = ct_iram = ct_tv = ct_scrub = -1;
-        cfg_cabac_cop = cop_save; cfg_cabac_iram = iram_save; cfg_tv = tv_cfg_save; cfg_cabac = cabac_save; cfg_scrub_mode = scrub_save;
+        ct_log_path = NULL; ct_cop = ct_iram = ct_tv = ct_scrub = ct_exact = -1;
+        cfg_cabac_cop = cop_save; cfg_cabac_iram = iram_save; cfg_tv = tv_cfg_save; cfg_cabac = cabac_save; cfg_scrub_mode = scrub_save; cfg_seek_exact = exact_save;
         ct_next = i + 1 < CT_N ? i + 1 : 0;
         splashf(HZ * 2, "Saved %s", path + 1);
     }
