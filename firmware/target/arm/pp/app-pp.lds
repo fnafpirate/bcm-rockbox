@@ -70,6 +70,24 @@ SECTIONS
     } AT> DRAM
 #endif
     
+#if defined(IPOD_VIDEO) && CONFIG_CPU == PP5022
+    /* bcm overlay v125: the second copy of the CABAC -> CAVLC transcoder (apps/bcm_cab2cav_iram.c), linked to run at
+     * the start of the IRAM Rockbox's codecs and plugins use (0x4000c000, 80 KB).  Nothing copies it at boot: the load
+     * image stays in SDRAM (before .vectors, so .bss never overlays it) and debug_menu.c copies it in while a video
+     * plays with Rockbox's playback stopped. */
+    .c2ciram 0x4000c000 :
+    {
+        _c2ciram_start = .;
+        *(.c2ciram.text*)
+        *(.c2ciram.rodata*)
+        *(.c2ciram.bss*)
+        . = ALIGN(0x4);
+        _c2ciram_end = .;
+    } AT> DRAM
+    _c2ciram_copy = LOADADDR(.c2ciram);
+    ASSERT(_c2ciram_end <= 0x40020000, "bcm: .c2ciram is larger than the codec IRAM")
+#endif
+
     /DISCARD/ :
     {
         *(.eh_frame)

@@ -26,9 +26,19 @@
 #endif
 /* bcm overlay v123: H.264 CABAC -> CAVLC entropy transcoder.  See bcm_cab2cav.h.
  * Clause numbers refer to ITU-T H.264 (Rec. H.264 | ISO/IEC 14496-10). */
+#ifndef C2C_TEXT
+#define C2C_TEXT                              /* sections: the iPod build has a second copy that runs from IRAM */
+#endif
+#ifndef C2C_RODATA
+#define C2C_RODATA
+#endif
+#ifndef C2C_BSS
+#define C2C_BSS
+#endif
 #include <string.h>
 #include "bcm_cab2cav.h"
 #include "bcm_cab2cav_tables.h"
+
 
 #ifndef C2C_MAX_NAL
 #define C2C_MAX_NAL (256 * 1024)              /* largest output NAL unit */
@@ -49,7 +59,7 @@
 /* ------------------------------------------------------------------ bit reader (RBSP) */
 typedef struct { const uint8_t *buf; uint32_t pos, end; } br_t;   /* pos / end in bits */
 
-static inline uint32_t br_u(br_t *b, int n)          /* 1 <= n <= 25 */
+C2C_TEXT static inline uint32_t br_u(br_t *b, int n)          /* 1 <= n <= 25 */
 {
     const uint8_t *p = b->buf + (b->pos >> 3);
     uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
@@ -57,13 +67,13 @@ static inline uint32_t br_u(br_t *b, int n)          /* 1 <= n <= 25 */
     b->pos += n;
     return v >> (32 - n);
 }
-static inline uint32_t br_u1(br_t *b)
+C2C_TEXT static inline uint32_t br_u1(br_t *b)
 {
     uint32_t v = (b->buf[b->pos >> 3] >> (7 - (b->pos & 7))) & 1;
     b->pos++;
     return v;
 }
-static uint32_t br_ue(br_t *b)
+C2C_TEXT static uint32_t br_ue(br_t *b)
 {
     int lz = 0;
     while (!br_u1(b)) { if (++lz > 31 || b->pos > b->end) return 0xffffffff; }
@@ -71,7 +81,7 @@ static uint32_t br_ue(br_t *b)
     if (lz > 25) { uint32_t hi = br_u(b, lz - 16); return ((1u << lz) - 1) + ((hi << 16) | br_u(b, 16)); }
     return ((1u << lz) - 1) + br_u(b, lz);
 }
-static int32_t br_se(br_t *b)
+C2C_TEXT static int32_t br_se(br_t *b)
 {
     uint32_t k = br_ue(b);
     return (k & 1) ? (int32_t)((k + 1) >> 1) : -(int32_t)(k >> 1);
@@ -80,13 +90,13 @@ static int32_t br_se(br_t *b)
 /* ------------------------------------------------------------------ bit writer (RBSP; escaped afterwards) */
 typedef struct { uint8_t *p, *end; uint32_t acc; int left; int err; int big; uint32_t clamped, escaped; } bw_t;
 
-static inline void bw_word(bw_t *w, uint32_t a)
+C2C_TEXT static inline void bw_word(bw_t *w, uint32_t a)
 {
     if (w->p + 4 > w->end) { w->err = 1; return; }
     w->p[0] = (uint8_t)(a >> 24); w->p[1] = (uint8_t)(a >> 16); w->p[2] = (uint8_t)(a >> 8); w->p[3] = (uint8_t)a;
     w->p += 4;
 }
-static inline void bw_put(bw_t *w, uint32_t v, int n)  /* v < 2^n, n <= 24 */
+C2C_TEXT static inline void bw_put(bw_t *w, uint32_t v, int n)  /* v < 2^n, n <= 24 */
 {
     if (n < w->left) { w->acc = (w->acc << n) | v; w->left -= n; return; }
     n -= w->left;
@@ -94,8 +104,8 @@ static inline void bw_put(bw_t *w, uint32_t v, int n)  /* v < 2^n, n <= 24 */
     w->acc = v;
     w->left = 32 - n;
 }
-static uint8_t log2tab[256];
-static inline void bw_ue(bw_t *w, uint32_t v)
+C2C_BSS static uint8_t log2tab[256];
+C2C_TEXT static inline void bw_ue(bw_t *w, uint32_t v)
 {
     uint32_t x = v + 1; int len;
     if (x < 256) { len = log2tab[x]; bw_put(w, x, 2 * len + 1); return; }
@@ -104,8 +114,8 @@ static inline void bw_ue(bw_t *w, uint32_t v)
     if (len > 12) { bw_put(w, 0, len); bw_put(w, x, len + 1); return; }
     bw_put(w, x, 2 * len + 1);
 }
-static inline void bw_se(bw_t *w, int32_t v) { bw_ue(w, v > 0 ? 2u * v - 1 : (uint32_t)(-2 * v)); }
-static void bw_trailing(bw_t *w)                        /* rbsp_trailing_bits, then flush */
+C2C_TEXT static inline void bw_se(bw_t *w, int32_t v) { bw_ue(w, v > 0 ? 2u * v - 1 : (uint32_t)(-2 * v)); }
+C2C_TEXT static void bw_trailing(bw_t *w)                        /* rbsp_trailing_bits, then flush */
 {
     bw_put(w, 1, 1);
     int used = 32 - w->left;
@@ -117,14 +127,14 @@ static void bw_trailing(bw_t *w)                        /* rbsp_trailing_bits, t
     }
     w->left = 32;
 }
-static void bw_copy(bw_t *w, br_t *b, uint32_t from, uint32_t to)
+C2C_TEXT static void bw_copy(bw_t *w, br_t *b, uint32_t from, uint32_t to)
 {
     b->pos = from;
     while (to - b->pos >= 16) bw_put(w, br_u(b, 16), 16);
     if (to > b->pos) { int n = to - b->pos; bw_put(w, br_u(b, n), n); }
 }
 /* RBSP -> NAL payload (emulation_prevention_three_byte); returns the length or -1 */
-static int escape(const uint8_t *in, int n, uint8_t *out, int cap)
+C2C_TEXT static int escape(const uint8_t *in, int n, uint8_t *out, int cap)
 {
     int o = 0, z = 0;
     for (int i = 0; i < n; i++) {
@@ -184,15 +194,15 @@ struct c2c {
     uint8_t obuf[C2C_MAX_NAL];                 /* CAVLC RBSP before escaping */
 };
 
-static const uint8_t trans_lps[64] = {
+C2C_RODATA static const uint8_t trans_lps[64] = {
     0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9,11,11,12,13,13,15,15,16,16,18,18,19,19,21,21,22,22,23,24,
    24,25,26,26,27,27,28,29,29,30,30,30,31,32,32,33,33,33,34,34,35,35,35,36,36,36,37,37,37,38,38,63 };
-static uint8_t renorm_shift[256];
+C2C_BSS static uint8_t renorm_shift[256];
 static void eng_tables(void);
 
-uint32_t c2c_state_size(void) { return sizeof(struct c2c); }
+C2C_TEXT uint32_t c2c_state_size(void) { return sizeof(struct c2c); }
 
-c2c_t *c2c_init(void *mem, uint32_t size)
+C2C_TEXT c2c_t *c2c_init(void *mem, uint32_t size)
 {
     if (size < sizeof(struct c2c)) return 0;
     memset(mem, 0, sizeof(struct c2c));
@@ -201,9 +211,9 @@ c2c_t *c2c_init(void *mem, uint32_t size)
     eng_tables();
     return (c2c_t *)mem;
 }
-const c2c_stats_t *c2c_stats(c2c_t *c) { return &c->st; }
-void c2c_set_escape(c2c_t *c, int on) { c->big = on; }
-const char *c2c_errstr(int e)
+C2C_TEXT const c2c_stats_t *c2c_stats(c2c_t *c) { return &c->st; }
+C2C_TEXT void c2c_set_escape(c2c_t *c, int on) { c->big = on; }
+C2C_TEXT const char *c2c_errstr(int e)
 {
     switch (e) {
     case C2C_ERR_SYNTAX: return "bitstream error";
@@ -217,9 +227,9 @@ const char *c2c_errstr(int e)
 
 /* ------------------------------------------------------------------ CABAC engine (9.3.1.2, 9.3.3.2) */
 /* tables indexed by the context byte (pStateIdx << 1 | valMPS) */
-static uint8_t rlps[128][4], next_mps[128], next_lps[128];
+C2C_BSS static uint8_t rlps[128][4], next_mps[128], next_lps[128];
 
-static void eng_tables(void)
+C2C_TEXT static void eng_tables(void)
 {
     for (int s = 0; s < 128; s++) {
         int st = s >> 1, m = s & 1;
@@ -231,7 +241,7 @@ static void eng_tables(void)
 #define ENG_REFILL(e) do { if ((e)->k < 8) { (e)->val = ((e)->val << 16) | ((uint32_t)(e)->p[0] << 8) | (e)->p[1]; \
                                             (e)->p += 2; (e)->k += 16; } } while (0)
 
-static inline int e_dec(eng_t *e, uint8_t *ctx, int ci)
+C2C_TEXT static inline int e_dec(eng_t *e, uint8_t *ctx, int ci)
 {
     uint32_t s = ctx[ci];
     uint32_t lps = rlps[s][(e->range >> 6) & 3];
@@ -250,7 +260,7 @@ static inline int e_dec(eng_t *e, uint8_t *ctx, int ci)
     ENG_REFILL(e);
     return (s & 1) ^ 1;
 }
-static inline int e_bypass(eng_t *e)
+C2C_TEXT static inline int e_bypass(eng_t *e)
 {
     e->k--;
     uint32_t t = e->range << e->k;
@@ -269,7 +279,7 @@ static inline int e_bypass(eng_t *e)
 #define cab_dec(c, ci) e_dec(E, (c)->ctx, (ci))
 #define cab_bypass(c) e_bypass(E)
 #endif
-static AI int cab_term(c2c_t *c, eng_t *E)
+C2C_TEXT static AI int cab_term(c2c_t *c, eng_t *E)
 {
     (void)c;
     eng_t *e = E;
@@ -284,7 +294,7 @@ static AI int cab_term(c2c_t *c, eng_t *E)
     return 0;
 }
 /* start the engine at byte-aligned bit position pos of c->b */
-static void cab_init_engine(c2c_t *c, eng_t *E, uint32_t pos)
+C2C_TEXT static void cab_init_engine(c2c_t *c, eng_t *E, uint32_t pos)
 {
     const uint8_t *p = c->b->buf + (pos >> 3);
     E->val = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -292,9 +302,9 @@ static void cab_init_engine(c2c_t *c, eng_t *E, uint32_t pos)
     E->p = p + 3;
     E->range = 510;
 }
-static inline uint32_t cab_pos(c2c_t *c, eng_t *E) { return (uint32_t)(E->p - c->b->buf) * 8 - E->k; }
+C2C_TEXT static inline uint32_t cab_pos(c2c_t *c, eng_t *E) { return (uint32_t)(E->p - c->b->buf) * 8 - E->k; }
 
-static void cab_init_ctx(c2c_t *c, int slice_qp, int table)
+C2C_TEXT static void cab_init_ctx(c2c_t *c, int slice_qp, int table)
 {
     int qp = slice_qp < 0 ? 0 : slice_qp > 51 ? 51 : slice_qp;
     for (int i = 0; i < 460; i++) {
@@ -305,7 +315,7 @@ static void cab_init_ctx(c2c_t *c, int slice_qp, int table)
 }
 
 /* ------------------------------------------------------------------ helpers */
-static inline int r2b8(int r) { return ((r >> 3) << 1) | ((r & 3) >> 1); }   /* raster 4x4 -> 8x8 index */
+C2C_TEXT static inline int r2b8(int r) { return ((r >> 3) << 1) | ((r & 3) >> 1); }   /* raster 4x4 -> 8x8 index */
 
 /* per-macroblock context caches: luma 8 bytes per row (row / column -1 = neighbours, the 4x4
    interior of each row is one aligned word), chroma 4 bytes per row, both components */
@@ -319,11 +329,11 @@ typedef struct {
     int8_t cnz[2][12];
 } mc_t;
 #define B8(a) ((uint8_t *)(a))
-static const uint8_t blkx[16] = { 0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3 };
-static const uint8_t blky[16] = { 0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3 };
+C2C_RODATA static const uint8_t blkx[16] = { 0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3 };
+C2C_RODATA static const uint8_t blky[16] = { 0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3 };
 
 /* ------------------------------------------------------------------ CABAC syntax elements */
-static AI int cab_ue_k(c2c_t *c, eng_t *E, int k)                     /* Exp-Golomb bypass suffix (UEGk) */
+C2C_TEXT static AI int cab_ue_k(c2c_t *c, eng_t *E, int k)                     /* Exp-Golomb bypass suffix (UEGk) */
 {
     (void)c;
     uint32_t v = 0;
@@ -332,7 +342,7 @@ static AI int cab_ue_k(c2c_t *c, eng_t *E, int k)                     /* Exp-Gol
     return (int)v;
 }
 
-static const uint8_t sig_off[5] = { 0, 15, 29, 44, 47 }, abs_off[5] = { 0, 10, 20, 30, 39 };
+C2C_RODATA static const uint8_t sig_off[5] = { 0, 15, 29, 44, 47 }, abs_off[5] = { 0, 10, 20, 30, 39 };
 
 /* one residual block: its non-zero coefficients from the highest scan position down
    (the order CABAC decodes the levels in and the order CAVLC writes them in) */
@@ -340,7 +350,7 @@ typedef struct { uint8_t n; uint8_t pos[16]; int16_t lev[16]; } blk_t;
 
 /* residual_block_cabac after coded_block_flag == 1: fills k, returns the coefficient count.
    Most bins are decoded here, so the engine is kept in local variables. */
-static int cab_block(c2c_t *c, eng_t *E, int cat, int maxn, blk_t *k)
+C2C_TEXT static int cab_block(c2c_t *c, eng_t *E, int cat, int maxn, blk_t *k)
 {
     uint8_t sig[16];
     int n = 0;
@@ -410,7 +420,7 @@ levels:;
 }
 
 /* ------------------------------------------------------------------ CAVLC residual writer (9.2) */
-static int cav_block(bw_t *w, const blk_t *k, int maxn, int nC)
+C2C_TEXT static int cav_block(bw_t *w, const blk_t *k, int maxn, int nC)
 {
     int tc = k->n, t1 = 0;
     const int16_t *lev = k->lev;
@@ -473,7 +483,7 @@ static int cav_block(bw_t *w, const blk_t *k, int maxn, int nC)
 }
 
 /* nC (9.2.1) from the TotalCoeff of the left and upper blocks, -1 = not available */
-static inline int nc_of(int a, int b)
+C2C_TEXT static inline int nc_of(int a, int b)
 {
     if (a >= 0 && b >= 0) return (a + b + 1) >> 1;
     return a >= 0 ? a : b >= 0 ? b : 0;
@@ -498,21 +508,21 @@ typedef struct {
     int last_qpd_nz;
 } sctx_t;
 
-static const uint8_t part_num[4] = { 1, 2, 2, 4 };
-static const uint8_t sub_num[4] = { 1, 2, 2, 4 };
+C2C_RODATA static const uint8_t part_num[4] = { 1, 2, 2, 4 };
+C2C_RODATA static const uint8_t sub_num[4] = { 1, 2, 2, 4 };
 
 /* neighbour columns / rows into the caches */
-static inline void col_in(uint32_t *w, uint32_t v)        /* column -1 of rows 0..3 */
+C2C_TEXT static inline void col_in(uint32_t *w, uint32_t v)        /* column -1 of rows 0..3 */
 {
     uint8_t *b = B8(w);
     b[I8(-1, 0)] = (uint8_t)v; b[I8(-1, 1)] = (uint8_t)(v >> 8); b[I8(-1, 2)] = (uint8_t)(v >> 16); b[I8(-1, 3)] = (uint8_t)(v >> 24);
 }
-static inline uint32_t col_out(const uint32_t *w)         /* column 3 of rows 0..3 */
+C2C_TEXT static inline uint32_t col_out(const uint32_t *w)         /* column 3 of rows 0..3 */
 {
     const uint8_t *b = (const uint8_t *)w;
     return b[I8(3, 0)] | (b[I8(3, 1)] << 8) | (b[I8(3, 2)] << 16) | ((uint32_t)b[I8(3, 3)] << 24);
 }
-static void mc_fill_inter(mc_t *m)
+C2C_TEXT static void mc_fill_inter(mc_t *m)
 {
     const mbi_t *A = m->A, *B = m->B;
     if (m->avA) { col_in(m->mvx_w, A->mvx_r); col_in(m->mvy_w, A->mvy_r); col_in(m->refp_w, A->refp_r); }
@@ -520,7 +530,7 @@ static void mc_fill_inter(mc_t *m)
     if (m->avB) { m->mvx_w[1] = B->mvx_b; m->mvy_w[1] = B->mvy_b; m->refp_w[1] = B->refp_b; }
     else m->mvx_w[1] = m->mvy_w[1] = m->refp_w[1] = 0;
 }
-static void mc_fill_resid(mc_t *m)
+C2C_TEXT static void mc_fill_resid(mc_t *m)
 {
     const mbi_t *A = m->A, *B = m->B;
     uint32_t una = m->intra ? 0x01010101u : 0;            /* coded_block_flag of a missing neighbour */
@@ -543,7 +553,7 @@ static void mc_fill_resid(mc_t *m)
     }
 }
 /* store the right column / bottom row of the current MB for later neighbours */
-static void mc_store(mc_t *m, int inter, int resid)
+C2C_TEXT static void mc_store(mc_t *m, int inter, int resid)
 {
     mbi_t *c = m->cur;
     if (inter) {
@@ -562,14 +572,14 @@ static void mc_store(mc_t *m, int inter, int resid)
         c->cnz_b = z0[I4(0, 1)] | (z0[I4(1, 1)] << 8) | (z1[I4(0, 1)] << 16) | ((uint32_t)z1[I4(1, 1)] << 24);
     } else c->cbf_r = c->cbf_b = c->nz_r = c->nz_b = c->ccbf_r = c->ccbf_b = c->cnz_r = c->cnz_b = 0;
 }
-static inline void mbi_set_const(mbi_t *c, uint32_t cbf, uint32_t nz)
+C2C_TEXT static inline void mbi_set_const(mbi_t *c, uint32_t cbf, uint32_t nz)
 {
     c->cbf_r = c->cbf_b = c->ccbf_r = c->ccbf_b = cbf;
     c->nz_r = c->nz_b = c->cnz_r = c->cnz_b = nz;
     c->mvx_r = c->mvx_b = c->mvy_r = c->mvy_b = c->refp_r = c->refp_b = 0;
 }
 
-static inline void fill_mvd(mc_t *m, int x4, int y4, int w4, int h4, int mx, int my)
+C2C_TEXT static inline void fill_mvd(mc_t *m, int x4, int y4, int w4, int h4, int mx, int my)
 {
     uint32_t ax = mx < 0 ? -mx : mx, ay = my < 0 ? -my : my;
     if (ax > 64) ax = 64;
@@ -583,14 +593,14 @@ static inline void fill_mvd(mc_t *m, int x4, int y4, int w4, int h4, int mx, int
     for (int y = y4; y < y4 + h4; y++)
         for (int x = x4; x < x4 + w4; x++) { bx[I8(x, y)] = (uint8_t)ax; by[I8(x, y)] = (uint8_t)ay; }
 }
-static inline void fill_ref(mc_t *m, int x4, int y4, int w4, int h4, int refp)
+C2C_TEXT static inline void fill_ref(mc_t *m, int x4, int y4, int w4, int h4, int refp)
 {
     if (w4 == 4) { for (int y = y4; y < y4 + h4; y++) m->refp_w[(y + 1) * 2 + 1] = refp ? 0x01010101u : 0; return; }
     uint8_t *b = B8(m->refp_w);
     for (int y = y4; y < y4 + h4; y++)
         for (int x = x4; x < x4 + w4; x++) b[I8(x, y)] = (uint8_t)refp;
 }
-static AI int cab_mvd(c2c_t *c, eng_t *E, const mc_t *m, int x, int y, int comp)
+C2C_TEXT static AI int cab_mvd(c2c_t *c, eng_t *E, const mc_t *m, int x, int y, int comp)
 {
     int base = comp ? 47 : 40;
     const uint8_t *mv = comp ? (const uint8_t *)m->mvy_w : (const uint8_t *)m->mvx_w;
@@ -602,7 +612,7 @@ static AI int cab_mvd(c2c_t *c, eng_t *E, const mc_t *m, int x, int y, int comp)
     if (v == 9) { int s2 = cab_ue_k(c, E, 3); if (s2 < 0 || s2 > 8192) return 0x7fff; v += s2; }
     return cab_bypass(c) ? -v : v;
 }
-static AI int cab_ref(c2c_t *c, eng_t *E, const mc_t *m, int x, int y)
+C2C_TEXT static AI int cab_ref(c2c_t *c, eng_t *E, const mc_t *m, int x, int y)
 {
     const uint8_t *rp = (const uint8_t *)m->refp_w;
     int inc = rp[I8(x - 1, y)] + 2 * rp[I8(x, y - 1)];
@@ -611,13 +621,13 @@ static AI int cab_ref(c2c_t *c, eng_t *E, const mc_t *m, int x, int y)
     while (cab_dec(c, 54 + (v == 1 ? 4 : 5))) { if (++v > 32) return -1; }
     return v;
 }
-static void part_geom(int mbtype, int p, int *x, int *y, int *w, int *h)
+C2C_TEXT static void part_geom(int mbtype, int p, int *x, int *y, int *w, int *h)
 {
     if (mbtype == 0) { *x = 0; *y = 0; *w = 4; *h = 4; }
     else if (mbtype == 1) { *x = 0; *y = p * 2; *w = 4; *h = 2; }     /* 16x8 */
     else { *x = p * 2; *y = 0; *w = 2; *h = 4; }                      /* 8x16 */
 }
-static void sub_geom(int sub, int s, int *x, int *y, int *w, int *h)
+C2C_TEXT static void sub_geom(int sub, int s, int *x, int *y, int *w, int *h)
 {
     if (sub == 0) { *x = 0; *y = 0; *w = 2; *h = 2; }
     else if (sub == 1) { *x = 0; *y = s; *w = 2; *h = 1; }            /* 8x4 */
@@ -626,7 +636,7 @@ static void sub_geom(int sub, int s, int *x, int *y, int *w, int *h)
 }
 
 /* intra mb_type bins after the first one (9.3.2.5, ctxIdx per table 9-39) */
-static AI int cab_itype(c2c_t *c, eng_t *E, int c0, int cl, int cc, int cc2, int cp1, int cp0)
+C2C_TEXT static AI int cab_itype(c2c_t *c, eng_t *E, int c0, int cl, int cc, int cc2, int cp1, int cp0)
 {
     if (!cab_dec(c, c0)) return 0;                       /* I_NxN */
     if (cab_term(c, E)) return 25;                          /* I_PCM */
@@ -637,33 +647,33 @@ static AI int cab_itype(c2c_t *c, eng_t *E, int c0, int cl, int cc, int cc2, int
     return 1 + pm + 4 * chroma + 12 * luma;
 }
 
-static int cbp_luma_cond(const mbi_t *n, int avail, int b8)       /* 1 when that 8x8 had no residual */
+C2C_TEXT static int cbp_luma_cond(const mbi_t *n, int avail, int b8)       /* 1 when that 8x8 had no residual */
 {
     if (!avail || n->type == T_PCM) return 0;
     return !((n->cbp >> b8) & 1);
 }
-static int cbp_chroma_cond(const mbi_t *n, int avail, int bin)
+C2C_TEXT static int cbp_chroma_cond(const mbi_t *n, int avail, int bin)
 {
     if (!avail) return 0;
     if (n->type == T_PCM) return 1;
     if (n->type == T_SKIP) return 0;
     return bin ? (n->cbp >> 4) == 2 : (n->cbp >> 4) != 0;
 }
-static inline int dc_cond(const mbi_t *n, int avail, int intra, int bit)
+C2C_TEXT static inline int dc_cond(const mbi_t *n, int avail, int intra, int bit)
 {
     return avail ? (n->dc >> bit) & 1 : intra;
 }
 
 /* macroblock_layer after mb_skip_flag == 0, CABAC -> d and the caches */
 static int cab_mb_(c2c_t *c, eng_t *E, sctx_t *s, mc_t *m, mbd_t *d);
-static int cab_mb(c2c_t *c, eng_t *Eo, sctx_t *s, mc_t *m, mbd_t *d)
+C2C_TEXT static int cab_mb(c2c_t *c, eng_t *Eo, sctx_t *s, mc_t *m, mbd_t *d)
 {
     eng_t e = *Eo;
     int r = cab_mb_(c, &e, s, m, d);
     *Eo = e;
     return r;
 }
-static AI int cab_mb_(c2c_t *c, eng_t *E, sctx_t *s, mc_t *m, mbd_t *d)
+C2C_TEXT static AI int cab_mb_(c2c_t *c, eng_t *E, sctx_t *s, mc_t *m, mbd_t *d)
 {
     mbi_t *cur = m->cur;
     int itype = -1;
@@ -850,10 +860,10 @@ static AI int cab_mb_(c2c_t *c, eng_t *E, sctx_t *s, mc_t *m, mbd_t *d)
     return 0;
 }
 
-static void bw_te(bw_t *w, int v, int range) { if (range == 1) bw_put(w, !v, 1); else bw_ue(w, v); }
+C2C_TEXT static void bw_te(bw_t *w, int v, int range) { if (range == 1) bw_put(w, !v, 1); else bw_ue(w, v); }
 
 /* macroblock_layer in CAVLC */
-static int cav_mb(bw_t *w, sctx_t *s, mc_t *m, mbd_t *d)
+C2C_TEXT static int cav_mb(bw_t *w, sctx_t *s, mc_t *m, mbd_t *d)
 {
     bw_ue(w, d->mbtype);
     if (d->itype == 25) {
@@ -908,7 +918,7 @@ static int cav_mb(bw_t *w, sctx_t *s, mc_t *m, mbd_t *d)
 }
 
 /* ------------------------------------------------------------------ parameter set parsing */
-static int rbsp_more(const br_t *b)                       /* more_rbsp_data() */
+C2C_TEXT static int rbsp_more(const br_t *b)                       /* more_rbsp_data() */
 {
     uint32_t last = b->end;                                /* position after the last 1 bit */
     while (last > b->pos) {
@@ -919,7 +929,7 @@ static int rbsp_more(const br_t *b)                       /* more_rbsp_data() */
     return last > b->pos + 1;
 }
 
-static int parse_sps(c2c_t *c, br_t *b)
+C2C_TEXT static int parse_sps(c2c_t *c, br_t *b)
 {
     sps_t t; memset(&t, 0, sizeof t);
     t.profile = (uint8_t)br_u(b, 8); br_u(b, 16);
@@ -949,7 +959,7 @@ static int parse_sps(c2c_t *c, br_t *b)
     return C2C_OK;
 }
 
-static int parse_pps(c2c_t *c, br_t *b, pps_t *t, uint32_t *id, int32_t *qs, int32_t *cqp, uint8_t *wbi, uint8_t *cip)
+C2C_TEXT static int parse_pps(c2c_t *c, br_t *b, pps_t *t, uint32_t *id, int32_t *qs, int32_t *cqp, uint8_t *wbi, uint8_t *cip)
 {
     (void)c;
     memset(t, 0, sizeof *t);
@@ -983,7 +993,7 @@ static int parse_pps(c2c_t *c, br_t *b, pps_t *t, uint32_t *id, int32_t *qs, int
 }
 
 /* ------------------------------------------------------------------ slices */
-static int do_slice(c2c_t *c, int nal_ref_idc, int nal_type, br_t *b, bw_t *w)
+C2C_TEXT static int do_slice(c2c_t *c, int nal_ref_idc, int nal_type, br_t *b, bw_t *w)
 {
     uint32_t first_mb = br_ue(b);
     uint32_t st = br_ue(b) % 5;
@@ -1099,7 +1109,7 @@ static int do_slice(c2c_t *c, int nal_ref_idc, int nal_type, br_t *b, bw_t *w)
 }
 
 /* ------------------------------------------------------------------ NAL units */
-int c2c_nal(c2c_t *c, const uint8_t *in, int in_len, uint8_t *out, int out_cap, uint8_t *rbsp)
+C2C_TEXT int c2c_nal(c2c_t *c, const uint8_t *in, int in_len, uint8_t *out, int out_cap, uint8_t *rbsp)
 {
     if (in_len < 1) return C2C_ERR_SYNTAX;
     int type = in[0] & 0x1f, ref = (in[0] >> 5) & 3;

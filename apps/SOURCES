@@ -15,6 +15,7 @@ bcm_tvshow.c
 bcm_timesync.c
 bcm_piezo.c
 bcm_cab2cav.c
+bcm_cab2cav_iram.c
 #endif
 filetypes.c
 fileop.c

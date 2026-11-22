@@ -69,7 +69,18 @@ const char *c2c_errstr(int err);
 /* A CABAC stream can hold a coefficient level that CAVLC in Baseline / Main cannot code (|level| above ~2063,
    e.g. a large Intra 16x16 DC at a low QP).  By default it is written as the largest codable level (a small error in
    one block until the next key frame; counted in stats.clamped).  on = 1 writes it exactly with level_prefix 16, the
-   High-profile escape -- only for a decoder that reads it. */
+   High-profile escape -- only for a decoder that reads it (the iPod's VideoCore does not: v124 test 8). */
 void c2c_set_escape(c2c_t *c, int on);
+
+
+/* bcm overlay v125: the iPod build links a second copy of the transcoder (bcm_cab2cav_iram.c) to run from the IRAM that
+   Rockbox's audio codecs use (0x4000c000, 80 KB on the PP5022).  It is copied there while the VideoCore plays the sound
+   and Rockbox's codec is unloaded; same code, same results, only faster. */
+uint32_t c2ci_state_size(void);
+c2c_t *c2ci_init(void *mem, uint32_t size);
+int c2ci_nal(c2c_t *c, const uint8_t *in, int in_len, uint8_t *out, int out_cap, uint8_t *rbsp_tmp);
+const c2c_stats_t *c2ci_stats(c2c_t *c);
+const char *c2ci_errstr(int err);
+void c2ci_set_escape(c2c_t *c, int on);
 
 #endif
