@@ -116,8 +116,13 @@ class Image:
         return None
 
 # ------------------------------------------------------------------------------------------------------ decoder
-CC = {0: 'eq', 1: 'ne', 2: 'cs', 3: 'cc', 4: 'mi', 5: 'pl', 6: 'vs', 7: 'vc', 8: 'hi', 9: 'ls', 10: 'ge', 11: 'lt',
+CC = {0: 'eq', 1: 'ne', 2: 'lo', 3: 'hs', 4: 'mi', 5: 'pl', 6: 'vs', 7: 'vc', 8: 'hi', 9: 'ls', 10: 'ge', 11: 'lt',
       12: 'gt', 13: 'le', 14: 'al', 15: 'nv'}
+
+# v1.1: 16-bit ALU ops (1100 oooo ssss dddd, and 011q qqqu uuuu dddd with o = 2q); evidence in VC2_ISA_NOTES.txt
+ALU16 = {2: 'bmask', 3: 'bic', 5: 'eor', 6: 'shl', 7: 'and', 8: 'lsr', 0xa: 'mul', 0xb: 'rsub', 0xc: 'add', 0xd: 'sub',
+         0xe: 'mov', 0xf: 'or', 0x1f: 'not'}
+ALU32I = dict((0x20 + k, v) for k, v in ALU16.items() if k < 0x20)
 COP = {'eq': '==', 'ne': '!=', 'cs': '>=u', 'cc': '<u', 'hi': '>u', 'ls': '<=u', 'ge': '>=', 'lt': '<', 'gt': '>',
        'le': '<=', 'mi': '<0', 'pl': '>=0'}
 
@@ -129,15 +134,103 @@ class Insn:
         self.imm = k.get('imm'); self.mem = k.get('mem'); self.cond = k.get('cond'); self.table = k.get('table')
 
 def ilen(h):
+    """v1.1: lengths from branch-target consistency over every named function of the six .vll libraries:
+       0x0xxx / 0x1xxx = 32 bit (compare-and-branch, bl, far b); 0x20xx / 0x21xx = 80-bit vector;
+       0x22xx / 0x23xx = 48-bit vector; 0x28xx-0x2exx = 32 bit; 0x2fxx = 48 bit; the rest 16 bit"""
     t = h >> 8
+    if t < 0x20: return 4
+    if t in (0x20, 0x21): return 10
+    if t in (0x22, 0x23): return 6
     if t == 0x2f: return 6
-    if 0x10 <= t <= 0x1f and (h & 0x80): return 4
-    if t in (0x1e, 0x1f): return 4
     if 0x28 <= t <= 0x2e: return 4
     return 2
 
 def decode(img, a, fend=None):
     h = img.hw(a)
+    t8 = h >> 8
+    # ---- v1.1 additions (see VC2_ISA_NOTES.txt for the evidence) ----
+    if (h >> 12) == 0:                                  # compare-and-branch: rd += (#i | r_i); compare; branch
+        h1 = img.hw(a + 2); c = CC[(h >> 8) & 15]; i = (h >> 4) & 15; r = h & 15; form = h1 >> 14
+        if form & 1: add = (' r%d+=%d;' % (r, sx(i, 4))) if i else ''     # bit 14 set: the add is an immediate
+        else: add = ' r%d+=r%d;' % (r, i)                                   # bit 14 clear: a register (zlib adler32)
+        if form == 3:
+            k = (h1 >> 8) & 0x3f; tg = a + 2 * sx(h1 & 0xff, 8); what = '#%d' % k; cv = k
+        elif form == 2:
+            k = (h1 >> 8) & 0x3f; tg = a + 2 * sx(h1 & 0xff, 8); what = '#%d (?)' % k; cv = k
+        elif form == 1:
+            cv = (h1 >> 10) & 15; tg = a + 2 * sx(h1 & 0x3ff, 10); what = 'r%d' % cv
+        else:
+            cv = (h1 >> 8) & 0x3f; tg = a + 2 * sx(h1 & 0xff, 8); what = 'r%d' % cv
+        return Insn(a, 4, 'cjump', 'b%-4s%s r%d vs %s -> 0x%x' % (c, add, r, what, tg), tg=tg, op='bcc', rd=r,
+                    cond=(c, cv))
+    if 0x10 <= t8 <= 0x1d and not (h & 0x80):           # far conditional branch on flags (0x12 after cmp #5552 in adler32)
+        h1 = img.hw(a + 2); tg = a + 2 * sx(h1 << 7 | (h & 0x7f), 23)
+        return Insn(a, 4, 'cjump', 'b%-5s 0x%x   (flags, far)' % (CC[t8 & 15], tg), tg=tg, op='bcc_f', cond=(CC[t8 & 15], None))
+    if 0x30 <= t8 <= 0x3d:                              # short conditional branch, cond = low nibble of the opcode
+        tg = a + 2 * sx(h & 0xff, 8)
+        return Insn(a, 2, 'cjump', 'b%-5s 0x%x   (flags)' % (CC[t8 & 15], tg), tg=tg, op='bcc_f', cond=(CC[t8 & 15], None))
+    if t8 in (0x20, 0x21):
+        return Insn(a, 10, 'op', 'vec80  ' + ' '.join('%04x' % img.hw(a + k) for k in range(0, 10, 2)), op='vec')
+    if t8 in (0x22, 0x23):
+        return Insn(a, 6, 'op', 'vec48  ' + ' '.join('%04x' % img.hw(a + k) for k in range(0, 6, 2)), op='vec')
+    if t8 == 0x2e and ((h >> 4) & 15) == 0:
+        v = img.hw(a + 2)
+        return Insn(a, 4, 'op', 'cmp    r%d, #%d' % (h & 15, sx(v, 16)), op='cmpi', rd=h & 15, imm=sx(v, 16))
+    if t8 == 0x2e and ((h >> 4) & 15) == 7:
+        v = img.hw(a + 2)
+        return Insn(a, 4, 'op', 'mov    r%d, #%d' % (16 + (h & 15), sx(v, 16)), op='movi', rd=16 + (h & 15), imm=sx(v, 16))
+    if t8 == 0x2c:
+        off = sx(img.hw(a + 2), 16)
+        return Insn(a, 4, 'op', 'add    r%d, r%d, #%d' % (h & 15, (h >> 4) & 15, off), op='addi3', rd=h & 15,
+                    rs=(h >> 4) & 15, imm=off)
+    if t8 == 0x28:
+        off = sx(img.hw(a + 2), 16)
+        return Insn(a, 4, 'op', 'ld     r%d, [r%d%+d]' % (h & 15, (h >> 4) & 15, off), op='ld', rd=h & 15,
+                    rs=(h >> 4) & 15, mem=(off, 4))
+    if t8 == 0x2a:
+        off = sx(img.hw(a + 2), 16)
+        return Insn(a, 4, 'op', 'ldb    r%d, [r%d%+d]' % (h & 15, (h >> 4) & 15, off), op='ldb', rd=h & 15,
+                    rs=(h >> 4) & 15, mem=(off, 1))
+    if t8 == 0x2b:
+        off = sx(img.hw(a + 2), 16)
+        return Insn(a, 4, 'op', 'stb    r%d, [r%d%+d]' % (h & 15, (h >> 4) & 15, off), op='stb', rd=h & 15,
+                    rs=(h >> 4) & 15, mem=(off, 1))
+    if t8 == 0xbc: return Insn(a, 2, 'op', 'ldb    r%d, [r%d]' % (h & 15, (h >> 4) & 15), op='ldb', rd=h & 15, rs=(h >> 4) & 15, mem=(0, 1))
+    if t8 == 0xbd: return Insn(a, 2, 'op', 'stb    r%d, [r%d]' % (h & 15, (h >> 4) & 15), op='stb', rd=h & 15, rs=(h >> 4) & 15, mem=(0, 1))
+    if 0xc0 <= t8 <= 0xcf and t8 not in (0xcb, 0xcc, 0xce):   # rd = rd OP rs (adler32 / JM checked: d sub, f or)
+        nm = ALU16.get(t8 & 15)
+        if nm:
+            return Insn(a, 2, 'op', '%-6s r%d, r%d' % (nm, h & 15, (h >> 4) & 15), op=nm, rd=h & 15, rs=(h >> 4) & 15)
+    if 0xd0 <= t8 <= 0xdf and ALU16.get(0x10 + (t8 & 15)):
+        nm = ALU16[0x10 + (t8 & 15)]
+        return Insn(a, 2, 'op', '%-6s r%d, r%d' % (nm, h & 15, (h >> 4) & 15), op=nm, rd=h & 15, rs=(h >> 4) & 15)
+    if 0x80 <= t8 <= 0xb7 and ((h >> 8) & 7) == 0:     # 1 iiii 000 ssss dddd: ld rd, [rs + ri*4] (zlib crc32 tables)
+        ri = (h >> 11) & 15
+        return Insn(a, 2, 'op', 'ld     r%d, [r%d + r%d*4]' % (h & 15, (h >> 4) & 15, ri), op='ldx', rd=h & 15,
+                    rs=(h >> 4) & 15, mem=(None, 4))
+    if t8 in (0x78, 0x79, 0x7c, 0x7d):                  # post-increment ld / st (zlib *buf++, JM array loops)
+        nm = {0x78: 'ld', 0x79: 'st', 0x7c: 'ldb', 0x7d: 'stb'}[t8]
+        return Insn(a, 2, 'op', '%-6s r%d, [r%d]++' % (nm, h & 15, (h >> 4) & 15), op=nm, rd=h & 15,
+                    rs=(h >> 4) & 15, mem=(0, 4 if t8 < 0x7c else 1))
+    if t8 == 0x2e and ((h >> 4) & 15) == 8 and (img.hw(a + 2) >> 10) == 0x0f:
+        h1 = img.hw(a + 2)
+        return Insn(a, 4, 'op', 'add    r%d, r%d, r%d << 8' % (h & 15, h1 & 31, (h1 >> 5) & 31), op='addsh', rd=h & 15)
+    if 0x60 <= t8 <= 0x6f:                              # 011q qqqu uuuu dddd: rd = rd OP #u5, OP = 16-bit op 2q
+        q = (h >> 9) & 7; u = (h >> 4) & 31; d = h & 15
+        nm = ALU16.get(2 * q)
+        if q == 6: u = sx(u, 5)                         # add takes a signed 5-bit value (0x6df0 = add r0, #-1)
+        if nm:
+            return Insn(a, 2, 'op', '%-6s r%d, #%d' % (nm, d, u), op=nm + 'i', rd=d, imm=u)
+    if t8 == 0x2e and ((h >> 4) & 15) in (0xa, 0xb):    # 3-operand: [op6][b5][s5]; ops 0x20-0x2f = 16-bit ops with #b5
+        h1 = img.hw(a + 2); op6 = h1 >> 10; b5 = (h1 >> 5) & 31; s5 = h1 & 31
+        d = (h & 15) + (16 if ((h >> 4) & 15) == 0xb else 0)
+        nm = ALU32I.get(op6)
+        if nm:
+            return Insn(a, 4, 'op', '%-6s r%d, r%d, #%d' % (nm, d, s5, b5), op=nm + '3', rd=d, rs=s5, imm=b5)
+        nm = ALU16.get(op6)
+        if nm:                                           # ops 0x00-0x1f: the same ops with a register
+            return Insn(a, 4, 'op', '%-6s r%d, r%d, r%d' % (nm, d, s5, b5), op=nm + '3', rd=d, rs=s5)
+        return Insn(a, 4, 'op', 'alu%02x  r%d, r%d, r%d/#%d   (op not known)' % (op6, d, s5, b5, b5), op='alu3', rd=d, rs=s5)
     if (h & 0xf080) == 0x1080:
         h1 = img.hw(a + 2)
         tg = a + 2 * sx(((h >> 8) & 15) << 23 | h1 << 7 | (h & 0x7f), 27)

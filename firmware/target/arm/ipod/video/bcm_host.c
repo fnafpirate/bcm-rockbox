@@ -30,6 +30,7 @@
 #include <stdio.h>
 #else
 #include "file.h"
+#include "crc32.h"
 #endif
 
 #ifndef BCM_LOG
@@ -620,10 +621,19 @@ static void vcfs_dispatch(struct hi_chan *c, const struct hi_msg *m)
                     }
                 }
                 if (fd >= 0) {
+                    /* v132: size + CRC-32 (Rockbox crc_32, start 0xffffffff) of the file served, so a log shows
+                       exactly which library the VideoCore got (changed .vll tests) */
+                    uint32_t fsz = 0, crc = 0xffffffffu;
+                    {
+                        static unsigned char cb[1024];
+                        ssize_t n;
+                        while ((n = read(fd, cb, sizeof cb)) > 0) { crc = crc_32(cb, (uint32_t)n, crc); fsz += (uint32_t)n; }
+                        lseek(fd, 0, SEEK_SET);
+                    }
                     for (int i = 0; i < 8; i++)
                         if (hi.vfs_fd[i] < 0) { hi.vfs_fd[i] = fd; h = (uint32_t)i + 1; break; }
                     if (h == 0xffffffffu) close(fd);
-                    else TRACE("vcfs mapped", 0, 0, path);
+                    else TRACE("vcfs mapped", fsz, crc, path);
                 }
             }
         }
