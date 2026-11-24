@@ -4806,8 +4806,23 @@ long fat_readwrite(struct fat_filestr *filestr, unsigned long sectorcount,
             count = 0;
         }
 
+#ifndef BOOTLOADER
+        {   /* bcm overlay v137: the rest of this cluster in one step (it is contiguous by definition) instead of
+               one loop round per sector: a 4 MB read of a 64 KB-cluster exFAT file was 8192 rounds, now 64 */
+            unsigned long n = sectorcount - transferred - count;
+            if (n > fat_bpb->bpb_secperclus - sectornum)
+                n = fat_bpb->bpb_secperclus - sectornum;
+            if (n > (unsigned long)(FAT_MAX_TRANSFER_SIZE - count))
+                n = FAT_MAX_TRANSFER_SIZE - count;
+            count += n;
+            sector += n;
+            last = sector;
+            sectornum += n - 1;
+        }
+#else
         count++;
         last = ++sector;
+#endif
     }
 
     if (count)

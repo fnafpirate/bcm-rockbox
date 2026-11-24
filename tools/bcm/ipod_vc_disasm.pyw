@@ -283,6 +283,11 @@ def decode(img, a, fend=None):
     if (h & 0xfff0) == 0xe0a0: return Insn(a, 2, 'ret', 'pop    r6-r%d, pc' % (6 + (h & 15)), op='pop')
     if h == 0xe0ef: return Insn(a, 2, 'ret', 'pop    pc', op='pop')
     if h == 0x4430: return Insn(a, 2, 'ret', 'rts', op='rts')
+    if (h >> 8) in (0xe0, 0xf0):   # u = 0: push / pop page (probe 3: f076 stored nothing); [rs] is 0xb8 / 0xb9
+        base = (0, 6, 16, 24)[(h >> 5) & 3]; last = base + (h & 31); lr = h & 0x80
+        regs = ('r%d-r%d' % (base, last)) if last < 32 else '-'
+        if (h >> 8) == 0xf0: return Insn(a, 2, 'op', 'push?  %s%s' % (regs, ', lr' if lr else ''), op='push')
+        return Insn(a, 2, 'ret' if lr else 'op', 'pop?   %s%s' % (regs, ', pc' if lr else ''), op='pop')
     if (h >> 12) == 0xe:
         return Insn(a, 2, 'op', 'ld     r%d, [r%d+0x%x]' % (h & 15, (h >> 4) & 15, 4 * ((h >> 8) & 15)), op='ld',
                     rd=h & 15, rs=(h >> 4) & 15, mem=(4 * ((h >> 8) & 15), 4))

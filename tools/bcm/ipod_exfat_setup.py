@@ -66,10 +66,16 @@ takes at least one: with 40,000 songs in 4,000 album folders that is about 6 GB 
 (the bigger FAT included).  Rockbox reads music and video files in long runs either way, so playback costs the same;
 the allocation bitmap is 4x bigger (3.8 MB on 2 TB) and is only read in full to show the free space.
 Applies to a new format / migration only; --cluster-kb still picks any size.
+
+1.12 (bcm overlay v137): the automatic cluster size looks at the files when it can: a migration at the old card's
+files, a re-format of the iPod at the files on it now (the same library comes back).  It adds up the loss for each
+size -- the unused end of every file's last cluster and one cluster per folder (scaled to a card 90 % full), the FAT
+and the bitmap -- and takes the smallest.  Music libraries land on 32-64 KB, video libraries on 128-512 KB.  A blank
+card (New drive) still goes by its size.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.11'
+VERSION = '1.12'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -83,6 +89,72 @@ def auto_cluster(nbytes):
         if nbytes <= limit:
             return kb * 1024
     return 256 * 1024
+
+
+def choose_cluster(nbytes, sizes=None, ndirs=0, min_bytes=512, log=None):
+    """1.12 (bcm overlay v137): the cluster size from what will be ON the card when that is known -- a migration knows
+    every file of the old card; a re-format in place samples the files on the iPod now (the same library comes back).
+    For each size from 4 KB to 1 MB it adds up what the card loses:
+      * slack: the unused end of every file's last cluster and one cluster per folder, scaled from the sample up to a
+        card 90 % full (the same mix of files);
+      * the FAT (4 bytes per cluster, always allocated on exFAT) and the allocation bitmap (1 bit per cluster);
+    and takes the smallest loss, preferring the bigger cluster when two are within 0.1 % of the card (and at least 32 KB above 34 GB) (fewer clusters:
+    fewer allocation steps when files are written, a smaller bitmap to read).  The bitmap is kept at 8 MB or less
+    (Rockbox reads it whole to count the free space).  A music library (files of a few MB, many album folders) ends
+    up on 32-64 KB, a video library (files of hundreds of MB) on 128-512 KB.  Without a sample: auto_cluster()."""
+    if not sizes:
+        return max(auto_cluster(nbytes), min_bytes)
+    data = sum(sizes)
+    if data <= 0:
+        return max(auto_cluster(nbytes), min_bytes)
+    scale = nbytes * 0.9 / data
+    best = None
+    rows = []
+    for kb in (4, 8, 16, 32, 64, 128, 256, 512, 1024):
+        c = kb * 1024
+        if c < min_bytes or (nbytes > 34 * 10 ** 9 and kb < 32):
+            continue        # big cards: at least 32 KB (longer runs, fewer allocation steps; slack hardly changes)
+        n = nbytes // c
+        if n > 0xfffffff5 or n < 16:
+            continue
+        bitmap = (n + 7) // 8
+        if bitmap > 8 * (1 << 20):
+            continue
+        slack = sum(-sz % c for sz in sizes) + (ndirs + 2) * c
+        loss = slack * scale + n * 4 + bitmap
+        rows.append((kb, loss))
+        if best is None or loss <= best[1] + nbytes * 0.001:
+            best = (c, min(loss, best[1]) if best else loss)
+    if best is None:
+        return max(auto_cluster(nbytes), min_bytes)
+    if log:
+        log('cluster size from your files (%d files, %d folders, %s): %s -> %d KB'
+            % (len(sizes), ndirs, human(data), ', '.join('%d KB %s' % (kb, human(l)) for kb, l in rows),
+               best[0] // 1024))
+    return best[0]
+
+
+def library_sample(disk, ipod, log=print, limit=200000):
+    """the sizes of the files on the iPod's data partition now (not /.rockbox), for choose_cluster(); None if it
+    cannot be read"""
+    try:
+        if ipod.data_off is None or ipod.data_fs not in ('exFAT', 'FAT32'):
+            return None, 0
+        vol = SrcVolume(disk, ipod.data_off)
+        sizes, dirs = [], 0
+        for p, is_dir, size, opener, stamp, utc in vol.walk():
+            if p.lower().startswith('/.rockbox'):
+                continue
+            if is_dir:
+                dirs += 1
+            else:
+                sizes.append(size)
+            if len(sizes) >= limit:
+                break
+        return sizes, dirs
+    except Exception as ex:
+        log('  (could not read the files on the iPod for the cluster choice: %s)' % ex)
+        return None, 0
 
 
 def cluster_arg(v):
@@ -1473,7 +1545,7 @@ def keep_source(disk, log):
     return None
 
 def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, label='IPOD',
-          cluster=None, log=print, progress=lambda f: None, layout='auto', tree=None, ipsw=None):
+          cluster=None, log=print, progress=lambda f: None, layout='auto', tree=None, ipsw=None, sample=None):
     """layout
       'partition': exFAT partition in normal 512-byte units with 512-byte
                    sectors -- any PC / card reader; max 2.2 TB
@@ -1554,8 +1626,13 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
     for k in (1, 2, 3):
         mbr[0x1be + 16 * k: 0x1be + 16 * (k + 1)] = bytes(16)
     if not cluster:
-        cluster = max(auto_cluster(part_len), ss)
-        log('cluster size: %d KB (chosen automatically for %s)' % (cluster // 1024, human(part_len)))
+        if sample is None:
+            log('looking at the files on the iPod now (for the cluster size)')
+            sample = library_sample(disk, ipod, log)
+        sizes, ndirs = sample if sample else (None, 0)
+        cluster = choose_cluster(part_len, sizes, ndirs, ss, log)
+        if not sizes:
+            log('cluster size: %d KB (chosen automatically for %s)' % (cluster // 1024, human(part_len)))
     if layout == 'whole':
         plan = ExfatPlan(0, part_len, 512, cluster, label, up_raw, up,
                          fatoff_bytes=align_up(fw_end, ALIGN), mbr_tail=bytes(mbr[440:510])).layout(tree)
@@ -1869,9 +1946,8 @@ def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, 
         raise SetupError('the new card is for a different iPod model than the old one: choose the bootloader '
                          'file, a new firmware partition is made for it')
     fw_size = ipod.fw_size if copy_fw else FW_SIZE
-    if not cluster:
-        cluster = max(auto_cluster(dst.size), 512)   # setup() below gets the same choice for the partition
-        log('cluster size: %d KB (chosen automatically for %s)' % (cluster // 1024, human(dst.size)))
+    if not cluster:   # 1.12: from the old card's files (setup() below gets the same choice for the partition)
+        cluster = choose_cluster(dst.size, [n.size for _, n in t.walk() if not n.is_dir], vol.dirs, 512, log)
     # room: every file rounded up to clusters, the folders, the FAT and some slack
     need = sum(align_up(n.size, cluster) for _, n in t.walk() if not n.is_dir)
     need += (vol.dirs + 2) * cluster + 64 * (1 << 20)

@@ -3334,6 +3334,8 @@ static long ra_pos_t[2];              /* v108: when each was read */
 static int ra_stream;                 /* which of the two the next m4_rdd is for */
 static bool ra_filling, ra_slept;
 static uint32_t ra_bursts, ra_misses, ra_read_kb;
+static int arm_mode_cur;              /* v137: 0 fast, 1 normal, 2 rest (vp_arm_mode) */
+static bool ra_burst_new;             /* v137: a refill burst just started (the drive is on: a good moment to write) */
 /* v96: Adaptive buffering (Video Buffering = Adaptive).  The ring size is chosen when the file opens (from the bit rate,
    starting at the Balanced mode); while it plays, ra_adapt() moves the refill point and the history kept behind the picture from what it
    measures: the card's read speed, how often the viewer seeks, the largest frames.  Fixed modes keep ring/div and 128 KB. */
@@ -3425,9 +3427,12 @@ static void ra_tick(void)
     ahead = (uint32_t)(ra_hi - lead);
     room = ra_size - (uint32_t)(ra_hi - ra_lo);
     if (!ra_filling && ahead < (ra_refill_at ? ra_refill_at : ra_size / ra_refill_div) && room >= 65536)   /* v108: room */
-    { ra_filling = true; ra_slept = false; ra_bursts++; }
+    { ra_filling = true; ra_slept = false; ra_bursts++; ra_burst_new = true; }
     if (!ra_filling) return;
-    n = room < 65536 ? room : 65536;
+    {   /* v137: 256 KB a round once the VideoCore is well ahead: the burst ends sooner and the drive sleeps sooner */
+        uint32_t ch = arm_mode_cur ? 262144 : 65536;
+        n = room < ch ? room : ch;
+    }
     if (ra_hi + n > ra_fsize) n = (uint32_t)(ra_fsize - ra_hi);
     if (n < 4096 || !ra_read_at(ra_hi, n) || ra_hi >= ra_fsize || room - n < 65536)
     {
@@ -5046,6 +5051,10 @@ static int cfg_av_hz = 48000, cfg_av_mix = 1, cfg_vcvol = -1;
 static int cfg_vol_direct = 1;
 static int cfg_tv = -1, cfg_tv_enc = -1, cfg_tv_extra = 0, cfg_tv_osd = 1;
 static int cfg_boost = 2;              /* v57: CPU boost 0 never, 1 always, 2 auto */
+static int cfg_vc_gov = 1;             /* v137: VideoCore clock: 150 MHz only while starting / seeking, then Apple's governor */
+static int cfg_arm_save = 1;           /* v137: the ARM sleeps between frame requests once the VideoCore is ahead */
+static int cfg_post_rm = 1;            /* v137: remove the start-up screen window under the video once it plays */
+static int cfg_batlog = 10;            /* v137: /.rockbox/bcm_battery.txt line every N minutes of video (0 = off) */
 static bool av_boosted;
 static long av_boost_until;
 static void av_boost(bool on);   /* v55: force TV on/off, encoding number, 1 = add svideo=1 */
@@ -5181,6 +5190,10 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "tv_extra")) cfg_tv_extra = v;
         else if (!strcmp(p, "tv_osd"))   cfg_tv_osd = v;
         else if (!strcmp(p, "boost"))    cfg_boost = v;
+        else if (!strcmp(p, "vc_gov"))   cfg_vc_gov = v;            /* v137 */
+        else if (!strcmp(p, "arm_save")) cfg_arm_save = v;
+        else if (!strcmp(p, "post_rm"))  cfg_post_rm = v;
+        else if (!strcmp(p, "batlog"))   cfg_batlog = v;
         else if (!strcmp(p, "cabac"))    cfg_cabac = v;             /* v123 */
         else if (!strcmp(p, "cabac_iram")) cfg_cabac_iram = v;     /* v125 */
         else if (!strcmp(p, "cabac_cop")) cfg_cabac_cop = v;
@@ -5619,7 +5632,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v135 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v137 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -8123,22 +8136,6 @@ static void qz_tick(long run_t0)
 static uint32_t bcm_resume_ms;           /* where the next start continues (0 = the beginning); consumed by rs_begin() */
 static int rs_state, rs_vol = -1;        /* the continue-at-a-point state (rs_begin / rs_tick below) */
 static uint32_t rs_ms, rs_k;
-static uint32_t rbm_get(const char *path)
-{
-    char line[MAX_PATH + 16];
-    uint32_t ms = 0;
-    int fd = open(RBM_PATH, O_RDONLY);
-    if (fd < 0) return 0;
-    while (read_line(fd, line, sizeof line) > 0)
-    {
-        char *sp = strchr(line, ' ');
-        if (!sp) continue;
-        *sp = 0;
-        if (!strcmp(sp + 1, path)) { ms = (uint32_t)strtoul(line[0] == '*' ? line + 1 : line, NULL, 10); break; }
-    }
-    close(fd);
-    return ms;
-}
 static bool rbm_boot_flag;               /* v120: rbm_put marks its line "*": the next start plays that video on */
 static void rbm_put(const char *path, uint32_t ms)
 {
@@ -8174,17 +8171,6 @@ static uint32_t pl_pos_now(void)
     else p = v_last_vts > 15000 ? v_last_vts - 15000 : 0;   /* no status yet: the VideoCore holds ~15 s ahead */
     if (v_last_vts && p > v_last_vts) p = v_last_vts;
     return p;
-}
-static void rbm_save(bool finished)
-{
-    uint32_t pos, dur = m4_dur_ms ? m4_dur_ms : pl_dur_ms;
-    char t[16];
-    if (!bcm_play_path || qz_on || !global_settings.bcm_video_resume) return;
-    pos = finished ? 0 : rs_state == 1 ? rs_ms : pl_pos_now();   /* stopped before the resume seek: keep the old point */
-    if (pos < 10000 || (dur && pos + 15000 > dur)) pos = 0;     /* the first 10 s or the last 15 s: start over next time */
-    rbm_put(bcm_play_path, pos);
-    fmt_time(t, sizeof t, pos);
-    BLOG("  resume point: %s", pos ? t : "cleared");
 }
 
 /* ---- v119/v120: sleep, as the iPod does it ------------------------------------------------------------------------
@@ -8506,6 +8492,92 @@ static void ra_adapt(void)
     }
 }
 
+/* ---- v137: power while a video plays ----------------------------------------------------------------------------------
+   * VideoCore clock: "pm_set_policy max" (150 MHz) only while the video starts, seeks or scrubs; once the picture has
+     moved for 3 s, "pm_set_policy min" -- Apple's own governor (5-150 MHz in 10 ms windows), which is what the stock
+     firmware plays every video on.  v106 had moved the whole video to "max" for a faster start.
+   * ARM: v45 polled without sleeping while the VideoCore pulled frames -- it asks ~77 times a second (30 pictures and
+     47 AAC frames), so the ARM never slept for the whole video.  Now, once the VideoCore holds more than 3 s ahead,
+     the ARM serves a request and sleeps until the next tick (normal), and above 8 s it looks only every 40 ms (rest):
+     the VideoCore drains its buffer a little, then the normal mode tops it up.  Fast (as before) while starting,
+     seeking, scrubbing, transcoding or below 3 s.  A refill burst of the read-ahead always runs fast, in 256 KB reads.
+   * the start-up status window under the video is removed once the picture moves (nothing composited under it).
+   * /.rockbox/bcm_battery.txt: a line every cfg batlog minutes, written when a read-ahead burst starts (the drive is on
+     then anyway), at the start and at the end of each video -- for battery tests (time since boot, mV, %). */
+static const char *bcm_pm_pol;
+static bool gov_fast, gov_dead;
+static long gov_need_until;
+static long arm_ticks[3], arm_t_last;
+static int post_idx = -1;
+static long batlog_next;
+static int vp_ahead_ms(void)
+{
+    uint32_t p;
+    if (!vr_el_tick || !v_last_vts || pl_paused || sc_active) return -1;
+    p = pl_pos_now();
+    return v_last_vts > p ? (int)(v_last_vts - p) : 0;
+}
+static void vp_gov_set(bool fast)
+{
+    char r[200];
+    int rc;
+    if (!cfg_vc_gov || !cfg_pm || gov_dead || fast == gov_fast) return;
+    bcm_cmd_t0 = current_tick;
+    rc = bcm_gencmd_watched(fast ? "pm_set_policy max" : "pm_set_policy min", r, sizeof r, 2);
+    BLOG("  power: VideoCore clock policy -> %s (%d)", fast ? "max, 150 MHz" : "min, Apple's governor", rc);
+    if (rc < 0) { gov_dead = true; BLOG("  power: no answer -- the policy stays as it is for this video"); return; }
+    gov_fast = fast; bcm_pm_pol = fast ? "max" : "min";
+}
+static int vp_arm_mode(long run_t0)
+{
+    int a, m;
+    if (!cfg_arm_save || mon_until || sc_active || c2c_on || current_tick - run_t0 < 12 * HZ) m = 0;
+    else if (pl_paused) m = 2;
+    else if ((a = vp_ahead_ms()) < 3000) m = 0;
+    else if (a > 8000) m = 2;
+    else if (a < 6000) m = 1;
+    else m = arm_mode_cur ? arm_mode_cur : 1;   /* 6-8 s: stay */
+    if (arm_t_last) arm_ticks[arm_mode_cur] += current_tick - arm_t_last;
+    arm_t_last = current_tick;
+    return arm_mode_cur = m;
+}
+static void vp_power_tick(long run_t0)
+{
+    bool need = mon_until || sc_active || c2c_on || current_tick - run_t0 < 12 * HZ || !vr_el_tick;
+    if (need) { gov_need_until = current_tick + 3 * HZ; vp_gov_set(true); }
+    else if (!TIME_BEFORE(current_tick, gov_need_until))
+    {
+        vp_gov_set(false);
+        if (cfg_post_rm && post_idx >= 0)
+        {   /* the start-up screen's window, left under the video since mp_play (post=1) */
+            uint32_t o[4], w4[4] = { gfx_win[post_idx], 0, 0, 0 };
+            if (w4[0])
+            {
+                bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+                bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+                bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+                gfx_win[post_idx] = 0;
+                BLOG("  power: start-up window %08x under the video removed", (unsigned)w4[0]);
+            }
+            post_idx = -1;
+        }
+    }
+}
+static void vp_batlog(const char *why)
+{
+    long t = arm_ticks[0] + arm_ticks[1] + arm_ticks[2];
+    int fd;
+    if (cfg_batlog <= 0) return;
+    batlog_next = current_tick + cfg_batlog * 60 * HZ;
+    fd = open("/.rockbox/bcm_battery.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) return;
+    fdprintf(fd, "%3ld:%02ld up  %4d mV %3d %%  VC %s  ARM fast/normal/rest %ld/%ld/%ld %%  %s %s\n",
+             current_tick / HZ / 3600, current_tick / HZ / 60 % 60, battery_voltage(), battery_level(),
+             gov_dead ? "max?" : gov_fast ? "max" : "min",
+             t ? arm_ticks[0] * 100 / t : 0, t ? arm_ticks[1] * 100 / t : 0, t ? arm_ticks[2] * 100 / t : 0,
+             why, bcm_play_path ? bcm_play_path : v_path);
+    close(fd);
+}
 static void bcm_video_run(int secs)
 {
     long end = current_tick + secs * HZ, next_log = current_tick + 2 * HZ, next_stat = current_tick + 5 * HZ;
@@ -8528,9 +8600,13 @@ static void bcm_video_run(int secs)
             BLOG("  post: our UI window %08x removed", (unsigned)w4[0]);
             gfx_win[gfx_front] = 0;
         }
+        else if (cfg_post == 1) post_idx = gfx_front;  /* v137: its window is removed once the picture moves */
         gfx_front = -1;                                /* no more status-screen presents */
         BLOG("  post: status-screen updates stopped");
     }
+    gov_fast = bcm_pm_pol && !strcmp(bcm_pm_pol, "max"); gov_dead = false;   /* v137 */
+    arm_ticks[0] = arm_ticks[1] = arm_ticks[2] = 0; arm_t_last = 0; arm_mode_cur = 0; ra_burst_new = false;
+    vp_batlog("start");
     if (cfg_post == 3) { pw1 = current_tick + HZ; pw2 = current_tick + 4 * HZ; }
     int gf_last = v_getframes, gf_log = v_getframes, nstat = 0;
     long last_req = current_tick, run_t0 = current_tick, bl_next = current_tick;
@@ -8573,7 +8649,7 @@ static void bcm_video_run(int secs)
     bcm_video_running = true;
     rs_begin();                                        /* v96: resume point / recovery position */
     pl_fail_run = 0;
-    bool was_paused = false, pause_saved = false;
+    bool was_paused = false;
     long pause_t = current_tick;
     pl_input_tick = current_tick;                      /* v119 */
     BLOG("  buffering %s, frame buffer %u KB", ra_adaptive ? "adaptive" : "fixed", (unsigned)(m4_raw_max / 1024));
@@ -8582,10 +8658,9 @@ static void bcm_video_run(int secs)
         if (rc_want) break;                            /* v109: a refresh asked for by the scrub / tap code */
         bcm_host_service();
         if (pl_paused != was_paused)
-        {   /* v96: pause bookkeeping for the resume point */
-            was_paused = pl_paused; pause_t = current_tick; pause_saved = false;
+        {   /* v96: pause bookkeeping (the sleep timer) */
+            was_paused = pl_paused; pause_t = current_tick;
         }
-        if (pl_paused && !qz_on && !pause_saved && current_tick - pause_t > 5 * HZ) { pause_saved = true; rbm_save(false); }
         if (cfg_sleep_after_s > 0 && pl_paused && !sc_active && sl_ok() &&
             TIME_AFTER(current_tick, pause_t + cfg_sleep_after_s * HZ) &&
             TIME_AFTER(current_tick, pl_input_tick + cfg_sleep_after_s * HZ))
@@ -8798,9 +8873,20 @@ static void bcm_video_run(int secs)
         /* v45: keep polling without sleeping while the VC is pulling frames (a request within the last 50 ms);
            sleep a tick only when it has gone quiet (paused, or buffer full) */
         bool pumped = c2c_pump(!sc_active);           /* v131: CABAC: transcode ahead (the queue) */
-        if (v_getframes != gf_last) { gf_last = v_getframes; last_req = current_tick; yield(); }
-        else if (pumped || current_tick - last_req < HZ / 20) yield();
-        else sleep(1);
+        vp_power_tick(run_t0);                         /* v137 */
+        if (ra_burst_new) { ra_burst_new = false; if (!TIME_BEFORE(current_tick, batlog_next)) vp_batlog("playing"); }
+        {
+            int am = vp_arm_mode(run_t0);              /* v137: 0 fast (as v45), 1 normal, 2 rest */
+            bool served = v_getframes != gf_last;
+            if (served) { gf_last = v_getframes; last_req = current_tick; }
+            if (am == 0)
+            {
+                if (served || pumped || current_tick - last_req < HZ / 20) yield();
+                else sleep(1);
+            }
+            else if (pumped || ra_filling || (am == 1 && served)) yield();
+            else sleep(am == 1 ? 1 : HZ / 25);
+        }
         if (cfg_hang_s > 0 && !pl_paused && !sc_active && !v_eos && current_tick - run_t0 > 20 * HZ
             && current_tick - last_req > cfg_hang_s * HZ)
         {   /* v87: playing, not paused, not at the end, and the VideoCore has not asked for a single frame for cfg_hang_s
@@ -8839,7 +8925,12 @@ static void bcm_video_run(int secs)
     bcm_video_running = false;                         /* v63 */
     sc_remote = false;
     bcm_sync_every = 0; bcm_sync_startup = false;      /* v108 */
-    if (!rc_want && !v_fallback && !sl_want) rbm_save(bcm_video_finished);   /* v96; v120: not for a sleep (RAM keeps it) */
+    vp_batlog(bcm_video_finished ? "ended" : "stopped");   /* v137 */
+    if (!rc_want && !v_fallback && !sl_want && pl_sys_event == SYS_POWEROFF && !bcm_video_finished && bcm_play_path)
+    {   /* v137: no resume point when a video is left (MENU) -- only when the iPod goes to sleep (above, in RAM / the "*"
+           line at the deep sleep) or powers off while it plays: then the next start continues it, as after a sleep */
+        rbm_boot_flag = true; rbm_put(bcm_play_path, pl_pos_now()); rbm_boot_flag = false;
+    }
     if (rs_vol >= 0) { av_set_vol(rs_vol); rs_vol = -1; }
     rs_state = 0;
     av_close();
@@ -9645,31 +9736,15 @@ static bool dbg_bcm_host(void) { return bcm_run(NULL); }
 /* v96: Resume Videos = Ask: the question comes before the video starts (Rockbox's screen is still up);
    Always: no question; the next episode / the dock's next and previous (ask_ok false) continue only with Always */
 static void rbm_offer(const char *path, bool ask_ok)
-{
-    int mode = global_settings.bcm_video_resume;
-    uint32_t ms;
+{   /* v137: Resume Videos is gone: a video left with MENU starts from the beginning next time.  What stays: the start
+       after a sleep that ended in power off (or a power off while it played) continues where it was, no question. */
+    (void)path; (void)ask_ok;
     bcm_resume_ms = 0;
     if (sl_force)
-    {   /* v119: the start after a sleep that ended in power off: where it was, no question */
+    {
         sl_force = false;
         bcm_resume_ms = sl_pos;
-        return;
     }
-    if (!mode || qz_on) return;
-    ms = rbm_get(path);
-    if (ms < 10000) return;
-    if (mode == 1)
-    {
-        char t[16];
-        const char *lines[2];
-        struct text_message msg;
-        if (!ask_ok) return;
-        fmt_time(t, sizeof t, ms);
-        lines[0] = str(LANG_VIDEO_RESUME_Q); lines[1] = t;
-        msg.message_lines = lines; msg.nb_lines = 2;
-        if (gui_syncyesno_run(&msg, NULL, NULL) != YESNO_YES) return;
-    }
-    bcm_resume_ms = ms;
 }
 /* v47: play a video from the file browser and come back to it (the display goes back to Rockbox's own firmware) */
 bool bcm_video_play(const char *path)
@@ -10073,7 +10148,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v135, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v137, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -10733,7 +10808,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v135 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v137 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -10758,7 +10833,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v135, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v137, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
