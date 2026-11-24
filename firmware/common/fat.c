@@ -4698,7 +4698,8 @@ static long transfer(struct bpb *fat_bpb, sector_t start, long count,
 static unsigned long fat_max_read = FAT_MAX_TRANSFER_SIZE;
 void fat_set_max_read(unsigned long sectors)
 {
-    fat_max_read = sectors >= 8 && sectors <= 16384 ? sectors : FAT_MAX_TRANSFER_SIZE;
+    /* v140: 2048 at most -- 4096 (2 MB) wedged the iPod's IDE DMA in the v139 transfer test */
+    fat_max_read = sectors >= 8 && sectors <= 2048 ? sectors : FAT_MAX_TRANSFER_SIZE;
 }
 unsigned long fat_get_max_read(void) { return fat_max_read; }
 #define FAT_XFER_MAX (write ? (unsigned long)FAT_MAX_TRANSFER_SIZE : fat_max_read)

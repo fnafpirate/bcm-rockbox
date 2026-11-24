@@ -5637,7 +5637,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v139 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v140 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -8553,19 +8553,33 @@ int bcm_battery_learn(void)
             break;
         }
         if (current_tick - shown >= 5 * HZ)
-        {
+        {   /* v140: nothing stays on one spot for hours -- the text moves every 5 s and the whole screen swaps between
+               light-on-dark and dark-on-light every minute, so every pixel spends about as long bright as dark
+               (no image retention on the LCD); the backlight stays at full brightness the whole time */
+            static unsigned step;
+            int w, fh, x, y, k;
+            bool light = (current_tick / (60 * HZ)) & 1;
+            char t[4][48];
             shown = current_tick;
             battery_smooth_info(&bi);
+            snprintf(t[0], sizeof t[0], "Learn Battery: %u h %02u min", bln_n / 120, bln_n / 2 % 60);
+            snprintf(t[1], sizeof t[1], "%d mV (compensated %d)", raw, bi.comp_mv);
+            snprintf(t[2], sizeof t[2], "empty at about %u mV", (unsigned)battery_level_shutoff);
+            snprintf(t[3], sizeof t[3], "Leave it alone. MENU stops.");
+            lcd_getstringsize(t[3], &w, &fh);
+            step++;
+            x = LCD_WIDTH - w > 0 ? (int)(step * 37 % (unsigned)(LCD_WIDTH - w)) : 0;
+            y = LCD_HEIGHT - 4 * fh > 0 ? (int)(step * 53 % (unsigned)(LCD_HEIGHT - 4 * fh)) : 0;
+            lcd_set_background(light ? LCD_WHITE : LCD_BLACK);
+            lcd_set_foreground(light ? LCD_BLACK : LCD_WHITE);
             lcd_clear_display();
-            lcd_puts(0, 0, "Learn Battery");
-            lcd_putsf(0, 2, "Running %u h %02u min", bln_n / 120, bln_n / 2 % 60);
-            lcd_putsf(0, 3, "Battery %d mV (compensated %d)", raw, bi.comp_mv);
-            lcd_putsf(0, 4, "Empty at about %u mV", (unsigned)battery_level_shutoff);
-            lcd_puts(0, 6, "Leave it alone. MENU stops.");
+            for (k = 0; k < 4; k++) lcd_putsxy(x, y + k * fh, t[k]);
             lcd_update();
         }
     }
     backlight_set_brightness(global_settings.brightness);
+    lcd_set_background(global_settings.bg_color);
+    lcd_set_foreground(global_settings.fg_color);
     return 0;
 }
 
@@ -9981,7 +9995,9 @@ void bcm_fat_xfer_init(void)
 }
 static bool dbg_xfer_test(void)
 {
-    static const int sizes[] = { 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+    /* v140: up to 2048 (1 MB): a 4096-sector (2 MB) read wedged the drive on the first v139 run (panic in the next
+       write); the PP5022 IDE DMA length evidently stops below 2 MB */
+    static const int sizes[] = { 8, 16, 32, 64, 128, 256, 512, 1024, 2048 };
     struct storage_info si;
     unsigned short *id = ata_get_identify();
     bool lba48 = id && (id[83] & (1 << 10));
@@ -10534,7 +10550,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v139, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v140, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -11194,7 +11210,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v139 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v140 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -11219,7 +11235,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v139, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v140, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
