@@ -140,10 +140,13 @@ struct battery_smooth_info {
     int apple_table;          /* which of Apple's six tables (0..5) */
     unsigned hw_rev;
     unsigned short curve_mv[11];  /* curve in use: mV at 0, 10, ... 100 % */
+    bool learned_curve;       /* v138: the curve came from Learn Battery (battery_levels.cfg) */
+    int comp_mv;              /* v138: load-compensated, filtered voltage (-1 = not yet) */
 };
 void battery_set_reading(int mode);   /* v92: 0 balanced, 1 smooth, 2 exact */
 void powermgmt_set_load_hint(int load, bool on);   /* load 3 = the video decoder (BCM) */
 void battery_smooth_info(struct battery_smooth_info *i);
+void battery_set_learned_curve(const unsigned short *mv);   /* v138 */
 #endif
 int battery_time(void); /* minutes */
 int battery_voltage(void); /* filtered batt. voltage in millivolts */

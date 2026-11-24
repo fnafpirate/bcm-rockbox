@@ -88,6 +88,9 @@ static int volume_limit_callback(int action,
 /*    SOUND MENU                   */
 MENUITEM_SETTING(volume, &global_status.volume, NULL);
 MENUITEM_SETTING(volume_limit, &global_settings.volume_limit, volume_limit_callback);
+#ifdef IPOD_VIDEO
+MENUITEM_SETTING(start_volume, &global_settings.start_volume, NULL);   /* bcm overlay v138 */
+#endif
 #ifdef AUDIOHW_HAVE_BASS
 MENUITEM_SETTING(bass, &global_settings.bass,
 #ifdef HAVE_SW_TONE_CONTROLS
@@ -257,6 +260,9 @@ MAKE_MENU(bcm_piezo_menu, ID2P(LANG_PIEZO_MENU), NULL, Icon_Audio,
 MAKE_MENU(sound_settings, ID2P(LANG_SOUND_SETTINGS), NULL, Icon_Audio,
           &volume
           ,&volume_limit
+#ifdef IPOD_VIDEO
+          ,&start_volume
+#endif
 #ifdef AUDIOHW_HAVE_BASS
           ,&bass
 #endif

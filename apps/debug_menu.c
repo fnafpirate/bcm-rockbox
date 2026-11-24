@@ -84,6 +84,7 @@
 #include "skin_engine/skin_engine.h"
 #include "logfdisp.h"
 #include "core_alloc.h"
+#include <stdarg.h>
 #include "pcmbuf.h"
 #include "buffering.h"
 #include "playback.h"
@@ -2849,6 +2850,10 @@ static bool view_ram_info(void)
 
     simplelist_reset_lines();
     simplelist_addline("Rockbox: %d MB", MEMORYSIZE);
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    simplelist_addline("This iPod: %d MB (%s profile in use)", probed_ramsize == 64 ? 64 : 32,   /* bcm v138 */
+                       probed_ramsize == 64 ? "64 MB" : "32 MB");
+#endif
 
     struct sysinfo sys_info;
     if (sysinfo(&sys_info) == 0) {
@@ -5632,7 +5637,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v137 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v139 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -8374,6 +8379,196 @@ const char *bcm_boot_resume(void)
     return path;
 }
 
+/* ---- v138: Settings > Sound > Start Volume: 50 % (the video player's scale: -60 dB .. the volume limit, 50 % = -27 dB
+   with the usual +6 dB limit) each time playback starts, or at every track.  Set from the playback events (the audio
+   thread): the volume register only, the saved volume follows the next time it is changed by hand. */
+static void sv_set(void)
+{
+    int v = av_pct_to_vol(50);
+    if (global_status.volume == v) return;
+    global_status.volume = v;
+    sound_set_volume(v);
+}
+static void sv_event(unsigned short id, void *data)
+{
+    (void)data;
+    if (bcm_video_running) return;                     /* the video player keeps its own volume */
+    if (global_settings.bcm_debug_log)
+    {   /* v139: with the album art lines (apps/recorder/albumart.c): a time line of each track start */
+        int fd = open("/.rockbox/play_timing.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd >= 0)
+        {
+            struct mp3entry *t = audio_current_track();
+            fdprintf(fd, "%ld.%02ld %s  %s  (CPU %ld MHz, battery %d %%)\n", current_tick / HZ, current_tick % HZ,
+                     id == PLAYBACK_EVENT_START_PLAYBACK ? "playback starts" : "track change",
+                     t ? t->path : "", (long)(cpu_frequency / 1000000), battery_level());
+            close(fd);
+        }
+    }
+    if ((id == PLAYBACK_EVENT_START_PLAYBACK && global_settings.start_volume >= 1) ||
+        (id == PLAYBACK_EVENT_TRACK_CHANGE && global_settings.start_volume == 2))
+        sv_set();
+}
+void bcm_start_volume_init(void)
+{
+    static bool done;
+    if (done) return;
+    done = true;
+    add_event(PLAYBACK_EVENT_START_PLAYBACK, sv_event);
+    add_event(PLAYBACK_EVENT_TRACK_CHANGE, sv_event);
+}
+
+/* ---- v138: Learn Battery (Settings > General Settings > Battery) -------------------------------------------------------
+   Apple's 5.5G does not learn its battery: it maps the voltage through one of six fixed tables picked by the hardware
+   model (see powermgmt.c, v59) and lets the shown level fall at most one step per update.  The iPod has no fuel gauge
+   (no current counting), so a battery's own curve can only be learned by running it down.  This run: from a full
+   charge, charger out, the screen lit at full brightness and nothing else -- a constant load -- until the battery is
+   empty.  Every 30 s it records the load-compensated voltage (battery reading, v58/v92); with a constant load the
+   share of the run still to come at each moment is the share of the charge left, so the voltage at 90 %, 80 %, ...
+   of the run left is this battery's curve.  That curve goes to /.rockbox/battery_levels.cfg (Rockbox's own file,
+   read at every start) and is used at once; it then wins over Apple's table.  The samples go to
+   /.rockbox/battery_learn.txt every 10 minutes, so a run that Rockbox's low-battery power-off ends before this screen
+   does is finished at the next start (bcm_battery_learn_boot). */
+#define BLN_LOG  "/.rockbox/battery_learn.txt"
+#define BLN_MAX  4096                                  /* 30 s samples: 34 hours */
+static uint16_t bln_mv[BLN_MAX];
+static unsigned bln_n;
+static bool bln_curve(const uint16_t *mv, unsigned n, unsigned short out[11])
+{
+    int k;
+    if (n < 240) return false;                         /* under 2 hours: not a full run */
+    for (k = 0; k <= 10; k++)
+    {   /* k*10 % left = the moment (10-k)/10 of the way through; median of 5 samples around it */
+        unsigned c = (unsigned)((uint64_t)(n - 1) * (10 - k) / 10), i, j;
+        uint16_t w[5]; unsigned m = 0;
+        for (i = c >= 2 ? c - 2 : 0; i <= c + 2 && i < n; i++) w[m++] = mv[i];
+        for (i = 1; i < m; i++) for (j = i; j > 0 && w[j - 1] > w[j]; j--) { uint16_t t = w[j]; w[j] = w[j - 1]; w[j - 1] = t; }
+        out[k] = w[m / 2];
+    }
+    for (k = 1; k <= 10; k++) if (out[k] <= out[k - 1]) out[k] = out[k - 1] + 1;
+    return out[0] >= 3000 && out[10] <= 4350 && out[10] - out[0] >= 250;
+}
+static bool bln_save_curve(const unsigned short c[11], unsigned n)
+{
+    int fd = open(BATTERY_LEVELS_USER, O_WRONLY | O_CREAT | O_TRUNC, 0666), k;
+    if (fd < 0) return false;
+    fdprintf(fd, "# written by Learn Battery (bcm overlay v138): %u min run, screen at full brightness\n"
+                 "# mV at 0 %%, 10 %%, ... 100 %% (load-compensated).  Delete this file to go back to the built-in curve.\n"
+                 "discharge:", n / 2);
+    for (k = 0; k <= 10; k++) fdprintf(fd, "%s %u", k ? "," : "", (unsigned)c[k]);
+    fdprintf(fd, "\n");
+    close(fd);
+    battery_set_learned_curve(c);
+    return true;
+}
+static void bln_flush(unsigned from, unsigned to)
+{
+    int fd = open(BLN_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    unsigned i;
+    if (fd < 0) return;
+    for (i = from; i < to; i++) fdprintf(fd, "%u\n", (unsigned)bln_mv[i]);
+    close(fd);
+}
+static void bln_mark(const char *what)
+{
+    int fd = open(BLN_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) { fdprintf(fd, "%s\n", what); close(fd); }
+}
+/* at start-up (apps/root_menu.c): a run that ended in the low-battery power-off is finished from its samples */
+void bcm_battery_learn_boot(void)
+{
+    char line[32];
+    unsigned short c[11];
+    bool done = false;
+    int fd = open(BLN_LOG, O_RDONLY);
+    if (fd < 0) return;
+    bln_n = 0;
+    while (read_line(fd, line, sizeof line) > 0)
+    {
+        if (line[0] >= '0' && line[0] <= '9') { if (bln_n < BLN_MAX) bln_mv[bln_n++] = (uint16_t)atoi(line); }
+        else if (!strncmp(line, "done", 4) || !strncmp(line, "stopped", 7)) done = true;
+    }
+    close(fd);
+    if (done) return;
+    bln_mark(bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n) ? "done (at the next start)" : "done: too short");
+    if (bln_n >= 240) splashf(3 * HZ, "Battery learned (%u h %u min run)", bln_n / 120, bln_n / 2 % 60);
+}
+int bcm_battery_learn(void)
+{
+    extern unsigned short battery_level_shutoff;
+    struct battery_smooth_info bi;
+    unsigned short c[11];
+    const char *lines[3];
+    struct text_message msg;
+    unsigned flushed = 0;
+    long next = current_tick, shown = 0;
+    int lvl = battery_level();
+    if (charger_inserted())
+    {
+        splash(4 * HZ, "Charge to full, unplug the charger, then start Learn Battery");
+        return 0;
+    }
+    if (lvl >= 0 && lvl < 95)
+    {
+        splashf(4 * HZ, "Battery at %d %% -- charge to full first", lvl);
+        return 0;
+    }
+    lines[0] = "Screen on full until the battery is empty";
+    lines[1] = "(10-20 h). Do not use the iPod meanwhile.";
+    lines[2] = "MENU stops. Start?";
+    msg.message_lines = lines; msg.nb_lines = 3;
+    if (gui_syncyesno_run(&msg, NULL, NULL) != YESNO_YES) return 0;
+    remove(BLN_LOG);
+    bln_mark("# Learn Battery (bcm overlay v138): one load-compensated mV per 30 s");
+    bln_n = 0;
+    backlight_set_brightness(MAX_BRIGHTNESS_SETTING);
+    button_clear_queue();
+    while (1)
+    {
+        int b = button_get_w_tmo(HZ);
+        int raw = battery_voltage();
+        backlight_on();
+        reset_poweroff_timer();
+        if (b == BUTTON_MENU)
+        {
+            lines[0] = "Stop learning?"; msg.nb_lines = 1;
+            if (gui_syncyesno_run(&msg, NULL, NULL) == YESNO_YES) { bln_flush(flushed, bln_n); bln_mark("stopped"); break; }
+            msg.nb_lines = 3;
+        }
+        if (charger_inserted())
+        {   bln_flush(flushed, bln_n); bln_mark("stopped: charger"); splash(3 * HZ, "Charger in: learning stopped"); break; }
+        if (!TIME_BEFORE(current_tick, next))
+        {
+            next += 30 * HZ;
+            battery_smooth_info(&bi);
+            if (bln_n < BLN_MAX) bln_mv[bln_n++] = (uint16_t)(bi.comp_mv > 0 ? bi.comp_mv : raw);
+            if (bln_n - flushed >= 20) { bln_flush(flushed, bln_n); flushed = bln_n; }
+        }
+        if (raw > 0 && raw <= battery_level_shutoff + 25)
+        {   /* empty: finish here, before Rockbox's own low-battery power-off */
+            bln_flush(flushed, bln_n);
+            if (bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n)) { bln_mark("done"); splash(4 * HZ, "Battery learned -- powering off"); }
+            else { bln_mark("done: too short"); splash(4 * HZ, "Run too short -- nothing learned"); }
+            sys_poweroff();
+            break;
+        }
+        if (current_tick - shown >= 5 * HZ)
+        {
+            shown = current_tick;
+            battery_smooth_info(&bi);
+            lcd_clear_display();
+            lcd_puts(0, 0, "Learn Battery");
+            lcd_putsf(0, 2, "Running %u h %02u min", bln_n / 120, bln_n / 2 % 60);
+            lcd_putsf(0, 3, "Battery %d mV (compensated %d)", raw, bi.comp_mv);
+            lcd_putsf(0, 4, "Empty at about %u mV", (unsigned)battery_level_shutoff);
+            lcd_puts(0, 6, "Leave it alone. MENU stops.");
+            lcd_update();
+        }
+    }
+    backlight_set_brightness(global_settings.brightness);
+    return 0;
+}
+
 /* ---- v96: recovery.  A VideoCore that stops (no frame request for hang_s while playing, four player commands in a row
    unanswered, or the bus itself not answering) is power-cycled and booted again with the same vmcs.bin, the display layers
    and mplayer.vll come back through the normal start-up, and the video continues near where it stopped (cfg recover = the
@@ -9733,6 +9928,197 @@ static void bcm_reset_run_state(void)
 }
 static bool bcm_run(const char *play_path);
 static bool dbg_bcm_host(void) { return bcm_run(NULL); }
+
+/* ---- v139: Debug > Drive Transfer Test ---------------------------------------------------------------------------------
+   How many sectors can one ATA read command carry on this iPod's drive, and how fast is each size?  Rockbox's FAT layer
+   sends at most 256 (128 KB).  LBA48 drives (the iFlash adapters) take up to 65536 per command; whether the PP5022's IDE
+   DMA does more than 128 KB in one go is not documented.  Reads only: the same 4 MB, at the start of the disk and in its
+   middle, is read with commands of 8 ... 8192 sectors and compared (CRC-32) with a read in 64-sector commands.  Every
+   step is written to /.rockbox/xfer_test.txt before it runs, so a size that hangs the drive is in the log.  Then the
+   same through the file system (a 16 MB test file, read with each size the raw test passed).  At the end: use the
+   fastest size that read back correctly (saved as fat_xfer=N in /.rockbox/bcm_test.cfg, read at every start). */
+void fat_set_max_read(unsigned long sectors);
+unsigned long fat_get_max_read(void);
+#define XT_LOG "/.rockbox/xfer_test.txt"
+static void xt_log(const char *fmt, ...)
+{
+    char b[200];
+    va_list ap;
+    int fd;
+    va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    fd = open(XT_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) { fdprintf(fd, "%s\n", b); close(fd); }        /* closed every line: survives a hang */
+    lcd_clear_display(); lcd_puts(0, 0, "Drive Transfer Test"); lcd_puts_scroll(0, 2, b); lcd_update();
+}
+static int xt_cfg_put(int n)
+{   /* fat_xfer=N into bcm_test.cfg, other lines kept */
+    static char buf[4096];
+    int fd = open("/.rockbox/bcm_test.cfg", O_RDONLY), len = 0, o = 0;
+    if (fd >= 0) { len = read(fd, buf, sizeof buf - 1); close(fd); if (len < 0) len = 0; }
+    buf[len] = 0;
+    fd = open("/.rockbox/bcm_test.cfg", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) return -1;
+    while (o < len)
+    {
+        char *e = strchr(buf + o, '\n');
+        int l = e ? (int)(e - (buf + o)) + 1 : len - o;
+        if (strncmp(buf + o, "fat_xfer=", 9)) write(fd, buf + o, l);
+        o += l;
+    }
+    fdprintf(fd, "%sfat_xfer=%d\n", len && buf[len - 1] != '\n' ? "\n" : "", n);
+    close(fd);
+    return 0;
+}
+/* at start-up: fat_xfer=N from bcm_test.cfg */
+void bcm_fat_xfer_init(void)
+{
+    char line[64];
+    int fd = open("/.rockbox/bcm_test.cfg", O_RDONLY);
+    if (fd < 0) return;
+    while (read_line(fd, line, sizeof line) > 0)
+        if (!strncmp(line, "fat_xfer=", 9)) fat_set_max_read(strtoul(line + 9, NULL, 10));
+    close(fd);
+}
+static bool dbg_xfer_test(void)
+{
+    static const int sizes[] = { 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+    struct storage_info si;
+    unsigned short *id = ata_get_identify();
+    bool lba48 = id && (id[83] & (1 << 10));
+    int h, k, a, best = 256, ok_max = 256;
+    unsigned long best_kbs = 0, kbs256 = 0;
+    uint8_t *buf;
+    size_t bytes = 4u << 20;
+    bool pass[ARRAYLEN(sizes)] = { false };
+    unsigned long kbs_k[ARRAYLEN(sizes)] = { 0 };
+    char model[41];
+    audio_stop();
+    h = core_alloc_ex(bytes + 64, NULL);
+    if (h <= 0) { splash(3 * HZ, "Not enough free memory"); return false; }
+    core_pin(h);
+    buf = (uint8_t *)(((uintptr_t)core_get_data(h) + 31) & ~31u);
+    storage_get_info(0, &si);
+    remove(XT_LOG);
+    for (k = 0; k < 20 && id; k++) { model[2 * k] = id[27 + k] >> 8; model[2 * k + 1] = id[27 + k] & 0xff; }
+    model[40] = 0;
+    xt_log("Drive Transfer Test (bcm overlay v139); this iPod: %d MB RAM", probed_ramsize == 64 ? 64 : 32);
+    xt_log("drive: %s", id ? model : "?");
+    xt_log("  %lu sectors of %u bytes, LBA48 %s, UDMA modes %04x, FAT reads now %lu sectors per command",
+           (unsigned long)si.num_sectors, si.sector_size, lba48 ? "yes" : "no", id ? id[88] : 0, fat_get_max_read());
+    {
+        unsigned long per = bytes / si.sector_size;                      /* sectors in 4 MB */
+        sector_t area[2] = { 2048, si.num_sectors / 2 / 2048 * 2048 };
+        uint32_t ref[2];
+        for (a = 0; a < 2; a++)
+        {   /* the reference: 64-sector commands (well inside what Rockbox always used) */
+            unsigned long s;
+            xt_log("area %d at sector %lu: reference read, 64-sector commands", a, (unsigned long)area[a]);
+            memset(buf, 0, bytes);
+            for (s = 0; s < per; s += 64)
+                if (storage_read_sectors(IF_MD(0,) area[a] + s, 64, buf + s * si.sector_size) < 0)
+                { xt_log("  reference read failed at %lu -- stopping", s); goto out; }
+            ref[a] = crc_32(buf, bytes, 0xffffffff);
+        }
+        for (k = 0; k < (int)ARRAYLEN(sizes); k++)
+        {
+            int n = sizes[k], rep;
+            unsigned long us_best = 0;
+            pass[k] = false; kbs_k[k] = 0;
+            if ((unsigned long)n > per) continue;
+            if (n > 256 && !lba48) { xt_log("%5d sectors: skipped (the drive has no LBA48: 256 at most)", n); continue; }
+            xt_log("%5d sectors (%d KB) per command: reading ...", n, n * (int)si.sector_size / 1024);
+            pass[k] = true;
+            for (a = 0; a < 2 && pass[k]; a++)
+                for (rep = 0; rep < 2; rep++)
+                {
+                    unsigned long s, t0;
+                    int rc = 0;
+                    memset(buf, 0xa5, bytes);
+                    t0 = USEC_TIMER;
+                    for (s = 0; s < per && rc >= 0; s += n)
+                        rc = storage_read_sectors(IF_MD(0,) area[a] + s, n, buf + s * si.sector_size);
+                    t0 = USEC_TIMER - t0;
+                    if (rc < 0) { xt_log("      area %d: read error %d", a, rc); pass[k] = false; break; }
+                    if (crc_32(buf, bytes, 0xffffffff) != ref[a]) { xt_log("      area %d: DIFFERENT DATA", a); pass[k] = false; break; }
+                    if (!us_best || t0 < us_best) us_best = t0;
+                }
+            if (pass[k])
+            {
+                unsigned long kbs = us_best ? (unsigned long)((uint64_t)4096 * 1000000 / us_best) : 0;
+                xt_log("      ok, %lu KB/s (best of 4 reads of 4 MB)", kbs);
+                kbs_k[k] = kbs;
+                if (n == 256) kbs256 = kbs;
+                if (n > 256) ok_max = n;
+            }
+            else if (n > 256) break;                                  /* bigger sizes will not do better */
+        }
+    }
+    /* through the file system: a 16 MB file read in 4 MB read() calls with each size that passed */
+    if (ok_max > 256)
+    {
+        const char *tf = "/.rockbox/xfer_test.bin";
+        unsigned long saved = fat_get_max_read();
+        uint32_t ref = 0;
+        int fd = open(tf, O_WRONLY | O_CREAT | O_TRUNC, 0666), i;
+        xt_log("file system: writing a 16 MB test file ...");
+        for (i = 0; i < 4 && fd >= 0; i++)
+        {
+            size_t j;
+            for (j = 0; j < bytes; j += 4) *(uint32_t *)(buf + j) = (uint32_t)(i * bytes + j) * 2654435761u;
+            ref = crc_32(buf, bytes, i ? ref : 0xffffffff);
+            if (write(fd, buf, bytes) != (ssize_t)bytes) { close(fd); fd = -1; }
+        }
+        if (fd >= 0) close(fd);
+        if (fd < 0) xt_log("  could not write it -- file test skipped");
+        else
+            for (k = 0; k < (int)ARRAYLEN(sizes); k++)
+            {
+                unsigned long t0;
+                uint32_t c = 0;
+                bool good = true;
+                if (sizes[k] < 256 || !pass[k]) continue;
+                fat_set_max_read(sizes[k]);
+                xt_log("file read, FAT commands up to %d sectors ...", sizes[k]);
+                fd = open(tf, O_RDONLY);
+                t0 = USEC_TIMER;
+                for (i = 0; i < 4 && fd >= 0 && good; i++)
+                {
+                    if (read(fd, buf, bytes) != (ssize_t)bytes) good = false;
+                    else c = crc_32(buf, bytes, i ? c : 0xffffffff);
+                }
+                t0 = USEC_TIMER - t0;
+                if (fd >= 0) close(fd);
+                if (!good || c != ref) { xt_log("      DIFFERENT DATA / read error"); pass[k] = false; }
+                else xt_log("      ok, %lu KB/s (16 MB, includes the CRC)", (unsigned long)((uint64_t)16384 * 1000000 / t0));
+            }
+        fat_set_max_read(saved);
+        remove(tf);
+    }
+out:
+    core_unpin(h); core_free(h);
+    for (k = 0; k < (int)ARRAYLEN(sizes); k++)          /* the fastest size that passed both tests */
+        if (pass[k] && sizes[k] >= 256 && kbs_k[k] > best_kbs) { best_kbs = kbs_k[k]; best = sizes[k]; }
+    if (best > 256 && best_kbs > kbs256 + kbs256 / 20)
+    {
+        const char *lines[2];
+        char l2[48];
+        struct text_message msg;
+        snprintf(l2, sizeof l2, "%d sectors: %lu KB/s (256: %lu)", best, best_kbs, kbs256);
+        lines[0] = "Use the faster read size?"; lines[1] = l2;
+        msg.message_lines = lines; msg.nb_lines = 2;
+        xt_log("fastest that read back correctly: %d sectors per command, %lu KB/s (256: %lu KB/s)", best, best_kbs, kbs256);
+        if (gui_syncyesno_run(&msg, NULL, NULL) == YESNO_YES)
+        {
+            fat_set_max_read(best);
+            xt_cfg_put(best);
+            xt_log("now in use, and saved (fat_xfer=%d in /.rockbox/bcm_test.cfg)", best);
+        }
+    }
+    else
+        xt_log("result: 256 sectors per command stays (nothing bigger was correct and at least 5 %% faster)");
+    splash(3 * HZ, "Log: /.rockbox/xfer_test.txt");
+    return false;
+}
 /* v96: Resume Videos = Ask: the question comes before the video starts (Rockbox's screen is still up);
    Always: no question; the next episode / the dock's next and previous (ask_ok false) continue only with Always */
 static void rbm_offer(const char *path, bool ask_ok)
@@ -10148,7 +10534,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v137, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v139, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -10808,7 +11194,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v137 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v139 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -10833,7 +11219,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v137, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v139, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
@@ -10869,6 +11255,7 @@ static const struct {
 #endif
 #ifdef IPOD_VIDEO
         { "BCM host test", dbg_bcm_host },
+        { "Drive Transfer Test", dbg_xfer_test },       /* v139 */
         { "CABAC tests", dbg_cabac_tests },
         { "Storage report (exFAT prep)", dbg_storage_report },
         { "Dump flash ROM (exFAT prep)", dbg_flash_dump },

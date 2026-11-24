@@ -195,6 +195,8 @@ static bool cal_ok;
 static unsigned short apple_curve[11];   /* Apple's curve in mV, 0..100 % by 10 */
 static bool apple_curve_ok;
 static int bsm_sub_raw = -1;
+static bool user_discharge;             /* bcm v138: battery_levels.cfg had a discharge curve (Learn Battery) */
+#define BSM_CURVE() ((apple_curve_ok && !user_discharge) ? apple_curve : (const unsigned short *)percent_to_volt_discharge)
 
 static void cal_add(int raw, int mv)
 {
@@ -240,7 +242,9 @@ void battery_smooth_info(struct battery_smooth_info *i)
     i->apple_curve = apple_curve_ok;
     i->apple_table = apple_table_index();
     i->hw_rev = (unsigned)IPOD_HW_REVISION;
-    for (k = 0; k < 11; k++) i->curve_mv[k] = apple_curve_ok ? apple_curve[k] : percent_to_volt_discharge[k];
+    for (k = 0; k < 11; k++) i->curve_mv[k] = BSM_CURVE()[k];
+    i->learned_curve = user_discharge;
+    i->comp_mv = bsm.inited ? (int)(bsm.vslow >> 8) : -1;
     i->enabled = bsm_on;
     i->balanced = bsm.balanced;
     i->raw_percent = percent_raw;
@@ -248,6 +252,13 @@ void battery_smooth_info(struct battery_smooth_info *i)
     i->resistance_mohm = bsm.r_mohm;
     i->loads = bsm.cls;
     for (k = 0; k < 4; k++) { i->sag_mv[k] = bsm.sag[k]; i->measured[k] = bsm.learned[k]; }
+}
+/* bcm v138: Learn Battery: use a learned discharge curve now (it is also written to battery_levels.cfg for the next
+   start) */
+void battery_set_learned_curve(const unsigned short *mv)
+{
+    memcpy(percent_to_volt_discharge, mv, sizeof(percent_to_volt_discharge));
+    user_discharge = true;
 }
 static unsigned bsm_loads(void)
 {
@@ -585,7 +596,7 @@ static void battery_status_update(void)
         long now = current_tick;
         int shown = bsm_step(&bsm, bsm_sample, bsm.inited ? (now - bsm_tick) * (1000 / HZ) : 0, bsm_loads(),
                              charger_inserted(), charging_state(), bsm_charge_ma(), battery_capacity,
-                             apple_curve_ok ? apple_curve : percent_to_volt_discharge);
+                             BSM_CURVE());
         bsm_tick = now;
         if (bsm_on) level = shown;
     }
@@ -1132,11 +1143,14 @@ void init_battery_tables(void)
             if (bl_op == eCHARGE)
             {
 #if CONFIG_CHARGING
-                memcpy(device_battery_tables.charge, &tmparr, PWRELEMS);
+                memcpy(device_battery_tables.charge, &tmparr, sizeof(tmparr));   /* bcm v138: was PWRELEMS bytes = 5.5 values */
 #endif
                 break;
             }
-            memcpy(device_battery_tables.discharge, &tmparr, PWRELEMS);
+            memcpy(device_battery_tables.discharge, &tmparr, sizeof(tmparr));   /* bcm v138: was PWRELEMS bytes */
+#ifdef HAVE_BATTERY_SMOOTH
+            user_discharge = true;   /* bcm v138: a learned / user curve wins over Apple's table */
+#endif
             break;
         } /* switch */
     } /* for */

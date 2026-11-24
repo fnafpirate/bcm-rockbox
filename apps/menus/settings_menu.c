@@ -253,6 +253,10 @@ MENUITEM_SETTING(battery_capacity, &global_settings.battery_capacity, NULL);
 #ifdef HAVE_BATTERY_SMOOTH_API
 MENUITEM_SETTING(battery_reading, &global_settings.battery_reading, NULL);
 #endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+extern int bcm_battery_learn(void);   /* bcm overlay v138: apps/debug_menu.c */
+MENUITEM_FUNCTION(battery_learn, 0, ID2P(LANG_BATTERY_LEARN), bcm_battery_learn, NULL, Icon_NOICON);
+#endif
 
 #ifdef HAVE_USB_CHARGING_ENABLE
 static int usbcharging_callback(int action,
@@ -277,6 +281,9 @@ MAKE_MENU(battery_menu, ID2P(LANG_BATTERY_MENU), 0, Icon_NOICON,
 #endif
 #ifdef HAVE_BATTERY_SMOOTH_API
             &battery_reading,
+#endif
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+            &battery_learn,
 #endif
 #ifdef HAVE_USB_CHARGING_ENABLE
             &usb_charging,

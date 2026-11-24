@@ -29,6 +29,9 @@ Command line (also used for testing on a disk image):
                       [--layout auto|partition|whole|ipod] --yes
   --layout: auto (default) = a normal exFAT partition up to 2.2 TB, the whole
             disk as exFAT above that (any size); "ipod" = old iPod-only units
+  --full: full format (every sector of the new partition rewritten with zeros first)
+  --full-check: full format with a test pattern that is read back (finds bad sectors and fake-capacity cards)
+  --itunes-fw: keep the old firmware partition sizes (32 MB new / Apple's size) instead of 2 MB
   ipod_exfat_setup.py --new [--model 5.5g|5g] (--disk N|--image F) --rockbox-zip Z --bootloader B
                       [--keep-dir SAVED_ROCKBOX_FOLDER] [--label L] [--cluster-kb auto|32|128|...] --yes
   ipod_exfat_setup.py --restore BACKUP (--disk N|--image F) --yes
@@ -72,10 +75,18 @@ files, a re-format of the iPod at the files on it now (the same library comes ba
 size -- the unused end of every file's last cluster and one cluster per folder (scaled to a card 90 % full), the FAT
 and the bitmap -- and takes the smallest.  Music libraries land on 32-64 KB, video libraries on 128-512 KB.  A blank
 card (New drive) still goes by its size.
+
+1.13: quick or full format.  Full rewrites every sector of the new partition with zeros (one pass, 8 MB writes);
+"full + check" writes a pattern naming each block's place and reads it back (bad sectors, fake-capacity cards).  All
+disk access on Windows is now unbuffered: writes go at the disk's own steady speed instead of fast-then-slow bursts
+through Windows' cache.  The firmware
+partition is 2 MB (was 32 MB on a new drive, Apple's size on a converted iPod): the boot ROM reads only its
+directory and the bootloader (~1.1 MB with room for a bigger bootloader); Apple's other images stay in the backup.
+--itunes-fw keeps the old sizes.  Can be built into a Windows .exe (no Python needed): see build_exe.txt.
 """
 import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.12'
+VERSION = '1.13'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -105,8 +116,8 @@ def choose_cluster(nbytes, sizes=None, ndirs=0, min_bytes=512, log=None):
     if not sizes:
         return max(auto_cluster(nbytes), min_bytes)
     data = sum(sizes)
-    if data <= 0:
-        return max(auto_cluster(nbytes), min_bytes)
+    if len(sizes) < 50 or data < min(10 ** 9, nbytes // 50):
+        return max(auto_cluster(nbytes), min_bytes)   # too little to go by (e.g. only Rockbox on it)
     scale = nbytes * 0.9 / data
     best = None
     rows = []
@@ -132,6 +143,89 @@ def choose_cluster(nbytes, sizes=None, ndirs=0, min_bytes=512, log=None):
             % (len(sizes), ndirs, human(data), ', '.join('%d KB %s' % (kb, human(l)) for kb, l in rows),
                best[0] // 1024))
     return best[0]
+
+
+ZERO_CHUNK = 8 << 20
+
+
+def zero_fill(disk, start, end, log=print, progress=lambda f: None):
+    """1.13 full format: zeros over [start, end) in one pass, 8 MB per write from one buffer, unbuffered on Windows --
+    the disk's own steady write speed (log: speed and time left every 5 %)"""
+    start = align_up(start, disk.sector)
+    end = end // disk.sector * disk.sector
+    total = end - start
+    if total <= 0:
+        return
+    log('full format: writing zeros over %s' % human(total))
+    zero = None if hasattr(disk, 'write_zeros') else bytes(ZERO_CHUNK)
+    t0 = time.time(); last = -1; off = start
+    while off < end:
+        n = min(ZERO_CHUNK, end - off)
+        if zero is None:
+            disk.write_zeros(off, n)
+        else:
+            disk.write(off, zero[:n])
+        off += n
+        done = (off - start) / total
+        progress(done)
+        pct = int(done * 20)
+        if pct != last:
+            last = pct
+            el = time.time() - t0
+            if el > 1:
+                log('  %d %%  %.1f MB/s  about %s left' % (pct * 5, (off - start) / el / 1e6, human_time(el / done - el)))
+    disk.flush()
+    el = time.time() - t0
+    log('  zeros written: %s in %s (%.1f MB/s)' % (human(total), human_time(el), total / max(el, 0.001) / 1e6))
+
+
+def surface_test(disk, start, end, log=print, progress=lambda f: None):
+    """1.13 full format: every 4 MB block of [start, end) is written with a pattern that names its own position,
+    then everything is read back and compared.  Finds bad sectors and fake-capacity cards (whose far blocks land on
+    the near ones).  Slow: the whole partition is written and read once (log: speed and time left)."""
+    blk = CHUNK
+    start = align_up(start, disk.sector)
+    end = end // disk.sector * disk.sector
+    total = end - start
+    if total <= 0:
+        return
+    def pattern(off):
+        n = min(blk, end - off)
+        stamp = struct.pack('<QQ', off, off ^ 0x5a5aa5a5c3c33c3c)
+        return (stamp * (n // 16 + 1))[:n]
+    for phase, name in ((0, 'writing'), (1, 'reading back')):
+        log('full format: %s a test pattern over %s' % (name, human(total)))
+        t0 = time.time(); last = -1
+        off = start
+        while off < end:
+            n = min(blk, end - off)
+            if phase == 0:
+                write_at(disk, off, pattern(off))
+            else:
+                got = disk.read(off, n)
+                if got != pattern(off):
+                    bad = next(i for i in range(0, n, 16) if got[i:i + 16] != pattern(off)[i:i + 16])
+                    raise SetupError('full format: the data at %s does not read back (bad sector, or a card that '
+                                     'is smaller than it claims) -- nothing more was written'
+                                     % human(off + bad - start))
+            off += n
+            done = (off - start) / total
+            progress((phase + done) / 2)
+            pct = int(done * 20)
+            if pct != last:
+                last = pct
+                el = time.time() - t0
+                if el > 1 and done > 0:
+                    log('  %s %d %%  %.1f MB/s  about %s left' % (name, pct * 5, (off - start) / el / 1e6,
+                                                                   human_time(el / done - el)))
+        if phase == 0:
+            disk.flush()
+    log('  full format: every block read back correctly')
+
+
+def human_time(s):
+    s = int(s)
+    return '%d h %02d min' % (s // 3600, s // 60 % 60) if s >= 3600 else '%d min %02d s' % (s // 60, s % 60)
 
 
 def library_sample(disk, ipod, log=print, limit=200000):
@@ -422,9 +516,13 @@ if os.name == 'nt':
     k32.GetVolumePathNamesForVolumeNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
                                                      ctypes.POINTER(wintypes.DWORD)]
     k32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+    k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+    FILE_FLAG_NO_BUFFERING = 0x20000000
 
-    def _open(path, access):
-        h = k32.CreateFileW(path, access, FILE_SHARE_RW, None, OPEN_EXISTING, 0, None)
+    def _open(path, access, flags=0):
+        h = k32.CreateFileW(path, access, FILE_SHARE_RW, None, OPEN_EXISTING, flags, None)
         if h in (None, INVALID_HANDLE):
             raise OSError(ctypes.get_last_error(), 'cannot open %s' % path)
         return h
@@ -499,7 +597,18 @@ if os.name == 'nt':
     class WinDisk:
         def __init__(self, number, writable=True):
             self.number = number
-            self.h = _open(r'\\.\PhysicalDrive%d' % number, GENERIC_READ | (GENERIC_WRITE if writable else 0))
+            # 1.13: unbuffered (FILE_FLAG_NO_BUFFERING): every write goes to the disk as it is issued, at the disk's own
+            # steady speed.  Through Windows' file cache (1.0-1.12) writes ran fast until the cache filled, then slowly
+            # while it emptied (8-10 MB/s, then 2-4).  Unbuffered I/O needs sector-aligned memory: _abuf().
+            path = r'\\.\PhysicalDrive%d' % number
+            acc = GENERIC_READ | (GENERIC_WRITE if writable else 0)
+            self.unbuffered = True
+            self._buf, self._cap, self._zero, self._zcap = None, 0, None, 0
+            try:
+                self.h = _open(path, acc, FILE_FLAG_NO_BUFFERING)
+            except OSError:
+                self.unbuffered = False
+                self.h = _open(path, acc)
             try:
                 g = _ioctl(self.h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, None, 256)
                 if le64(g, 24) == 0:
@@ -532,21 +641,56 @@ if os.name == 'nt':
             if not k32.SetFilePointerEx(self.h, off, None, 0):
                 raise SetupError('seek to %d failed (error %d)' % (off, ctypes.get_last_error()))
 
+        def _abuf(self, n, zero=False):
+            """page-aligned memory of at least n bytes (VirtualAlloc), kept and reused; zero=True: a buffer that is
+            never written to (VirtualAlloc memory starts as zeros)"""
+            if zero:
+                if n > self._zcap:
+                    if self._zero:
+                        k32.VirtualFree(self._zero, 0, 0x8000)
+                    self._zero = k32.VirtualAlloc(None, n, 0x3000, 4)
+                    if not self._zero:
+                        raise SetupError('out of memory (%d bytes)' % n)
+                    self._zcap = n
+                return self._zero
+            if n > self._cap:
+                if self._buf:
+                    k32.VirtualFree(self._buf, 0, 0x8000)
+                self._buf = k32.VirtualAlloc(None, n, 0x3000, 4)
+                if not self._buf:
+                    raise SetupError('out of memory (%d bytes)' % n)
+                self._cap = n
+            return self._buf
+
         def read(self, off, n):
             assert off % self.sector == 0 and n % self.sector == 0
             self._seek(off)
-            buf = ctypes.create_string_buffer(n)
+            addr = self._abuf(n)
             got = wintypes.DWORD(0)
-            if not k32.ReadFile(self.h, buf, n, ctypes.byref(got), None) or got.value != n:
+            if not k32.ReadFile(self.h, addr, n, ctypes.byref(got), None) or got.value != n:
                 raise SetupError('read at %d failed (error %d)' % (off, ctypes.get_last_error()))
-            return buf.raw
+            return ctypes.string_at(addr, n)
+
+        def write_zeros(self, off, n):
+            """1.13 full format: n bytes of zeros from one reused buffer (no data copied per write)"""
+            assert off % self.sector == 0 and n % self.sector == 0
+            if off + n > self.size:
+                raise SetupError('write past the end of the disk')
+            self._seek(off)
+            addr = self._abuf(n, zero=True)
+            done = wintypes.DWORD(0)
+            if not k32.WriteFile(self.h, addr, n, ctypes.byref(done), None) or done.value != n:
+                raise SetupError('write at %d failed (Windows error %d)' % (off, ctypes.get_last_error()))
 
         def write(self, off, data):
             assert off % self.sector == 0 and len(data) % self.sector == 0
             if off + len(data) > self.size:
                 raise SetupError('write past the end of the disk')
             self._seek(off)
-            buf = ctypes.create_string_buffer(bytes(data), len(data))
+            if not isinstance(data, bytes):
+                data = bytes(data)
+            buf = self._abuf(len(data))
+            ctypes.memmove(buf, data, len(data))
             done = wintypes.DWORD(0)
             if not k32.WriteFile(self.h, buf, len(data), ctypes.byref(done), None) or done.value != len(data):
                 err = ctypes.get_last_error()
@@ -625,6 +769,11 @@ if os.name == 'nt':
                 k32.CloseHandle(vh)
             self.locked = []
             k32.CloseHandle(self.h)
+            for b in (self._buf, self._zero):
+                if b:
+                    k32.VirtualFree(b, 0, 0x8000)
+            self._buf = self._zero = None
+            self._cap = self._zcap = 0
 else:
     def is_admin():
         return os.geteuid() == 0 if hasattr(os, 'geteuid') else True
@@ -761,7 +910,11 @@ MODELS = {'5.5g': 2048, '5g': 512}
 PROTECT_TYPE = 0xDA          # up to 1.8: a PC-unit copy of the firmware partition (Windows mounts it!): skipped when reading
 PC_LIMIT = 0xffffffff * 512  # a 512-unit partition table ends at 2.2 TB
 FW_START_UNITS = 63                  # where iTunes puts it
-FW_SIZE = 32 << 20
+FW_SIZE = 32 << 20                   # 1.0-1.12: the firmware partition of a new drive
+FW_SMALL = 2 << 20                   # 1.13: small firmware partition (bootloader + directory need ~1.1 MB)
+# 1.13: run-wide options, set by the window / the command line
+OPTIONS = {'small_fw': True,         # firmware partition 2 MB instead of 32 MB / Apple's size
+           'full': ''}               # '' quick, 'zero' full format (zeros everywhere), 'check' (pattern + read back)
 OSOS_DEV, OSOS_ROOM = 0x4800, 1 << 20
 
 def disk_check_new(disk, unit):
@@ -789,12 +942,9 @@ def write_fw_partition(disk, unit, fw_size, chunks, log=print):
     write_at(disk, 0, bytes(mbr[:512]))
     disk.flush()
 
-def create_blank(disk, unit, boot, log=print):
-    """partition table + firmware partition with the bootloader; setup() then
-    adds the exFAT partition"""
-    disk_check_new(disk, unit)
-    fw_start = FW_START_UNITS * unit
-    fw = bytearray(FW_SIZE)
+def fw_image(unit, boot, size):
+    """a firmware partition holding only the Rockbox bootloader (as osos) and an empty rsrc entry"""
+    fw = bytearray(size)
     fw[0:255] = APPLE_STOP_SIGN
     fw[0x100:0x104] = b']ih['
     struct.pack_into('<IHH', fw, 0x104, 0x4000, 0x010c, 3)
@@ -808,8 +958,16 @@ def create_blank(disk, unit, boot, log=print):
         o = unit + dev
         fw[o:o + len(data)] = data
         d += 40
-    log('writing a new partition table and firmware partition (%d-byte units)' % unit)
-    write_fw_partition(disk, unit, FW_SIZE, (bytes(fw[pos:pos + CHUNK]) for pos in range(0, FW_SIZE, CHUNK)), log)
+    return bytes(fw)
+
+def create_blank(disk, unit, boot, log=print):
+    """partition table + firmware partition with the bootloader; setup() then
+    adds the exFAT partition.  1.13: 2 MB (OPTIONS small_fw) instead of 32 MB."""
+    disk_check_new(disk, unit)
+    size = FW_SMALL if OPTIONS.get('small_fw') else FW_SIZE
+    fw = fw_image(unit, boot, size)
+    log('writing a new partition table and %s firmware partition (%d-byte units)' % (human(size), unit))
+    write_fw_partition(disk, unit, size, (fw[pos:pos + CHUNK] for pos in range(0, size, CHUNK)), log)
 
 def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', cluster=None,
               log=print, progress=lambda f: None, layout='auto', ipsw=None):
@@ -1588,7 +1746,13 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         make_backup(ipod, backup_path, log)
     # 3. new layout
     disk_end = disk.size // unit * unit
-    fw_end = ipod.fw_start + ipod.fw_size
+    # 1.13: the firmware partition rebuilt at 2 MB (bootloader only; Apple's images go -- they are in the backup)
+    shrink = bool(OPTIONS.get('small_fw') and boot and ipod.fw_size > FW_SMALL and len(boot) <= OSOS_ROOM
+                  and OSOS_DEV + OSOS_ROOM + 4096 + unit <= FW_SMALL)
+    fw_end = ipod.fw_start + (FW_SMALL if shrink else ipod.fw_size)
+    if shrink:
+        log('firmware partition: %s -> %s (only the Rockbox bootloader is kept in it)'
+            % (human(ipod.fw_size), human(FW_SMALL)))
     part_off = align_up(fw_end, ALIGN)
     part_len = (disk_end - part_off) // ALIGN * ALIGN
     if layout == 'auto':
@@ -1625,6 +1789,8 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
     mbr = bytearray(ipod.mbr_sector)
     for k in (1, 2, 3):
         mbr[0x1be + 16 * k: 0x1be + 16 * (k + 1)] = bytes(16)
+    if shrink:
+        struct.pack_into('<I', mbr, 0x1be + 12, FW_SMALL // unit)
     if not cluster:
         if sample is None:
             log('looking at the files on the iPod now (for the cluster size)')
@@ -1651,6 +1817,10 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         disk.lock_volumes(log)
     else:
         disk.lock_volumes()
+    if OPTIONS.get('full'):
+        (surface_test if OPTIONS['full'] == 'check' else zero_fill)(
+            disk, part_off if layout != 'whole' else align_up(fw_end, ALIGN),
+            part_off + part_len if layout != 'whole' else part_len, log, progress)
     plan.write(disk, log, progress)     # (whole disk: its boot sector is the new sector 0)
     if layout != 'whole':
         pu = 512 if pc else unit
@@ -1670,6 +1840,27 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         verify_exfat(disk, part_off, tree, up, log)
         disk.finish()
         log('DONE.  Eject the drive and put it in the iPod; hold MENU+SELECT to start.')
+        return plan
+    if shrink:
+        write_at(disk, ipod.fw_start, fw_image(unit, boot, FW_SMALL))
+        if layout != 'whole':
+            disk.write(0, bytes(mbr))
+        log('  new %s firmware partition with the Rockbox bootloader (%s)' % (human(FW_SMALL), human(len(boot))))
+        disk.flush()
+        log('checking')
+        progress(1.0)
+        after = Ipod(disk)
+        im2 = after.images[after.osos]
+        if (im2['len'] != len(boot) or after.data_fs != 'exFAT' or after.fw_size != FW_SMALL
+                or after._read(after.fwoffset + im2['devOffset'], len(boot)) != boot):
+            raise SetupError('verify: firmware partition / partition table did not read back correctly')
+        log('  firmware partition and partition table read back correctly')
+        verify_exfat(disk, part_off, tree, up, log)
+        disk.finish()
+        if zf:
+            zf.close()
+        log('DONE.  ' + ('Eject the iPod, unplug it and hold MENU+SELECT to restart.' if backup_path else
+                        'Eject the drive and put it in the iPod (or unplug the iPod); hold MENU+SELECT to start.'))
         return plan
     im = ipod.images[ipod.osos]
     off = ipod.fwoffset + im['devOffset']
@@ -1945,9 +2136,13 @@ def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, 
     if not copy_fw and not bootloader:
         raise SetupError('the new card is for a different iPod model than the old one: choose the bootloader '
                          'file, a new firmware partition is made for it')
-    fw_size = ipod.fw_size if copy_fw else FW_SIZE
+    # 1.13: an old card whose firmware partition holds only the Rockbox bootloader gets a 2 MB one with that bootloader
+    small_copy = bool(copy_fw and OPTIONS.get('small_fw') and ipod.boot_has_rockbox and len(ipod.images) <= 2
+                      and ipod.fw_size > FW_SMALL and ipod.images[ipod.osos]['len'] <= OSOS_ROOM)
+    fw_size = (FW_SMALL if small_copy else ipod.fw_size) if copy_fw else (FW_SMALL if OPTIONS.get('small_fw') else FW_SIZE)
     if not cluster:   # 1.12: from the old card's files (setup() below gets the same choice for the partition)
-        cluster = choose_cluster(dst.size, [n.size for _, n in t.walk() if not n.is_dir], vol.dirs, 512, log)
+        cluster = choose_cluster(dst.size, [n.size for p_, n in t.walk() if not n.is_dir
+                                            and not p_.lower().startswith('/.rockbox')], vol.dirs, 512, log)
     # room: every file rounded up to clusters, the folders, the FAT and some slack
     need = sum(align_up(n.size, cluster) for _, n in t.walk() if not n.is_dir)
     need += (vol.dirs + 2) * cluster + 64 * (1 << 20)
@@ -1962,7 +2157,12 @@ def migrate(src, dst, unit=None, rockbox_zip=None, bootloader=None, label=None, 
         dst.lock_volumes(log)
     else:
         dst.lock_volumes()
-    if copy_fw:
+    if small_copy:
+        osos = ipod.images[ipod.osos]
+        create_blank(dst, unit, ipod._read(ipod.fwoffset + osos['devOffset'], osos['len']), log)
+        log('  the Rockbox bootloader of the old card in a %s firmware partition' % human(FW_SMALL))
+        boot = None
+    elif copy_fw:
         log('copying the firmware partition (%s: bootloader%s) as it is'
             % (human(fw_size), ', Apple OS' if not ipod.boot_has_rockbox or len(ipod.images) > 2 else ''))
         def chunks():
@@ -2175,6 +2375,15 @@ def gui():
     cl_var = tk.StringVar(value='Auto')    # 1.8: chosen from the card's size
     ttk.Combobox(opt, textvariable=cl_var, values=['Auto', '32 KB', '64 KB', '128 KB', '256 KB', '512 KB'], width=8,
                  state='readonly').pack(side='left')
+    opt2 = ttk.Frame(frm); opt2.grid(row=13, column=0, columnspan=3, sticky='w', pady=(0, 4))   # 1.13
+    ttk.Label(opt2, text='Format:').pack(side='left')
+    FORMATS = [('Quick', ''), ('Full (rewrites every sector with zeros)', 'zero'),
+               ('Full + check (test pattern written and read back: finds bad / fake cards; 2x as long)', 'check')]
+    fmt_var = tk.StringVar(value=FORMATS[0][0])
+    ttk.Combobox(opt2, textvariable=fmt_var, width=50, state='readonly',
+                 values=[x for x, _ in FORMATS]).pack(side='left')
+    sfw_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(opt2, text='Small firmware partition (2 MB)', variable=sfw_var).pack(side='left', padx=(12, 0))
 
     to_lbl = ttk.Label(frm, text='To:')
     to_var = tk.StringVar()
@@ -2395,6 +2604,8 @@ def gui():
             return
         cl = cluster_arg(cl_var.get())
         label = label_var.get() or 'IPOD'
+        OPTIONS['full'] = dict(FORMATS)[fmt_var.get()]             # 1.13
+        OPTIONS['small_fw'] = bool(sfw_var.get())
         n, it = st['items'][i]
         if mode.get() == 'move':
             j = to_box.current()
@@ -2546,6 +2757,10 @@ def gui():
 # --------------------------------------------------------------------------
 
 def main():
+    if sys.stdout is None:                           # 1.13: a windowed .exe has no console: print() must not fail
+        sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w')
     try:
         return main2()
     except SystemExit:
@@ -2569,11 +2784,15 @@ def main2():
     a = sys.argv[1:]
     def opt(name, default=None):
         return a[a.index(name) + 1] if name in a else default
+    OPTIONS['full'] = 'check' if '--full-check' in a else 'zero' if '--full' in a else ''   # 1.13
+    OPTIONS['small_fw'] = '--itunes-fw' not in a
     if not a:
         if os.name == 'nt' and not is_admin():
             import ctypes as c
             params = ' '.join('"%s"' % x for x in [os.path.abspath(sys.argv[0])] + a)
             exe = sys.executable
+            if getattr(sys, 'frozen', False):            # 1.13: the .exe restarts itself (no script argument)
+                params = ' '.join('"%s"' % x for x in a)
             if exe.lower().endswith('python.exe') and os.path.exists(exe[:-10] + 'pythonw.exe'):
                 exe = exe[:-10] + 'pythonw.exe'          # no extra console window
             r = c.windll.shell32.ShellExecuteW(None, 'runas', exe, params, None, 1)

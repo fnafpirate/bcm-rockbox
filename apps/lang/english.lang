@@ -19169,3 +19169,71 @@
     ipodvideo: "USB Read-Ahead"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_BATTERY_LEARN
+  desc: bcm overlay v138: Settings > General > Battery: run that learns the battery curve
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Learn Battery"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Learn Battery"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Learn Battery"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_START_VOLUME
+  desc: bcm overlay v138: Settings > Sound: volume set at the start of playback
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Start Volume"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Start Volume"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Start Volume"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_START_VOLUME_PLAY
+  desc: bcm overlay v138: Start Volume: 50 % each time playback starts
+  user: core
+  <source>
+    *: none
+    ipodvideo: "50 % When Playback Starts"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "50 % When Playback Starts"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "50 % When Playback Starts"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_START_VOLUME_TRACK
+  desc: bcm overlay v138: Start Volume: 50 % at every track
+  user: core
+  <source>
+    *: none
+    ipodvideo: "50 % Every Track"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "50 % Every Track"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "50 % Every Track"
+  </voice>
+</phrase>

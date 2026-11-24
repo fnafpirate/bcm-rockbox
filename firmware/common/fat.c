@@ -4691,6 +4691,21 @@ static long transfer(struct bpb *fat_bpb, sector_t start, long count,
     return 0;
 }
 
+#ifndef BOOTLOADER
+/* bcm overlay v139: the most sectors one READ command may carry (writes keep FAT_MAX_TRANSFER_SIZE).  256 unless
+   /.rockbox/bcm_test.cfg says "fat_xfer=N" -- set by Debug > Drive Transfer Test after it read the same data back
+   correctly with N-sector commands */
+static unsigned long fat_max_read = FAT_MAX_TRANSFER_SIZE;
+void fat_set_max_read(unsigned long sectors)
+{
+    fat_max_read = sectors >= 8 && sectors <= 16384 ? sectors : FAT_MAX_TRANSFER_SIZE;
+}
+unsigned long fat_get_max_read(void) { return fat_max_read; }
+#define FAT_XFER_MAX (write ? (unsigned long)FAT_MAX_TRANSFER_SIZE : fat_max_read)
+#else
+#define FAT_XFER_MAX ((unsigned long)FAT_MAX_TRANSFER_SIZE)
+#endif
+
 long fat_readwrite(struct fat_filestr *filestr, unsigned long sectorcount,
                    void *buf, bool write)
 {
@@ -4794,7 +4809,7 @@ long fat_readwrite(struct fat_filestr *filestr, unsigned long sectorcount,
         }
 
         /* find sequential sectors and transfer them all at once */
-        if (sector != last || count >= FAT_MAX_TRANSFER_SIZE)
+        if (sector != last || count >= FAT_XFER_MAX)
         {
             /* not sequential/over limit */
             rc = transfer(fat_bpb, last - count + 1, count, buf, write);
@@ -4812,8 +4827,8 @@ long fat_readwrite(struct fat_filestr *filestr, unsigned long sectorcount,
             unsigned long n = sectorcount - transferred - count;
             if (n > fat_bpb->bpb_secperclus - sectornum)
                 n = fat_bpb->bpb_secperclus - sectornum;
-            if (n > (unsigned long)(FAT_MAX_TRANSFER_SIZE - count))
-                n = FAT_MAX_TRANSFER_SIZE - count;
+            if (n > FAT_XFER_MAX - count)
+                n = FAT_XFER_MAX - count;
             count += n;
             sector += n;
             last = sector;

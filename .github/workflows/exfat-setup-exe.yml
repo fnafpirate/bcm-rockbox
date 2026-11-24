@@ -1,0 +1,39 @@
+# bcm overlay v138: builds "iPod exFAT Setup.exe" (no Python needed on the PC) on GitHub's Windows runner.
+# Runs when tools/bcm/ipod_exfat_setup.py changes on branch bcm-host, or from Actions -> "iPod exFAT Setup exe" ->
+# Run workflow.  Output: artifact "ipod-exfat-setup-exe" (the .exe).  Put the .exe in the same folder as
+# rockbox.zip and bootloader-ipodvideo.ipod (the exFAT Setup package folder) and double-click it; Windows asks for
+# administrator rights (needed to write to disks).  Every setting of the window and every command-line option of
+# the .py works the same in the .exe.
+name: iPod exFAT Setup exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ bcm-host ]
+    paths:
+      - 'tools/bcm/ipod_exfat_setup.py'
+      - '.github/workflows/exfat-setup-exe.yml'
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller==6.11.1
+
+      - name: Build the .exe
+        run: >
+          pyinstaller --onefile --windowed --uac-admin --clean
+          --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipod-exfat-setup-exe
+          path: dist/iPod exFAT Setup.exe

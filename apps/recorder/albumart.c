@@ -76,6 +76,89 @@ static const char* strip_filename(char* buf, int buf_size, const char* fullpath)
     return (sep + 1);
 }
 
+#if !defined(PLUGIN) && !defined(SIMULATOR) && defined(IPOD_VIDEO)
+/* bcm overlay v139: a track without cover data costs up to 18 file_exists() calls per album art search (sized and
+   generic names, 3 extensions, this folder and its parent) -- 12 of them in the track's own folder.  Each one reads
+   the whole folder when the directory cache is off or full (a big library): with 2000 songs in one folder that was
+   ~2 MB of directory entries, read twice per track change (this track and the next one), on the audio thread.  Now a
+   folder is read once and its image file names (.jpg .jpeg .bmp) are kept for 2 minutes; every look-up in it is a
+   string compare.  A folder with more images than fit falls back to file_exists(). */
+#include "dir.h"
+#include "file.h"
+#define AA_DIRS 3
+#define AA_POOL 2048
+static struct { char dir[MAX_PATH]; long t; bool overflow; int used; char pool[AA_POOL]; } aa_c[AA_DIRS];
+static int aa_next;
+static unsigned aa_lookups, aa_scans;
+static struct mutex aa_mtx;
+static bool aa_mtx_ok;
+static bool aa_fe(const char *p) { return file_exists(p); }   /* the real one */
+static bool aa_is_image(const char *name)
+{
+    const char *e = strrchr(name, '.');
+    return e && (!strcasecmp(e, ".jpg") || !strcasecmp(e, ".jpeg") || !strcasecmp(e, ".bmp"));
+}
+static int aa_dir(const char *dir)
+{
+    int i;
+    DIR *d;
+    struct dirent *de;
+    for (i = 0; i < AA_DIRS; i++)
+        if (aa_c[i].dir[0] && !strcmp(aa_c[i].dir, dir) && current_tick - aa_c[i].t < 120 * HZ)
+            return i;
+    i = aa_next; aa_next = (aa_next + 1) % AA_DIRS;
+    aa_c[i].dir[0] = 0; aa_c[i].used = 0; aa_c[i].overflow = false;
+    aa_scans++;
+    d = opendir(dir[0] ? dir : "/");
+    if (!d)
+        return -1;
+    while ((de = readdir(d)))
+    {
+        size_t n = strlen((const char *)de->d_name) + 1;
+        if (!aa_is_image((const char *)de->d_name))
+            continue;
+        if (aa_c[i].used + (int)n > AA_POOL) { aa_c[i].overflow = true; break; }
+        memcpy(aa_c[i].pool + aa_c[i].used, de->d_name, n);
+        aa_c[i].used += n;
+    }
+    closedir(d);
+    strmemccpy(aa_c[i].dir, dir, sizeof(aa_c[i].dir));
+    aa_c[i].t = current_tick;
+    return i;
+}
+static bool aa_exists(const char *path)
+{
+    char dir[MAX_PATH];
+    const char *name = strrchr(path, '/');
+    bool found = false;
+    int i, k;
+    aa_lookups++;
+    if (!name || (size_t)(name - path) >= sizeof(dir))
+        return aa_fe(path);
+    if (!aa_mtx_ok)
+    {
+        int old = disable_irq_save();
+        if (!aa_mtx_ok) { mutex_init(&aa_mtx); aa_mtx_ok = true; }
+        restore_irq(old);
+    }
+    memcpy(dir, path, name - path); dir[name - path] = 0;   /* without the last '/' ("" = the root) */
+    name++;
+    mutex_lock(&aa_mtx);
+    i = aa_dir(dir);
+    if (i < 0 || aa_c[i].overflow)
+    {
+        mutex_unlock(&aa_mtx);
+        return aa_fe(path);
+    }
+    for (k = 0; k < aa_c[i].used; k += strlen(aa_c[i].pool + k) + 1)
+        if (!strcasecmp(aa_c[i].pool + k, name)) { found = true; break; }
+    mutex_unlock(&aa_mtx);
+    return found;
+}
+#undef file_exists
+#define file_exists(p) aa_exists(p)
+#endif
+
 #ifdef USE_JPEG_COVER
 static const char * const extensions[] = { "jpeg", "jpg", "bmp" };
 static const unsigned char extension_lens[] = { 4, 3, 3 };
@@ -267,6 +350,30 @@ bool find_albumart(const struct mp3entry *id3, char *buf, int buflen,
     snprintf(size_string, sizeof(size_string), ".%dx%d",
               dim->width, dim->height);
 
+#if !defined(SIMULATOR) && defined(IPOD_VIDEO)
+    {   /* bcm overlay v139: Debug Log on -> /.rockbox/play_timing.txt gets one line per search */
+        unsigned long t0 = USEC_TIMER;
+        unsigned l0 = aa_lookups, s0 = aa_scans;
+        bool r = search_albumart_files(id3, size_string, buf, buflen);
+        if (!r)
+        {
+            *size_string = 0;
+            r = search_albumart_files(id3, size_string, buf, buflen);
+        }
+        if (global_settings.bcm_debug_log)
+        {
+            int fd = open("/.rockbox/play_timing.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+            if (fd >= 0)
+            {
+                fdprintf(fd, "%ld.%02ld album art search %lu ms, %u look-ups, %u folder reads, %s  %s\n",
+                         current_tick / HZ, current_tick % HZ, (unsigned long)(USEC_TIMER - t0) / 1000,
+                         aa_lookups - l0, aa_scans - s0, r ? "found" : "none", id3->path);
+                close(fd);
+            }
+        }
+        return r;
+    }
+#else
     /* First we look for a bitmap of the right size */
     if (search_albumart_files(id3, size_string, buf, buflen))
         return true;
@@ -274,6 +381,7 @@ bool find_albumart(const struct mp3entry *id3, char *buf, int buflen,
     /* Then we look for generic bitmaps */
     *size_string = 0;
     return search_albumart_files(id3, size_string, buf, buflen);
+#endif
 }
 
 #endif /* PLUGIN */

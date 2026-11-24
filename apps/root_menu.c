@@ -949,8 +949,13 @@ void root_menu(void)
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
     {   /* bcm overlay v119: a video that slept until the iPod powered off plays on from where it was, and the file
            browser then shows it (apps/debug_menu.c) */
+        extern void bcm_battery_learn_boot(void);   /* v138: a Learn Battery run the low battery ended */
         extern const char *bcm_boot_resume(void);
-        const char *v = bcm_boot_resume();
+        const char *v;
+        bcm_battery_learn_boot();
+        {   extern void bcm_start_volume_init(void); bcm_start_volume_init(); }   /* v138: Start Volume */
+        {   extern void bcm_fat_xfer_init(void); bcm_fat_xfer_init(); }         /* v139: Drive Transfer Test result */
+        v = bcm_boot_resume();
         if (v)
         {
             set_current_file(v);

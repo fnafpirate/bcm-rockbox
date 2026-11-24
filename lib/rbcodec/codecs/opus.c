@@ -57,25 +57,71 @@ static int get_more_data(ogg_sync_state *oy)
     return bytes;
 }
 
-/* seek to ogg page after given file position */
+/* bcm overlay v138: the next "OggS" at or after filepos, read 1 KB at a time (the stock loop read one byte per
+   read_filebuf() call: a whole Ogg page byte by byte after every resume) */
 static int seek_ogg_page(uint64_t filepos)
 {
-    const char synccode[] = "OggS\0"; /* Note: there are two nulls here */
-    char buf[sizeof(synccode)];
+    static const char synccode[5] = { 'O', 'g', 'g', 'S', 0 };
+    static char buf[1024 + 4];
+    size_t have = 0, n, i;
+    uint64_t base = filepos;          /* file position of buf[0] */
     ci->seek_buffer(filepos);
-    while (ci->read_filebuf(buf, 1) == 1) {
-        if (buf[0] == synccode[0]) {
-            if (ci->read_filebuf(&buf[1], sizeof(buf) - 1) != sizeof(buf) - 1)
-                break;
-            if (memcmp(buf, synccode, sizeof(buf)) == 0) {
-                ci->seek_buffer(ci->curpos - sizeof(buf));
+    for (;;)
+    {
+        n = ci->read_filebuf(buf + have, 1024);
+        if (n == 0)
+            return 0;
+        have += n;
+        for (i = 0; i + sizeof(synccode) <= have; i++)
+            if (buf[i] == 'O' && !memcmp(buf + i, synccode, sizeof(synccode)))
+            {
+                ci->seek_buffer(base + i);
                 LOGF("next page %jd", (intmax_t) ci->curpos);
                 return 1;
-            } else
-                ci->seek_buffer(ci->curpos - (sizeof(buf) - 1));
-        }
+            }
+        /* keep the last 4 bytes: a sync code may straddle two reads */
+        i = have > 4 ? have - 4 : 0;
+        memmove(buf, buf + i, have - i);
+        base += i;
+        have -= i;
     }
-    return 0;
+}
+
+/* bcm overlay v138: past the header pages to the first audio page, one 27-byte page header (+ its segment table) at
+   a time.  Header pages (identification, comments) carry granule position 0; the first page with a positive one holds
+   audio (RFC 7845: audio starts on a fresh page).  The stock code searched for "OpusTags" and then for the next "OggS" one byte per read_filebuf() call --
+   through the whole comment packet, i.e. through an embedded cover picture (base64, often 100 KB - 1 MB): seconds
+   of the codec thread at every track start (the music stutters, the player stops answering).  0 = not an Ogg
+   stream the simple way (the stock search is used then). */
+static int skip_header_pages(void)
+{
+    unsigned char h[27], lace[255];
+    uint64_t pos = 0;
+    int pages = 0;
+    for (;;)
+    {
+        unsigned int k, len = 0;
+        int64_t granule;
+        ci->seek_buffer(pos);
+        if (ci->read_filebuf(h, 27) != 27 || memcmp(h, "OggS", 4) || h[4] != 0)
+            return 0;
+        if (h[26] && ci->read_filebuf(lace, h[26]) != h[26])
+            return 0;
+        for (k = 0; k < h[26]; k++)
+            len += lace[k];
+        granule = 0;
+        for (k = 0; k < 8; k++)
+            granule |= (int64_t)h[6 + k] << (8 * k);
+        if (granule > 0 && !(h[5] & 1) && pages >= 2)   /* after the identification page and >= 1 comment page */
+        {
+            ci->seek_buffer(pos);
+            LOGF("first audio page %jd", (intmax_t) pos);
+            return 1;
+        }
+        pos += 27 + h[26] + len;
+        if (++pages > 4096)
+            return 0;
+    }
 }
 
 /* seek to comment header */
@@ -486,7 +532,9 @@ enum codec_status codec_run(void)
                     /* seek buffer directly to the first audio packet to avoid
                        allocating space for huge comment packets
                        (embedded Album Art) */
-                        if (seek_opus_tags())
+                        if (skip_header_pages())
+                            ;   /* v138: page headers only */
+                        else if (seek_opus_tags())
                             seek_ogg_page(ci->curpos);
                         else {
                             LOGF("Could not find comment header");
