@@ -3066,32 +3066,35 @@ static void bcm_trace_cb(const char *tag, uint32_t a, uint32_t b, const char *s)
     BLOG("  trace: %s %08x %08x %.60s", tag, (unsigned)a, (unsigned)b, s ? s : "");
 }
 static void vcp_scan(void)
-{
-    static const struct { uint32_t lo, hi; } rg[] = { { 0xfe000000u, 0xfe400000u }, { 0x00000000u, 0x00140000u } };
-    uint32_t w[4], found = 0;
+{   /* v134: only the SRAM (0..0x140000: vmcs.bin at 0, the libraries after it -- H264dec.vll's code was at 0x91500 in
+       the v32 dump), read in 4 KB blocks, the part around the decoder first.  v133 read 16 bytes at a time and also
+       the 4 MB SDRAM: 2.4 s at the end of every video with a changed library. */
+    static const struct { uint32_t lo, hi; } rg[] = {
+        { 0x00080000u, 0x000c0000u }, { 0x00000000u, 0x00080000u }, { 0x000c0000u, 0x00140000u } };
+    static uint32_t blk[1024];
+    uint32_t found = 0;
     long t0 = current_tick;
     unsigned r;
-    BLOG("probe: changed H264dec.vll -- scanning VideoCore memory for a probe record");
-    for (r = 0; r < sizeof rg / sizeof rg[0]; r++)
+    BLOG("probe: changed H264dec.vll -- scanning the VideoCore SRAM for a probe record");
+    for (r = 0; r < sizeof rg / sizeof rg[0] && !found; r++)
     {
-        uint32_t a;
-        for (a = rg[r].lo; a < rg[r].hi; a += 16)
+        uint32_t a, i;
+        for (a = rg[r].lo; a < rg[r].hi && found < 4; a += sizeof blk)
         {
-            bcm_io_lock(); bcm_io_read(a, w, 4); bcm_io_unlock();
-            if (w[0] != VCP_MAGIC0) continue;
-            bcm_io_lock(); bcm_io_read(a + 4, w, 8); bcm_io_unlock();
-            if (w[0] != VCP_MAGIC1 || w[1] == 0 || w[1] > 64) continue;
+            bcm_io_lock(); bcm_io_read(a, blk, sizeof blk); bcm_io_unlock();
+            if (bcm_io_dead()) { BLOG("probe: bus died at %08x", (unsigned)a); return; }
+            for (i = 0; i < 1024 && found < 4; i += 4)     /* records are 16-byte aligned: a header never straddles */
             {
-                uint32_t n = w[1], i, v[64];
-                bcm_io_lock(); bcm_io_read(a + 12, v, n * 4); bcm_io_unlock();
-                BLOG("probe: record at %08x, %u words:", (unsigned)a, (unsigned)n);
-                for (i = 0; i < n; i += 4)
-                    BLOG("  [%2u] %08x %08x %08x %08x", (unsigned)i, (unsigned)v[i], i + 1 < n ? (unsigned)v[i + 1] : 0u,
-                         i + 2 < n ? (unsigned)v[i + 2] : 0u, i + 3 < n ? (unsigned)v[i + 3] : 0u);
+                uint32_t n = blk[i + 2], k, v[64];
+                if (blk[i] != VCP_MAGIC0 || blk[i + 1] != VCP_MAGIC1 || n == 0 || n > 64) continue;
+                bcm_io_lock(); bcm_io_read(a + i * 4 + 12, v, n * 4); bcm_io_unlock();
+                BLOG("probe: record at %08x, %u words:", (unsigned)(a + i * 4), (unsigned)n);
+                for (k = 0; k < n; k += 4)
+                    BLOG("  [%2u] %08x %08x %08x %08x", (unsigned)k, (unsigned)v[k], k + 1 < n ? (unsigned)v[k + 1] : 0u,
+                         k + 2 < n ? (unsigned)v[k + 2] : 0u, k + 3 < n ? (unsigned)v[k + 3] : 0u);
+                found++;
             }
-            if (++found >= 4) break;
         }
-        if (found >= 4) break;
     }
     BLOG("probe: %u record(s) found, %ld ms", (unsigned)found, (current_tick - t0) * 1000 / HZ);
 }
@@ -5615,7 +5618,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v133 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v134 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -9973,9 +9976,12 @@ static bool kp_enter(void)
     {   /* v100: the stock close (rt 0x1fa2f0): sound off, then the application ended -- the next video loads it fresh */
         static char er[128];
         char c[40];
-        int r1 = bcm_gencmd_watched("audio_enable 0", er, sizeof er, 2);
+        int r1;
+        /* v134: "audio_enable 0" was never answered after a video (every log from v101 to v133, stock or changed
+           H264dec.vll, paused or not): 2 s lost, then the BCM was powered off anyway.  Now end_application alone,
+           1 s at most -- if that is answered the VideoCore can finally stay on standby after a video. */
         snprintf(c, sizeof c, "end_application %d", bcm_mp_task);
-        r1 = r1 < 0 ? r1 : bcm_gencmd_watched(c, er, sizeof er, 3);
+        r1 = bcm_gencmd_watched(c, er, sizeof er, 1);
         bcm_log_text(c, r1, er);
         bcm_mp_task = -1;
         if (r1 < 0) { BLOG("keep ready: not kept -- end_application was not answered"); return false; }
@@ -10066,7 +10072,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v133, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v134, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -10726,7 +10732,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v133 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v134 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -10751,7 +10757,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v133, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v134, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
