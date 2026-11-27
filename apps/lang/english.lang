@@ -19237,3 +19237,54 @@
     ipodvideo: "50 % Every Track"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_DOCK_LINE_OUT
+  desc: bcm overlay v142: Settings > Sound: dock line-out mode
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Dock Line Out"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Dock Line Out"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Dock Line Out"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_LINE_OUT_BLUETOOTH
+  desc: bcm overlay v142: Dock Line Out: full level at every volume (Bluetooth transmitters)
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Bluetooth (Full Level)"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Bluetooth (Full Level)"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Bluetooth (Full Level)"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_LINE_OUT_GAIN
+  desc: bcm overlay v142: Settings > Sound: dock line-out amplifier gain
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Line Out Gain"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Line Out Gain"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Line Out Gain"
+  </voice>
+</phrase>

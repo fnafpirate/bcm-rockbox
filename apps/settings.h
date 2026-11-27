@@ -772,6 +772,8 @@ struct user_settings
     int bcm_video_buffer;  /* v74: 0 low-power, 1 balanced, 2 performance; v96: 3 adaptive */
     int bcm_video_resume;  /* v96: 0 off, 1 ask, 2 always */
     int start_volume;      /* bcm v138: 0 off, 1 50 % when playback starts, 2 50 % at every track */
+    int dock_line_out;     /* bcm v142: 0 normal, 1 Bluetooth (the line-out at full level at every volume) */
+    int line_out_gain;     /* bcm v142: the dock line-out amp, 0..6 dB */
     int bcm_keep_vc;       /* v99: Keep VideoCore Ready: 0 off, 1 in the video folder */
     bool bcm_dock_notify;  /* v74: notices for docks / power sources */
     bool bcm_dock_profile; /* v76: separate sound settings while docked (line-out) */

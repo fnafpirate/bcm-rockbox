@@ -149,6 +149,7 @@
 #include "bcm_subs.h"                     /* v73: soft subtitles */
 #include "bcm_dock.h"                     /* v74: docks */
 #include "bcm_cab2cav.h"                  /* v123: CABAC -> CAVLC */
+#include "bcm_gif.h"                      /* v142: the TV-out animation */
 #endif
 
 #if defined(HIBY_LINUX) && !defined(SIMULATOR)
@@ -3225,6 +3226,7 @@ static int cfg_recover = 2;                       /* v96: VideoCore recovery att
 static int vc_seeks_boot;
 static int cfg_seek_budget = 110;                 /* v110: 90 -> 110 (deaths at 125-126) */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
+static int cfg_tv_menu = 0;                      /* v142: the file browser on the TV while on standby (Video Out On) */
 static int cfg_sleep_after_s = 120;               /* v119: a paused video sleeps after this long untouched (0 = never) */
 static int cfg_sleep_off_min = 30;                /* v119: asleep this long = power off (0 = no sleep: power off as before) */
 static int cfg_sleep_32k = 1;                     /* v121: Apple's light sleep (SDRAM self-refresh, 32 kHz, CPU stopped) */
@@ -5208,6 +5210,7 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "big_frames")) cfg_big_frames = v;   /* v96 */
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
         else if (!strcmp(p, "keep_min")) cfg_keep_min = v < 1 ? 1 : v;
+        else if (!strcmp(p, "tv_menu")) cfg_tv_menu = v;
         else if (!strcmp(p, "sleep_after_s")) cfg_sleep_after_s = v < 0 ? 0 : v < 10 ? 10 : v;   /* v119 */
         else if (!strcmp(p, "sleep_off_min")) cfg_sleep_off_min = v < 0 ? 0 : v;
         else if (!strcmp(p, "sleep_32k")) cfg_sleep_32k = v;
@@ -5637,7 +5640,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v140 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v142 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -5891,11 +5894,24 @@ static void cv_blit(struct cv *c, int x, int y, int key, int clipw)
 /* look-alike shapes when the stock bitmaps are missing: white with a dark shadow, like the stock art */
 static void cv_shadowed(struct cv *c, int x, int y, int w, int h, uint32_t col)
 { cv_fill(c, x + 1, y + 1, w, h, 0x90000000); cv_fill(c, x, y, w, h, cv_tinted(col)); }
-static const uint8_t lk_font[13][7] = {           /* 5x7 digits, '-', ':', '%' for the look-alike / the % sign */
+static const uint8_t lk_font[22][7] = {           /* 5x7 digits, '-', ':', '%' for the look-alike / the % sign */
     {14,17,19,21,25,17,14},{4,12,4,4,4,4,14},{14,17,1,2,4,8,31},{31,2,4,2,1,17,14},{2,6,10,18,31,2,2},{31,16,30,1,1,17,14},
     {6,8,16,30,17,17,14},{31,1,2,4,8,8,8},{14,17,17,14,17,17,14},{14,17,17,15,1,2,12},{0,0,0,31,0,0,0},{0,12,12,0,12,12,0},
-    {24,25,2,4,8,19,3} };
-static int lk_glyph(char ch) { return ch >= '0' && ch <= '9' ? ch - '0' : ch == '-' ? 10 : ch == ':' ? 11 : ch == '%' ? 12 : -1; }
+    {24,25,2,4,8,19,3},
+    /* v142: the letters of the clock line (double SELECT): A D E M N O P S W */
+    {14,17,17,31,17,17,17},{30,17,17,17,17,17,30},{31,16,16,30,16,16,31},{17,27,21,21,17,17,17},{17,25,21,19,17,17,17},
+    {14,17,17,17,17,17,14},{30,17,17,30,16,16,16},{15,16,16,14,1,1,30},{17,17,17,21,21,21,10} };
+static int lk_glyph(char ch)
+{
+    static const char letters[] = "ADEMNOPSW";
+    const char *q;
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch == '-') return 10;
+    if (ch == ':') return 11;
+    if (ch == '%') return 12;
+    q = ch ? strchr(letters, ch) : NULL;
+    return q ? 13 + (int)(q - letters) : -1;
+}
 static int cv_glyph_w(char ch)
 {
     if (vui_state == 1)
@@ -5904,7 +5920,7 @@ static int cv_glyph_w(char ch)
         if (ch == '-') return vui[VUI_MINUS].w;
         if (ch == ':') return vui[VUI_COLON].w;
     }
-    return ch == ':' ? 6 : 12;
+    return ch == ':' || ch == ' ' ? 6 : 12;
 }
 static int cv_text_w(const char *s) { int w = 0; while (*s) w += cv_glyph_w(*s++); return w; }
 static void cv_text(struct cv *c, int x, int y, const char *s)
@@ -5943,6 +5959,7 @@ static int osd_ok = -1, osd_type = 15;
 static bool osd_visible, pl_paused;
 static long osd_hide_at, osd_next;
 static uint32_t pl_dur_ms, pl_el_ms, pl_target_ms;
+static long clk_until;                 /* v142: double SELECT: the clock line (now / when the video ends) until this tick */
 static char pl_title[40];
 static int pl_buffering = -1;
 static uint16_t osd_row[320 * 2];
@@ -6044,6 +6061,12 @@ static int osd_alloc(int type, int w, int h, uint32_t *img, uint32_t *addr)
     *img = o[0]; *addr = o[1]; return 0;
 }
 
+/* v142: seconds of the day -> "1:25AM" */
+static void clk_fmt(char *b, size_t n, long sod)
+{
+    int h = (int)(sod / 3600), m = (int)(sod / 60 % 60), h12 = h % 12 ? h % 12 : 12;
+    snprintf(b, n, "%d:%02d%s", h12, m, h < 12 ? "AM" : "PM");
+}
 /* ---- drawing (into the canvases) */
 static void osd_draw(void)
 {
@@ -6144,6 +6167,19 @@ static void osd_draw(void)
         cv_fill(&c2, 20, 6, 2, 20, 0xFFE8E8E8); cv_fill(&c2, 298, 6, 2, 20, 0xFFE8E8E8);
         if (fill > 4) cv_fill(&c2, 22, 8, fill - 4, 16, 0xE0F4F4F4);
     }
+    if (clk_until && TIME_BEFORE(current_tick, clk_until))
+    {   /* v142: double SELECT -- the iPod's clock now (left) and when the video ends at this point (right): what is left
+           of it from the position shown, added to the clock */
+        struct tm *tm = get_time();
+        long now_s = (long)tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec, end_s = (now_s + (long)(rem / 1000)) % 86400;
+        char e[24];
+        clk_fmt(a, sizeof a, now_s);
+        snprintf(e, sizeof e, "ENDS ");
+        clk_fmt(e + 5, sizeof e - 5, end_s);
+        cv_text(&c2, 20, 28, a);
+        cv_text(&c2, 300 - cv_text_w(e), 28, e);
+        return;
+    }
     fmt_time(a, sizeof a, shown);
     d[0] = '-'; fmt_time(d + 1, sizeof d - 1, rem);
     cv_text(&c2, 20, 28, a);
@@ -6192,9 +6228,10 @@ static void osd_write_span(struct osd_strip *s, int bi, int y, int x0, int x1)
     osd_bytes += (unsigned)(x1 - x0 + 1) * (osd_type == 15 ? 4 : 2);
 }
 /* full = whole image (it is not on screen yet); bi = which of the strip's images (1 only for the bottom panel) */
-static void osd_update(struct osd_strip *s, int bi, bool full)
+static bool osd_update(struct osd_strip *s, int bi, bool full)
 {
     int y;
+    bool changed = false;
     if (!s->valid[bi]) full = true;                   /* v103: its record does not match the image yet */
     s->valid[bi] = true;
     for (y = 0; y < s->h; y++)
@@ -6210,15 +6247,17 @@ static void osd_update(struct osd_strip *s, int bi, bool full)
         }
         osd_write_span(s, bi, y, x0, x1);
         memcpy(b + x0, a + x0, (size_t)(x1 - x0 + 1) * 4);
+        changed = true;
         if (full && (y & 15) == 15) bcm_host_service();
     }
+    return changed;
 }
 /* mask = strips to show with fresh content (1 icon, 2 battery, 4 bottom, 8 TV symbol) */
 static void osd_present_mask(int mask)
 {
     uint32_t o[4], pl[8], w4[4];
     int k, adds = 0;
-    bool open = false;
+    bool open = false, ch[OSD_NS] = { false, false, false, false };
     if (osd_ok <= 0) return;
     osd_bytes = 0;
     osd_draw();
@@ -6229,9 +6268,9 @@ static void osd_present_mask(int mask)
         if (!(mask & (1 << k))) continue;
         if (s->front < 0) s->front = 0;
         if (s->win[0] && !s->tvwin && s->img[1] && !bcm_tv)
-            osd_update(s, s->front ^ 1, false);        /* v103: into the hidden image, swapped in below */
+            ch[k] = osd_update(s, s->front ^ 1, false);   /* v103: into the hidden image, swapped in below */
         else
-            osd_update(s, s->front, !s->win[0] && !s->tvwin);
+            ch[k] = osd_update(s, s->front, !s->win[0] && !s->tvwin);
     }
     for (k = 0; k < OSD_NS; k++)
     {
@@ -6256,6 +6295,22 @@ static void osd_present_mask(int mask)
             }
             else s->valid[nb] = false;                 /* not shown: write it whole next time */
             continue;
+        }
+        if (bcm_tv && (mask & (1 << k)) && s->win[0] && ch[k])
+        {   /* v142: TV out: the iPod's screen (display 0) has no video on it, and the VideoCore composes it again only
+               when its windows change -- pixels written into an image already up stayed invisible (play / pause, volume
+               and the FF / REW time froze on the iPod while the TV was fine).  The changed strip's window is put up again
+               on the same image and the old one taken down in the same update, as the standby screen copies do. */
+            if (!open) { bcm_gfx_rpc(1, NULL, 0, o, NULL, 300); open = true; }
+            memset(pl, 0, sizeof pl);
+            pl[1] = (uint32_t)cfg_osd_layer; pl[3] = s->img[s->front < 0 ? 0 : s->front];
+            ((uint16_t *)pl)[8] = (uint16_t)s->x; ((uint16_t *)pl)[9] = (uint16_t)s->y; ((uint16_t *)pl)[12] = (uint16_t)s->w; ((uint16_t *)pl)[13] = (uint16_t)s->h;
+            if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0)
+            {
+                uint32_t nw = o[0] ? o[0] : 0xffffffffu;
+                memset(w4, 0, sizeof w4); w4[0] = s->win[0] == 0xffffffffu ? 0 : s->win[0]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+                s->win[0] = nw;
+            }
         }
         if ((mask & (1 << k)) && !s->win[0])
         {
@@ -6287,7 +6342,15 @@ static void osd_present_mask(int mask)
     if (open) bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = true;
 }
-static void osd_present(void) { osd_vol_only = false; osd_present_mask(bcm_tv ? 15 : 7); }
+/* v142: TV out: the animated picture on the iPod's screen (/.rockbox/tv.gif) in place of the drawn TV (strip 3) */
+#define TA_MAXF 48
+static uint32_t ta_img[TA_MAXF], ta_win;
+static int ta_n, ta_cur, ta_w, ta_h, ta_x, ta_y;
+static bool ta_tried;
+static unsigned long ta_next_us;
+static unsigned ta_shown, ta_late;
+static void ta_load(void);
+static void osd_present(void) { osd_vol_only = false; osd_present_mask(bcm_tv ? (ta_n ? 7 : 15) : 7); }
 static int vol_direct_n, vol_full_n;
 static unsigned long vol_us_direct, vol_us_full;
 static void osd_hide(void)
@@ -6302,6 +6365,7 @@ static void osd_hide(void)
         if (s->win[0]) { memset(w4, 0, sizeof w4); w4[0] = s->win[0] == 0xffffffffu ? 0 : s->win[0]; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->win[0] = 0; }
         if (s->tvwin) { memset(w4, 0, sizeof w4); w4[0] = s->tvwin == 0xffffffffu ? 0 : s->tvwin; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); s->tvwin = 0; }
     }
+    if (ta_win) { memset(w4, 0, sizeof w4); w4[0] = ta_win == 0xffffffffu ? 0 : ta_win; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); ta_win = 0; }   /* v142 */
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
     osd_visible = false; osd_vol_only = false; osd_bottom_vol = false;
 }
@@ -6323,6 +6387,7 @@ static void osd_init(void)
     if (ok && osd_alloc(osd_type, osd_s[2].w, osd_s[2].h, &osd_s[2].img[1], &osd_s[2].addr[1]) != 0)
         osd_s[2].img[1] = osd_s[2].addr[1] = 0;        /* v103: no second image: written in place as before */
     osd_ok = ok;
+    if (ok && bcm_tv) ta_load();                       /* v142 */
     BLOG("  OSD: %d strips, VC image type %d (%s), layer %d -> %s%s", OSD_NS, osd_type, osd_type == 15 ? "ARGB, drawn over the video" : "RGB565",
          cfg_osd_layer, ok ? "ok" : "FAILED", osd_s[2].img[1] ? ", bottom panel double-buffered" : "");
 }
@@ -7261,6 +7326,14 @@ static void av_open(const char *path)
              global_status.volume, global_settings.volume_limit);
         return;
     }
+#ifndef SIMULATOR
+    if (piezo_speaker_home_sink() == PCM_SINK_PIEZO && !bcm_tv)
+    {   /* v142: video sound never goes to the click speaker (on request) */
+        BLOG("  audio: the sound would go to the click speaker -- left silent (plug in headphones or a dock)");
+        global_status.volume = av_vol_saved; setvol();
+        return;
+    }
+#endif
     c2c_iram_release();                                /* v125: Rockbox's codec is about to use that IRAM */
     snprintf(dir, sizeof dir, "%s", path);
     sl = strrchr(dir, '/'); if (sl) *sl = 0;
@@ -7552,10 +7625,13 @@ static void scrub_end(void)
     if (sc_method == SM_SCAN)
     {   /* v115: scan off, ONE seek to where the picture got to, play again if it was playing (stock rt 0x1f8f44) */
         tf_dir = 0;
-        if (pl_disp(&dt, NULL) == 0 && dt && dt != 0xffffffffu) sc_pos = dt;
+        /* v142: land where the time on the screen was (sc_pos = the scan's position, what the overlay showed).  v115-v141
+           took the VideoCore's displayed picture instead -- its queue of 15-30 key frames lags the scan, so a hold to
+           3:17 landed at 1:33 (v139 log) and the time jumped back. */
+        if (pl_disp(&dt, NULL) != 0 || dt == 0xffffffffu) dt = 0;
         m4_key_at(sc_pos, &k);
-        BLOG("  scrub: scan released at %u ms after %d ticks (picture %s) -> one seek to the key frame at %u ms",
-             (unsigned)sc_pos, sc_ticks, scan_moved ? "moved" : "did not move", (unsigned)k);
+        BLOG("  scrub: scan released at %u ms after %d ticks (the picture showed %u ms) -> one seek to the key frame at %u ms",
+             (unsigned)sc_pos, sc_ticks, (unsigned)dt, (unsigned)k);
         if (seek_budget_out(0)) { pl_el_ms = k; pl_target_ms = k; vr_el_tick = current_tick; rc_plan(k); return; }
         snprintf(c, sizeof c, "mp_seek %u", (unsigned)k);
         pl_cmd(c, true);
@@ -7660,6 +7736,166 @@ static void pl_tap(int dir)
     mon_start(dir > 0 ? "tap >>|" : "tap |<<");
     osd_show_for(pl_paused ? 0 : 3000);
 }
+/* ---- v142: TV out: /.rockbox/tv.gif plays on the iPod's screen (30 frames a second, held while the video is paused)
+   where the drawn TV was.  Every frame is decoded once, scaled up (3x, 2x or 1x: the largest that fits 192 x 128 and the
+   VideoCore memory allowed) and written into its own VideoCore image (RGB565 on black, like the screen behind it);
+   playing it is then one window change per frame -- 4 graphics calls of well under a millisecond each, no pixels over
+   the bus.  No file, a file too big, or no memory: the drawn TV as before. */
+#define TA_PATH ROCKBOX_DIR "/tv.gif"
+#define TA_MAXW 192
+#define TA_MAXH 128
+#define TA_FRAME_US 33333u
+static uint32_t ta_addr[TA_MAXF];
+struct ta_ld { int fd, n, p, s, iw, nimg, done; uint16_t row[TA_MAXW]; uint8_t buf[1024]; };
+static int ta_rd(void *c, void *b, int n)
+{
+    struct ta_ld *L = c;
+    uint8_t *d = b;
+    int got = 0;
+    while (got < n)
+    {
+        int k;
+        if (L->p >= L->n)
+        {
+            L->n = read(L->fd, L->buf, sizeof L->buf); L->p = 0;
+            if (L->n <= 0) { L->n = 0; break; }
+        }
+        k = L->n - L->p < n - got ? L->n - L->p : n - got;
+        memcpy(d + got, L->buf + L->p, (size_t)k); L->p += k; got += k;
+    }
+    return got;
+}
+static bool ta_frame(void *c, const uint32_t *cv, int w, int h, int delay_cs, int i)
+{
+    struct ta_ld *L = c;
+    int y, x, k;
+    (void)delay_cs;
+    if (i >= L->nimg) return false;
+    for (y = 0; y < h; y++)
+    {
+        memset(L->row, 0, sizeof L->row);
+        for (x = 0; x < w; x++)
+        {
+            uint32_t p = cv[y * w + x], v = 0;
+            if (p >> 24) v = (((p >> 16) & 255) >> 3) << 11 | (((p >> 8) & 255) >> 2) << 5 | ((p & 255) >> 3);
+            for (k = 0; k < L->s; k++) L->row[x * L->s + k] = (uint16_t)v;
+        }
+        for (k = 0; k < L->s; k++)
+        {
+            bcm_io_lock();
+            bcm_io_write(ta_addr[i] + (uint32_t)((y * L->s + k) * L->iw) * 2, L->row, (size_t)L->iw * 2);
+            bcm_io_unlock();
+        }
+        bcm_host_service();
+    }
+    L->done = i + 1;
+    return true;
+}
+static void ta_free_imgs(int n)
+{
+    uint32_t o[4], a[4];
+    int i;
+    for (i = 0; i < n; i++)
+        if (ta_img[i]) { memset(a, 0, sizeof a); a[0] = ta_img[i]; bcm_gfx_rpc(9, a, 0x10, o, NULL, 300); ta_img[i] = 0; }
+}
+/* TV -> iPod screen: the window and the images go */
+static void ta_free(void)
+{
+    uint32_t o[4], w4[4];
+    if (ta_win)
+    {
+        bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+        memset(w4, 0, sizeof w4); w4[0] = ta_win == 0xffffffffu ? 0 : ta_win; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300);
+        bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+        ta_win = 0;
+    }
+    if (ta_n) BLOG("  TV animation: %u frames shown, %u times behind (caught up)", ta_shown, ta_late);
+    ta_free_imgs(TA_MAXF);
+    ta_n = 0; ta_tried = false; ta_shown = ta_late = 0;
+}
+static void ta_load(void)
+{
+    struct ta_ld *L;
+    struct gif_work *wk;
+    uint32_t *cv, *pv;
+    int h, n, W = 0, H = 0, s, i, got;
+    long t0 = current_tick;
+    unsigned budget = (st_n > 0 ? 300u : 640u) * 1024;   /* subtitles on the TV need ~330 KB of their own */
+    if (ta_tried) return;
+    ta_tried = true;
+    h = core_alloc_ex(sizeof *L + sizeof *wk + 2u * TA_MAXW * TA_MAXH * 4 + 16, NULL);
+    if (h <= 0) { BLOG("  TV animation: no memory to decode it -- the drawn TV"); return; }
+    core_pin(h);
+    L = core_get_data(h);
+    wk = (struct gif_work *)(((uintptr_t)(L + 1) + 3) & ~(uintptr_t)3);
+    cv = (uint32_t *)(wk + 1); pv = cv + TA_MAXW * TA_MAXH;
+    memset(L, 0, sizeof *L);
+    L->fd = open(TA_PATH, O_RDONLY);
+    if (L->fd < 0) { BLOG("  TV animation: no " TA_PATH " -- the drawn TV"); goto out; }
+    n = gif_decode(ta_rd, L, wk, cv, pv, TA_MAXW * TA_MAXH, true, NULL, NULL, &W, &H);
+    if (n <= 0 || W > TA_MAXW || H > TA_MAXH)
+    {
+        BLOG("  TV animation: " TA_PATH " not usable (%d frames, %dx%d; at most %dx%d) -- the drawn TV", n, W, H, TA_MAXW, TA_MAXH);
+        goto out;
+    }
+    if (n > TA_MAXF) { BLOG("  TV animation: %d frames, the first %d are used", n, TA_MAXF); n = TA_MAXF; }
+    for (s = 3; s >= 1; s--)
+    {
+        int iw = (W * s + 15) & ~15, ok = 1;
+        if (W * s > TA_MAXW || H * s > TA_MAXH || (unsigned)(n * iw * H * s * 2) > budget) continue;
+        for (i = 0; i < n && ok; i++) ok = osd_alloc(1, iw, H * s, &ta_img[i], &ta_addr[i]) == 0;
+        if (ok) { L->s = s; L->iw = iw; L->nimg = n; break; }
+        BLOG("  TV animation: the VideoCore refused image %d of %d at %dx -- smaller", i, n, s);
+        ta_free_imgs(n);
+    }
+    if (!L->s) { BLOG("  TV animation: no VideoCore memory for %d frames of %dx%d -- the drawn TV", n, W, H); goto out; }
+    lseek(L->fd, 0, SEEK_SET); L->n = L->p = 0;
+    got = gif_decode(ta_rd, L, wk, cv, pv, TA_MAXW * TA_MAXH, false, ta_frame, L, &W, &H);
+    if (L->done < 1) { BLOG("  TV animation: decoding failed (%d) -- the drawn TV", got); ta_free_imgs(TA_MAXF); goto out; }
+    if (L->done < n)
+    {   /* fewer frames decoded than counted: the images after them go back */
+        uint32_t o[4], a4[4];
+        for (i = L->done; i < n; i++)
+            if (ta_img[i]) { memset(a4, 0, sizeof a4); a4[0] = ta_img[i]; bcm_gfx_rpc(9, a4, 0x10, o, NULL, 300); ta_img[i] = 0; }
+        n = L->done;
+    }
+    ta_n = n; ta_cur = 0; ta_w = L->iw; ta_h = H * L->s;
+    ta_x = (LCD_WIDTH - ta_w) / 2; ta_y = 56 + (132 - ta_h) / 2; if (ta_y < 0) ta_y = 0;
+    BLOG("  TV animation: %d frames of %dx%d, shown %dx (%dx%d at %d,%d), 30 frames a second; %u KB of VideoCore memory, "
+         "ready in %ld ms", ta_n, W, H, L->s, ta_w, ta_h, ta_x, ta_y, (unsigned)(ta_n * ta_w * ta_h * 2 / 1024),
+         (current_tick - t0) * 1000 / HZ);
+out:
+    if (L->fd >= 0) close(L->fd);
+    core_unpin(h); core_free(h);
+}
+/* one frame on: the next image's window goes up, the last one's comes down (one update) */
+static void ta_tick(void)
+{
+    uint32_t o[4], pl[8], w4[4];
+    unsigned long now;
+    if (!bcm_tv || !ta_n || !osd_visible) return;
+    now = USEC_TIMER;
+    if (ta_win)
+    {
+        if (pl_paused || (long)(now - ta_next_us) < 0) return;
+        ta_cur = ta_cur + 1 < ta_n ? ta_cur + 1 : 0;
+        ta_next_us += TA_FRAME_US;
+        if ((long)(now - ta_next_us) > 100000) { ta_next_us = now + TA_FRAME_US; ta_late++; }
+    }
+    else ta_next_us = now + TA_FRAME_US;
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    memset(pl, 0, sizeof pl);
+    pl[1] = (uint32_t)cfg_osd_layer; pl[3] = ta_img[ta_cur];
+    ((uint16_t *)pl)[8] = (uint16_t)ta_x; ((uint16_t *)pl)[9] = (uint16_t)ta_y; ((uint16_t *)pl)[12] = (uint16_t)ta_w; ((uint16_t *)pl)[13] = (uint16_t)ta_h;
+    if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) == 0)
+    {
+        uint32_t nw = o[0] ? o[0] : 0xffffffffu;
+        if (ta_win) { memset(w4, 0, sizeof w4); w4[0] = ta_win == 0xffffffffu ? 0 : ta_win; bcm_gfx_rpc(4, w4, 0x10, o, NULL, 300); }
+        ta_win = nw; ta_shown++;
+    }
+    bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+}
+static bool ta_running(void) { return bcm_tv && ta_n && ta_win && !pl_paused; }
 static void bcm_osd_tick(void)
 {
     st_tick();                                         /* v73: subtitles */
@@ -7694,6 +7930,7 @@ static void bcm_osd_tick(void)
     }
     if (bcm_tv && osd_visible && (osd_s[0].tvwin || osd_s[2].tvwin) && !osd_tv_want(0))
         osd_present_mask(0);                           /* v56: removes the TV windows (the iPod screen keeps its overlay) */
+    ta_tick();                                         /* v142 */
     if (!osd_visible || sc_active) return;
     if (osd_hide_at && !TIME_BEFORE(current_tick, osd_hide_at) && !pl_paused) { osd_hide(); return; }
     if (!TIME_BEFORE(current_tick, osd_next))
@@ -7774,6 +8011,23 @@ static void pl_restart(void)
     mon_start("dock: restart");
     osd_show_for(pl_paused ? 0 : 3000);
 }
+/* SELECT: the controls on / off; v142: twice quickly = the clock line for 6 s (the time now, and when the video ends) */
+static void pl_select_tap(void)
+{
+    static long last;
+    if (last && current_tick - last < HZ * 45 / 100)
+    {
+        last = 0;
+        clk_until = current_tick + 6 * HZ;
+        if (!sc_active) pl_status();
+        BLOG("  user: SELECT twice -> the clock and the end time (%u ms left)", (unsigned)(pl_dur_ms > pl_el_ms ? pl_dur_ms - pl_el_ms : 0));
+        osd_show_for(6000);
+        return;
+    }
+    last = current_tick;
+    clk_until = 0;
+    if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000);
+}
 static void pl_vol_show(void)
 {
     av_vol_until = current_tick + 2 * HZ;
@@ -7845,6 +8099,7 @@ static int rc_to_local(int base)
 
 /* returns 1 when the user wants to stop.  The wheel is the volume (v51), never seeking. */
 static long pl_sys_event;                /* v96: SYS_POWEROFF / SYS_REBOOT that arrived during a video */
+static bool sl_play_hold;                /* v141: the sleep came from a held PLAY (its system power-off is ignored) */
 static bool sl_ok(void);
 static void sl_arm(const char *why);
 static int bcm_player_input(char *resp, size_t rn)
@@ -7945,7 +8200,7 @@ static int bcm_player_input(char *resp, size_t rn)
         if (b & BUTTON_REL)
         {
             st_sel_down = false;
-            if (!st_sel_done) { if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000); }
+            if (!st_sel_done) pl_select_tap();
         }
         else if (!st_sel_done && current_tick - st_sel_t0 >= HZ * 6 / 10) { st_sel_done = true; st_cycle(); }
         return 0;
@@ -7961,14 +8216,34 @@ static int bcm_player_input(char *resp, size_t rn)
         if (!done && current_tick - t0 >= HZ) { done = true; bcm_out_switch(); }
         return 0;
     }
+    if (base == BUTTON_PLAY)
+    {   /* v141: like MENU -- play / pause on release of a short press; held 1.5 s = sleep (the iPod's own "hold PLAY to
+           turn off"), with no play / pause first.  Before v141 the press toggled play / pause at once and only the
+           system's later power-off event (a few seconds of holding) put it to sleep. */
+        static bool down, done;
+        static long t0;
+        if (!(b & (BUTTON_REL | BUTTON_REPEAT))) { down = true; done = false; t0 = current_tick; return 0; }
+        if (!down) return 0;
+        if (b & BUTTON_REL)
+        {
+            down = false;
+            if (!done) pl_set_paused(!pl_paused, resp, rn);
+            return 0;
+        }
+        if (!done && current_tick - t0 >= HZ * 3 / 2)
+        {
+            done = true;
+            sl_play_hold = true;                        /* the sleep loop ignores the power-off of this same hold */
+            if (sl_ok()) { sl_arm("PLAY held"); return 1; }
+            BLOG("  PLAY held -- power off (no sleep possible now)");
+            pl_sys_event = SYS_POWEROFF;
+            return 1;
+        }
+        return 0;
+    }
     if (b & (BUTTON_REL | BUTTON_REPEAT)) return 0;
     if (b == BUTTON_MENU) return 1;
-    if (b == BUTTON_PLAY)
-        pl_set_paused(!pl_paused, resp, rn);
-    else if (b == BUTTON_SELECT)
-    {
-        if (osd_visible && !pl_paused) osd_hide(); else osd_show_for(3000);
-    }
+    if (b == BUTTON_SELECT) pl_select_tap();
     return 0;
 }
 
@@ -8289,6 +8564,8 @@ static void bcm_sleep(void)
             continue;
         }
         if (ev == SYS_USB_CONNECTED) { usb = true; break; }
+        if (ev == SYS_POWEROFF && sl_play_hold && (button_status() & BUTTON_PLAY))
+            continue;           /* v141: the same held PLAY that put it to sleep, still down: Rockbox's power-off for it */
         if (ev == SYS_POWEROFF || ev == SYS_REBOOT) { off = ev; break; }   /* the battery, or a held PLAY */
         if (IS_SYSEVENT(ev)) continue;
         if (ev & (BUTTON_REL | BUTTON_REPEAT)) continue;
@@ -8409,11 +8686,23 @@ static void sv_event(unsigned short id, void *data)
         (id == PLAYBACK_EVENT_TRACK_CHANGE && global_settings.start_volume == 2))
         sv_set();
 }
+/* v142: Settings > Sound > Dock Line Out / Line Out Gain (the codec part is in firmware/drivers/audio/wm8758.c) */
+void bcm_line_out_apply(int mode, int gain)
+{
+#ifndef SIMULATOR
+    extern void wm8758_lineout_cfg(bool bluetooth, int gain_db);
+    wm8758_lineout_cfg(mode == 1, gain);
+#else
+    (void)mode; (void)gain;
+#endif
+    sound_set_volume(global_status.volume);          /* re-programs the DAC, both amps and the line-out gain */
+}
 void bcm_start_volume_init(void)
 {
     static bool done;
     if (done) return;
     done = true;
+    bcm_line_out_apply(global_settings.dock_line_out, global_settings.line_out_gain);   /* v142 */
     add_event(PLAYBACK_EVENT_START_PLAYBACK, sv_event);
     add_event(PLAYBACK_EVENT_TRACK_CHANGE, sv_event);
 }
@@ -8430,31 +8719,105 @@ void bcm_start_volume_init(void)
    /.rockbox/battery_learn.txt every 10 minutes, so a run that Rockbox's low-battery power-off ends before this screen
    does is finished at the next start (bcm_battery_learn_boot). */
 #define BLN_LOG  "/.rockbox/battery_learn.txt"
-#define BLN_MAX  4096                                  /* 30 s samples: 34 hours */
+/* v142: one sample per 10 s (was 30 s), each the mean of the ten 1-second readings in it (was one reading); the
+   readings in the 20 s after a log write (the drive spinning up pulls the voltage down) are left out of their sample */
+#define BLN_PERIOD 10
+#define BLN_MAX  12288                                 /* 10 s samples: 34 hours */
 static uint16_t bln_mv[BLN_MAX];
-static unsigned bln_n;
+static unsigned bln_n, bln_period = BLN_PERIOD;
+/* v142: the point at each 10 % of the run left is a straight-line fit through the samples within +-2 % of the run
+   around it (was the median of 5 samples), and the 11 points are then made rising by pooling neighbours that are out
+   of order (was: +1 mV pushes) */
 static bool bln_curve(const uint16_t *mv, unsigned n, unsigned short out[11])
 {
-    int k;
-    if (n < 240) return false;                         /* under 2 hours: not a full run */
+    int k, i;
+    long pv[11], pw[11];
+    int np = 0, blk_k[11];
+    unsigned w;
+    if ((unsigned long)n * bln_period < 2 * 3600) return false;      /* under 2 hours: not a full run */
+    w = n / 50 > 3 ? n / 50 : 3;
     for (k = 0; k <= 10; k++)
-    {   /* k*10 % left = the moment (10-k)/10 of the way through; median of 5 samples around it */
-        unsigned c = (unsigned)((uint64_t)(n - 1) * (10 - k) / 10), i, j;
-        uint16_t w[5]; unsigned m = 0;
-        for (i = c >= 2 ? c - 2 : 0; i <= c + 2 && i < n; i++) w[m++] = mv[i];
-        for (i = 1; i < m; i++) for (j = i; j > 0 && w[j - 1] > w[j]; j--) { uint16_t t = w[j]; w[j] = w[j - 1]; w[j - 1] = t; }
-        out[k] = w[m / 2];
+    {   /* k*10 % left = the moment (10-k)/10 of the way through */
+        int64_t c2 = (int64_t)(n - 1) * (10 - k);                     /* the exact index times 10 */
+        unsigned c = (unsigned)(c2 / 10), lo = c > w ? c - w : 0, hi = c + w < n - 1 ? c + w : n - 1, m = 0, j;
+        int64_t sx = 0, sy = 0, sxx = 0, sxy = 0, d;
+        long v;
+        for (j = lo; j <= hi; j++)
+        {   /* x in tenths of a sample, relative to the exact point */
+            int64_t x = (int64_t)j * 10 - c2, y = mv[j];
+            sx += x; sy += y; sxx += x * x; sxy += x * y; m++;
+        }
+        d = (int64_t)m * sxx - sx * sx;
+        /* value at x = 0: (sy * sxx - sx * sxy) / d */
+        v = d ? (long)((sy * sxx - sx * sxy + d / 2) / d) : (long)(sy / (int64_t)m);
+        out[k] = (unsigned short)(v < 0 ? 0 : v > 65535 ? 65535 : v);
     }
+    for (k = 0; k <= 10; k++)
+    {   /* pool adjacent violators: a non-decreasing curve as close as possible to the fitted points */
+        pv[np] = out[k]; pw[np] = 1; blk_k[np] = k; np++;
+        while (np > 1 && pv[np - 2] > pv[np - 1])
+        {
+            pv[np - 2] = (pv[np - 2] * pw[np - 2] + pv[np - 1] * pw[np - 1]) / (pw[np - 2] + pw[np - 1]);
+            pw[np - 2] += pw[np - 1]; np--;
+        }
+    }
+    for (i = 0; i < np; i++)
+        for (k = blk_k[i]; k < blk_k[i] + pw[i]; k++) out[k] = (unsigned short)pv[i];
     for (k = 1; k <= 10; k++) if (out[k] <= out[k - 1]) out[k] = out[k - 1] + 1;
     return out[0] >= 3000 && out[10] <= 4350 && out[10] - out[0] >= 250;
 }
-static bool bln_save_curve(const unsigned short c[11], unsigned n)
+/* v142: the file keeps the curves of the last three runs ("# run" lines); the curve used is their median point by point
+   (two runs: the mean), so one run spoilt by a warm pocket or a stray drive spin-up does not decide it alone */
+static bool bln_save_curve(const unsigned short c0[11], unsigned n)
 {
-    int fd = open(BATTERY_LEVELS_USER, O_WRONLY | O_CREAT | O_TRUNC, 0666), k;
+    unsigned short runs[3][11], c[11];
+    char line[160], hist[2][160];
+    int nr = 0, nh = 0, fd, k, r;
+    fd = open(BATTERY_LEVELS_USER, O_RDONLY);
+    if (fd >= 0)
+    {
+        while (read_line(fd, line, sizeof line) > 0)
+            if (!strncmp(line, "# run ", 6))
+            {   /* keep the latest two */
+                if (nh == 2) { memmove(hist[0], hist[1], sizeof hist[0]); nh = 1; }
+                strlcpy(hist[nh++], line, sizeof hist[0]);
+            }
+        close(fd);
+    }
+    for (r = 0; r < nh; r++)
+    {   /* "# run <minutes> min: v0, v1, ... v10" */
+        char *q = strchr(hist[r], ':');
+        for (k = 0; q && k <= 10; k++)
+        {
+            while (*q && (*q < '0' || *q > '9')) q++;
+            if (!*q) break;
+            runs[nr][k] = (unsigned short)atoi(q);
+            while (*q >= '0' && *q <= '9') q++;
+        }
+        if (k == 11) nr++;
+    }
+    memcpy(runs[nr++], c0, sizeof runs[0]);
+    for (k = 0; k <= 10; k++)
+    {
+        unsigned short a = runs[0][k], b = nr > 1 ? runs[1][k] : a, d = nr > 2 ? runs[2][k] : b, t;
+        if (nr == 2) c[k] = (unsigned short)((a + b + 1) / 2);
+        else
+        {
+            if (a > b) { t = a; a = b; b = t; }
+            if (b > d) { t = b; b = d; d = t; }
+            if (a > b) { t = a; a = b; b = t; }
+            c[k] = b;
+        }
+        if (k && c[k] <= c[k - 1]) c[k] = c[k - 1] + 1;
+    }
+    fd = open(BATTERY_LEVELS_USER, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return false;
-    fdprintf(fd, "# written by Learn Battery (bcm overlay v138): %u min run, screen at full brightness\n"
-                 "# mV at 0 %%, 10 %%, ... 100 %% (load-compensated).  Delete this file to go back to the built-in curve.\n"
-                 "discharge:", n / 2);
+    fdprintf(fd, "# written by Learn Battery (bcm overlay v142): the median of the last %d run(s), screen at full brightness\n"
+                 "# mV at 0 %%, 10 %%, ... 100 %% (load-compensated).  Delete this file to go back to the built-in curve.\n", nr);
+    for (r = 0; r < nh; r++) fdprintf(fd, "%s\n", hist[r]);
+    fdprintf(fd, "# run %u min:", (unsigned)((unsigned long)n * bln_period / 60));
+    for (k = 0; k <= 10; k++) fdprintf(fd, "%s %u", k ? "," : "", (unsigned)c0[k]);
+    fdprintf(fd, "\ndischarge:");
     for (k = 0; k <= 10; k++) fdprintf(fd, "%s %u", k ? "," : "", (unsigned)c[k]);
     fdprintf(fd, "\n");
     close(fd);
@@ -8482,16 +8845,19 @@ void bcm_battery_learn_boot(void)
     bool done = false;
     int fd = open(BLN_LOG, O_RDONLY);
     if (fd < 0) return;
-    bln_n = 0;
+    bln_n = 0; bln_period = 30;                        /* v142: a log without "# period" is a v138-v141 one (30 s) */
     while (read_line(fd, line, sizeof line) > 0)
     {
         if (line[0] >= '0' && line[0] <= '9') { if (bln_n < BLN_MAX) bln_mv[bln_n++] = (uint16_t)atoi(line); }
+        else if (!strncmp(line, "# period ", 9)) bln_period = (unsigned)atoi(line + 9);
         else if (!strncmp(line, "done", 4) || !strncmp(line, "stopped", 7)) done = true;
     }
     close(fd);
     if (done) return;
     bln_mark(bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n) ? "done (at the next start)" : "done: too short");
-    if (bln_n >= 240) splashf(3 * HZ, "Battery learned (%u h %u min run)", bln_n / 120, bln_n / 2 % 60);
+    if ((unsigned long)bln_n * bln_period >= 2 * 3600)
+        splashf(3 * HZ, "Battery learned (%lu h %lu min run)", (unsigned long)bln_n * bln_period / 3600,
+                (unsigned long)bln_n * bln_period / 60 % 60);
 }
 int bcm_battery_learn(void)
 {
@@ -8501,7 +8867,8 @@ int bcm_battery_learn(void)
     const char *lines[3];
     struct text_message msg;
     unsigned flushed = 0;
-    long next = current_tick, shown = 0;
+    long next = current_tick + BLN_PERIOD * HZ, shown = 0, quiet_until = 0, sum = 0;
+    int cnt = 0;
     int lvl = battery_level();
     if (charger_inserted())
     {
@@ -8519,8 +8886,9 @@ int bcm_battery_learn(void)
     msg.message_lines = lines; msg.nb_lines = 3;
     if (gui_syncyesno_run(&msg, NULL, NULL) != YESNO_YES) return 0;
     remove(BLN_LOG);
-    bln_mark("# Learn Battery (bcm overlay v138): one load-compensated mV per 30 s");
-    bln_n = 0;
+    bln_mark("# Learn Battery (bcm overlay v142): one load-compensated mV per 10 s (the mean of 10 readings)");
+    bln_mark("# period 10");
+    bln_n = 0; bln_period = BLN_PERIOD;
     backlight_set_brightness(MAX_BRIGHTNESS_SETTING);
     button_clear_queue();
     while (1)
@@ -8537,14 +8905,20 @@ int bcm_battery_learn(void)
         }
         if (charger_inserted())
         {   bln_flush(flushed, bln_n); bln_mark("stopped: charger"); splash(3 * HZ, "Charger in: learning stopped"); break; }
+        if (b == BUTTON_NONE && TIME_AFTER(current_tick, quiet_until))
+        {   /* one reading a second (the wait above), none in the 20 s after a log write */
+            battery_smooth_info(&bi);
+            sum += bi.comp_mv > 0 ? bi.comp_mv : raw; cnt++;
+        }
         if (!TIME_BEFORE(current_tick, next))
         {
-            next += 30 * HZ;
-            battery_smooth_info(&bi);
-            if (bln_n < BLN_MAX) bln_mv[bln_n++] = (uint16_t)(bi.comp_mv > 0 ? bi.comp_mv : raw);
-            if (bln_n - flushed >= 20) { bln_flush(flushed, bln_n); flushed = bln_n; }
+            next += BLN_PERIOD * HZ;
+            if (cnt && bln_n < BLN_MAX) bln_mv[bln_n++] = (uint16_t)((sum + cnt / 2) / cnt);
+            else if (bln_n && bln_n < BLN_MAX) { bln_mv[bln_n] = bln_mv[bln_n - 1]; bln_n++; }   /* all quiet time: as before */
+            sum = 0; cnt = 0;
+            if (bln_n - flushed >= 60) { bln_flush(flushed, bln_n); flushed = bln_n; quiet_until = current_tick + 20 * HZ; }
         }
-        if (raw > 0 && raw <= battery_level_shutoff + 25)
+        if (raw > 0 && raw <= battery_level_shutoff + 10)   /* v142: +10 mV (was +25): the run's end is the 0 % point */
         {   /* empty: finish here, before Rockbox's own low-battery power-off */
             bln_flush(flushed, bln_n);
             if (bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n)) { bln_mark("done"); splash(4 * HZ, "Battery learned -- powering off"); }
@@ -8562,7 +8936,8 @@ int bcm_battery_learn(void)
             char t[4][48];
             shown = current_tick;
             battery_smooth_info(&bi);
-            snprintf(t[0], sizeof t[0], "Learn Battery: %u h %02u min", bln_n / 120, bln_n / 2 % 60);
+            snprintf(t[0], sizeof t[0], "Learn Battery: %lu h %02lu min", (unsigned long)bln_n * BLN_PERIOD / 3600,
+                     (unsigned long)bln_n * BLN_PERIOD / 60 % 60);
             snprintf(t[1], sizeof t[1], "%d mV (compensated %d)", raw, bi.comp_mv);
             snprintf(t[2], sizeof t[2], "empty at about %u mV", (unsigned)battery_level_shutoff);
             snprintf(t[3], sizeof t[3], "Leave it alone. MENU stops.");
@@ -8869,6 +9244,10 @@ static void bcm_video_run(int secs)
         if (pl_paused != was_paused)
         {   /* v96: pause bookkeeping (the sleep timer) */
             was_paused = pl_paused; pause_t = current_tick;
+            /* v142: the hang watch counts from the moment it plays again.  A 53 s pause, then PLAY: the last frame request
+               was 52 s old and the watch called it a hang at once, rebooted the VideoCore ... and the screen stayed white
+               (log of 27 Nov) */
+            if (!pl_paused) last_req = current_tick;
         }
         if (cfg_sleep_after_s > 0 && pl_paused && !sc_active && sl_ok() &&
             TIME_AFTER(current_tick, pause_t + cfg_sleep_after_s * HZ) &&
@@ -9094,10 +9473,10 @@ static void bcm_video_run(int secs)
                 else sleep(1);
             }
             else if (pumped || ra_filling || (am == 1 && served)) yield();
-            else sleep(am == 1 ? 1 : HZ / 25);
+            else sleep(am == 1 || ta_running() ? 1 : HZ / 25);   /* v142: the TV animation needs 30 passes a second */
         }
-        if (cfg_hang_s > 0 && !pl_paused && !sc_active && !v_eos && current_tick - run_t0 > 20 * HZ
-            && current_tick - last_req > cfg_hang_s * HZ)
+        if (cfg_hang_s > 0 && !pl_paused && !was_paused && !sc_active && !v_eos && current_tick - run_t0 > 20 * HZ
+            && current_tick - last_req > cfg_hang_s * HZ)   /* v142: !was_paused: PLAY in this pass, the count starts next pass */
         {   /* v87: playing, not paused, not at the end, and the VideoCore has not asked for a single frame for cfg_hang_s
                seconds (it asks ~70 times a second while it plays): it has stopped.  Leave like MENU does -- the display goes
                back to Rockbox -- instead of a frozen or white screen until a reboot. */
@@ -9466,6 +9845,7 @@ static void bcm_region(const char *when);
 static void bcm_out_switch(void)
 {
     BLOG("  user: hold MENU -> the picture to the %s", bcm_tv ? "iPod screen" : "TV");
+    osd_hide();                                        /* v142: the iPod screen's windows go (the TV symbol stayed over the video) */
     st_hide();
     if (st_cv_h > 0) { core_unpin(st_cv_h); core_free(st_cv_h); }
     st_cv_h = -1; st_cv = NULL; st_wk = NULL; st_ext = NULL;
@@ -9475,6 +9855,7 @@ static void bcm_out_switch(void)
     if (bcm_tv)
     {
         tl_off(0);
+        ta_free();                                     /* v142 */
         bcm_tv_enable(false);
         bcm_region("hold MENU: to the iPod screen");
         bcm_tv = false;
@@ -9486,6 +9867,7 @@ static void bcm_out_switch(void)
     {
         bcm_tv = true;
         bcm_tv_enable(true);
+        if (osd_ok > 0) ta_load();                     /* v142 */
     }
     iap_dock_remember_tv(bcm_tv);
     st_toast(bcm_tv ? "TV" : "iPod");
@@ -9735,13 +10117,14 @@ static void bcm_playback_probe(void)
             v_sound = cfg_sound; v_fallback = false;
             if (v_sound == 2 && !ma.ok) { BLOG("no AAC track found -- no VC sound"); v_sound = cfg_sound ? 1 : 0; }
 #ifndef SIMULATOR
-            if (v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO && ra_fsize > 0x7fffffffu)
+            if (0 && v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO && ra_fsize > 0x7fffffffu)
             {   /* v89: Rockbox's own playback (codecs, buffering) reads only the first 2 GiB of a file */
                 BLOG("audio: the movie is over 2 GiB -- Rockbox's own sound route cannot read it; the VideoCore plays the "
                      "sound (headphones / dock / TV), the click speaker stays silent");
             }
-            else if (v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO)
-            {   /* v86: the VideoCore's sound goes straight to the headphone codec, past Rockbox's mixer, so the click
+            else if (0 && v_sound == 2 && !bcm_tv && piezo_speaker_home_sink() == PCM_SINK_PIEZO)
+            {   /* v142: off on request -- video sound never goes to the click speaker; the VideoCore plays it to the
+                   headphones / dock / TV as always.  v86: the VideoCore's sound goes straight to the headphone codec, past Rockbox's mixer, so the click
                    speaker never got it (v77-v85: silent videos).  Rockbox decodes the AAC track instead (the v51 route,
                    kept in step with the picture), and the mixer sends it to the click speaker. */
                 BLOG("audio: the click speaker plays the sound -> Rockbox decodes the AAC track (sound=1)");
@@ -9823,6 +10206,7 @@ again:
     {
         bcm_video_run(cfg_play_secs > 0 ? cfg_play_secs : 6 * 3600);   /* v41: whole file by default (MENU stops) */
         BLOG("VIDEO RESULT: get_frame=%d frames_sent=%d bytes=%d empty=%d eos=%d stop=%d", v_getframes, v_frames, v_bytes, v_empty, v_eos, v_stop);
+        if (ta_n) BLOG("  TV animation: %u frames shown, %u times behind (caught up)", ta_shown, ta_late);   /* v142 */
         if (vcp_custom_vll) vcp_scan();                /* v133 */
         if (m4_big_seen) BLOG("large frames: %u over 64 KB, the largest %u KB", (unsigned)m4_big_seen, (unsigned)(m4_big_max / 1024));
         if (rc_want)
@@ -9931,6 +10315,7 @@ static void bcm_reset_run_state(void)
     tf_dir = 0; tf_fed = 0;
     gfx_front = -1; gfx_presents = 0; memset(gfx_win, 0, sizeof gfx_win); memset(gfx_black, 0, sizeof gfx_black);
     osd_ok = -1; osd_visible = false;
+    ta_n = 0; ta_win = 0; ta_tried = false; ta_shown = ta_late = 0; memset(ta_img, 0, sizeof ta_img);   /* v142 */
     for (k = 0; k < OSD_NS; k++) { osd_s[k].front = -1; memset(osd_s[k].win, 0, sizeof osd_s[k].win); osd_s[k].tvwin = 0; }
     pl_paused = false; pl_el_ms = 0; pl_dur_ms = 0; pl_target_ms = 0;
     sc_active = false; sc_btn = 0; mon_until = 0;
@@ -9943,6 +10328,178 @@ static void bcm_reset_run_state(void)
 static bool bcm_run(const char *play_path);
 static bool dbg_bcm_host(void) { return bcm_run(NULL); }
 
+/* ---- v142: Debug > Dock & Bluetooth Test ----------------------------------------------------------------------------
+   For a Bluetooth transmitter on the dock connector (Griffin AeroStream and the like).  Shows what the accessory said
+   about itself over iAP (name, maker, model, firmware, hardware, serial, lingoes), counts and logs every packet it sends
+   (/.rockbox/dock_test.txt: a transmitter that passes on the headphones' play / skip buttons sends them as Simple Remote
+   packets), and plays 1 kHz test tones straight into the mixer (no DSP) to set the line-out level by ear:
+   SELECT = next tone (off, -20, -6, -1, 0 dBFS, left only, right only), LEFT / RIGHT = Line Out Gain -/+ 1 dB,
+   PLAY = Dock Line Out Normal / Bluetooth, MENU = back.  The loudest clean setting: the 0 dBFS tone with the highest
+   gain at which the receiving end does not crackle or distort.  iAP has no field for the name of the Bluetooth device
+   the transmitter is paired with; whatever it does send is in the log. */
+#include "fixedpoint.h"
+#define DT_LOG "/.rockbox/dock_test.txt"
+#define DT_RING 32
+static struct { long t; int len; uint8_t b[24]; } dt_ring[DT_RING];
+static volatile unsigned dt_w, dt_total, dt_remote;
+static volatile uint8_t dt_last[3];
+static void dt_hook(const unsigned char *p, int len)
+{   /* iAP thread */
+    unsigned i = dt_w % DT_RING;
+    dt_ring[i].t = current_tick; dt_ring[i].len = len;
+    memcpy(dt_ring[i].b, p, len < 24 ? len : 24);
+    dt_last[0] = p[0]; dt_last[1] = len > 1 ? p[1] : 0; dt_last[2] = len > 2 ? p[2] : 0;
+    dt_w++; dt_total++;
+    if (p[0] == 0x02) dt_remote++;
+}
+static int16_t dt_sin[257];
+static int16_t dt_buf[512 * 2] __attribute__((aligned(4)));
+static volatile uint32_t dt_phase, dt_step;
+static volatile int dt_al, dt_ar;
+static void dt_fill(void)
+{
+    int i;
+    uint32_t ph = dt_phase, st = dt_step;
+    for (i = 0; i < 512; i++)
+    {
+        int k = ph >> 24, f = (ph >> 8) & 0xffff;
+        int s = dt_sin[k] + (((dt_sin[k + 1] - dt_sin[k]) * f) >> 16);
+        dt_buf[2 * i] = (int16_t)((s * dt_al) >> 15);
+        dt_buf[2 * i + 1] = (int16_t)((s * dt_ar) >> 15);
+        ph += st;
+    }
+    dt_phase = ph;
+}
+static void dt_more(const void **start, size_t *size) { dt_fill(); *start = dt_buf; *size = sizeof dt_buf; }
+static const char * const dt_tone_name[7] = { "off", "1 kHz -20 dBFS", "1 kHz -6 dBFS", "1 kHz -1 dBFS", "1 kHz 0 dBFS",
+                                              "1 kHz -6 dBFS left only", "1 kHz -6 dBFS right only" };
+static void dt_tone(int m)
+{
+    static const int amp[7][2] = { { 0, 0 }, { 3277, 3277 }, { 16423, 16423 }, { 29205, 29205 }, { 32767, 32767 },
+                                   { 16423, 0 }, { 0, 16423 } };
+    static struct mixer_play_cbs cbs = { dt_more, NULL };
+    mixer_channel_stop(PCM_MIXER_CHAN_BEEP);
+    if (!m) return;
+    dt_al = amp[m][0]; dt_ar = amp[m][1];
+    dt_step = (uint32_t)(((uint64_t)1000 << 32) / mixer_get_frequency());
+    dt_phase = 0;
+    dt_fill();
+    mixer_channel_set_amplitude(PCM_MIXER_CHAN_BEEP, MIX_AMP_UNITY);
+    mixer_channel_play_data(PCM_MIXER_CHAN_BEEP, &cbs, dt_buf, sizeof dt_buf);
+}
+static void dt_log(int fd, const char *fmt, ...)
+{
+    char b[200];
+    va_list ap;
+    if (fd < 0) return;
+    va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    fdprintf(fd, "[%4ld.%02ld] %s\n", current_tick / HZ, current_tick % HZ, b);
+}
+static const char *dt_lingo(int l)
+{
+    switch (l)
+    {
+        case 0x00: return "General";
+        case 0x01: return "Microphone";
+        case 0x02: return "Simple Remote";
+        case 0x03: return "Display Remote";
+        case 0x04: return "Extended Interface";
+        case 0x05: return "Accessory Power";
+        case 0x06: return "USB Host";
+        case 0x07: return "RF Tuner";
+        case 0x08: return "Accessory Equalizer";
+        case 0x0A: return "Digital Audio";
+        case 0x0C: return "Storage";
+    }
+    return "?";
+}
+static bool dbg_dock_test(void)
+{
+    int tone = 0, fd, i, y, st_was = -1;
+    unsigned seen = 0;
+    long next_snap = 0;
+    char l[64];
+    for (i = 0; i <= 256; i++)
+    {
+        long c, sv = fp_sincos((unsigned long)i << 24, &c) >> 16;
+        dt_sin[i] = (int16_t)(sv > 32767 ? 32767 : sv < -32767 ? -32767 : sv);
+    }
+    fd = open(DT_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    dt_log(fd, "==== Dock & Bluetooth Test (bcm overlay v142)");
+    dt_w = dt_total = dt_remote = 0;
+    iap_rx_hook = dt_hook;
+    lcd_setfont(FONT_SYSFIXED);
+    while (1)
+    {
+        int b, stt = iap_dock_state();
+        const char *nm = iap_dock_field(1);
+        if (stt != st_was || TIME_AFTER(current_tick, next_snap))
+        {   /* what is plugged in, every 10 s and at every change */
+            st_was = stt; next_snap = current_tick + 10 * HZ;
+            dt_log(fd, "dock %s; name \"%s\" maker \"%s\" model \"%s\" firmware %s hardware %s serial \"%s\"; lingoes %08lx",
+                   stt == 2 ? "connected" : stt == 1 ? "identifying" : "none", nm, iap_dock_field(6), iap_dock_field(7),
+                   iap_dock_field(4), iap_dock_field(5), iap_dock_field(8), iap_dock_lingoes());
+            dt_log(fd, "  power: %s%s, battery %d mV %d %%; headphones %s; volume %d dB; Dock Line Out %s, gain +%d dB; "
+                   "mixer %lu Hz; tone %s", charger_inserted() ? "external power" : "battery",
+                   usb_inserted() ? " (USB)" : "", battery_voltage(), battery_level(), headphones_inserted() ? "in" : "out",
+                   global_status.volume, global_settings.dock_line_out ? "Bluetooth" : "Normal", global_settings.line_out_gain,
+                   (unsigned long)mixer_get_frequency(), dt_tone_name[tone]);
+        }
+        while (seen != dt_w)
+        {   /* the packets since the last pass */
+            unsigned k = seen % DT_RING, j;
+            char hx[80];
+            int o = 0, n = dt_ring[k].len < 24 ? dt_ring[k].len : 24;
+            if (dt_w - seen > DT_RING) { dt_log(fd, "  (%u packets not logged: too many at once)", dt_w - seen - DT_RING); seen = dt_w - DT_RING; continue; }
+            for (j = 0; j < (unsigned)n && o < (int)sizeof hx - 4; j++) o += snprintf(hx + o, sizeof hx - o, "%02x ", dt_ring[k].b[j]);
+            dt_log(fd, "  rx %s (lingo %02x) len %d: %s%s", dt_lingo(dt_ring[k].b[0]), dt_ring[k].b[0], dt_ring[k].len, hx,
+                   dt_ring[k].len > 24 ? "..." : "");
+            seen++;
+        }
+        lcd_clear_display();
+        y = 0;
+        lcd_puts(0, y++, "Dock & Bluetooth Test");
+        lcd_putsf(0, y++, "dock: %s  lingoes %08lx", stt == 2 ? "connected" : stt == 1 ? "identifying" : "none", iap_dock_lingoes());
+        lcd_putsf(0, y++, "%s", nm[0] ? nm : "(no name sent)");
+        lcd_putsf(0, y++, "%s %s", iap_dock_field(6), iap_dock_field(7));
+        lcd_putsf(0, y++, "fw %s hw %s", iap_dock_field(4)[0] ? iap_dock_field(4) : "-", iap_dock_field(5)[0] ? iap_dock_field(5) : "-");
+        lcd_putsf(0, y++, "serial %s", iap_dock_field(8)[0] ? iap_dock_field(8) : "-");
+        lcd_putsf(0, y++, "rx %u pkts, remote %u, last %02x %02x %02x", dt_total, dt_remote, dt_last[0], dt_last[1], dt_last[2]);
+        lcd_putsf(0, y++, "power: %s%s %d mV", charger_inserted() ? "ext" : "battery", usb_inserted() ? " USB" : "", battery_voltage());
+        lcd_putsf(0, y++, "line out: %s, gain +%d dB", global_settings.dock_line_out ? "Bluetooth" : "Normal", global_settings.line_out_gain);
+        lcd_putsf(0, y++, "headphones %s, vol %d dB", headphones_inserted() ? "in" : "out", global_status.volume);
+        snprintf(l, sizeof l, "tone: %s", dt_tone_name[tone]);
+        lcd_puts(0, y++, l);
+        y++;
+        lcd_puts(0, y++, "SELECT tone  < > gain");
+        lcd_puts(0, y++, "PLAY mode  MENU back");
+        lcd_update();
+        b = button_get_w_tmo(HZ / 5);
+        if (b == BUTTON_MENU || b == ACTION_STD_CANCEL) break;
+        if (b == BUTTON_SELECT) { tone = (tone + 1) % 7; dt_tone(tone); dt_log(fd, "tone: %s", dt_tone_name[tone]); }
+        else if (b == BUTTON_RIGHT || b == BUTTON_LEFT)
+        {
+            int g = global_settings.line_out_gain + (b == BUTTON_RIGHT ? 1 : -1);
+            global_settings.line_out_gain = g < 0 ? 0 : g > 6 ? 6 : g;
+            bcm_line_out_apply(global_settings.dock_line_out, global_settings.line_out_gain);
+            settings_save();
+            dt_log(fd, "Line Out Gain +%d dB (tone %s)", global_settings.line_out_gain, dt_tone_name[tone]);
+        }
+        else if (b == BUTTON_PLAY)
+        {
+            global_settings.dock_line_out = !global_settings.dock_line_out;
+            bcm_line_out_apply(global_settings.dock_line_out, global_settings.line_out_gain);
+            settings_save();
+            dt_log(fd, "Dock Line Out %s", global_settings.dock_line_out ? "Bluetooth" : "Normal");
+        }
+    }
+    iap_rx_hook = NULL;
+    dt_tone(0);
+    dt_log(fd, "end: %u packets (%u Simple Remote)", dt_total, dt_remote);
+    if (fd >= 0) close(fd);
+    lcd_setfont(FONT_UI);
+    return false;
+}
 /* ---- v139: Debug > Drive Transfer Test ---------------------------------------------------------------------------------
    How many sectors can one ATA read command carry on this iPod's drive, and how fast is each size?  Rockbox's FAT layer
    sends at most 256 (128 KB).  LBA48 drives (the iFlash adapters) take up to 65536 per command; whether the PP5022's IDE
@@ -10322,7 +10879,7 @@ static bool bcm_standby;                         /* bcm_run: start-up only, no v
 /* the run that is ending may leave the VideoCore up */
 static bool kp_wanted(void)
 {
-    if (!kp_setting() || !bcm_player_mode || !bcm_play_path || bcm_tv || qz_on || kp_warm_off) return false;
+    if (!kp_setting() || !bcm_player_mode || !bcm_play_path || (bcm_tv && !cfg_tv_menu) || qz_on || kp_warm_off) return false;
     return kp_in_area(bcm_play_path, !bcm_standby);
 }
 static void kp_upd_hook(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; kp_dirty = true; }
@@ -10333,13 +10890,43 @@ static void kp_forget_images(void)
     kp_front = -1;
 }
 /* Rockbox's frame buffer -> the back image, shown as a window above everything, the old window removed */
+static int kp_sc = 1;                            /* v142: TV menus: the browser 2x on the TV (1 = as on the iPod) */
+static uint16_t kp_row2[LCD_WIDTH * 2];
 static int kp_push(void)
 {
     uint32_t o[4], pl[8], w4[4];
-    int back = kp_front < 0 ? 0 : 1 - kp_front, y, th = global_settings.bcm_tv_signal ? 576 : 480;
+    int back = kp_front < 0 ? 0 : 1 - kp_front, y, th = global_settings.bcm_tv_signal ? 576 : 480, x;
     const fb_data *fb = FBADDR(0, 0);
+    if (kp_front < 0 && !kp_img[0] && !kp_img[1])
+    {   /* v142: on the TV both images 640 x 480, every pixel doubled (a 320 x 240 picture in the middle of a TV is hard
+           to read); 1x if the VideoCore has no room for two of those */
+        kp_sc = 1;
+        if (kp_tv && osd_alloc(1, LCD_WIDTH * 2, LCD_HEIGHT * 2, &kp_img[0], &kp_addr[0]) == 0)
+        {
+            if (osd_alloc(1, LCD_WIDTH * 2, LCD_HEIGHT * 2, &kp_img[1], &kp_addr[1]) == 0) kp_sc = 2;
+            else
+            {
+                uint32_t a[4];
+                memset(a, 0, sizeof a); a[0] = kp_img[0]; bcm_gfx_rpc(9, a, 0x10, o, NULL, 300);
+                kp_img[0] = kp_img[1] = 0;
+            }
+        }
+    }
     if (!kp_img[back] && bcm_gfx_alloc(&kp_img[back], &kp_addr[back]) != 0) { kp_img[back] = 0; return -1; }
     kp_dirty = false;
+    if (kp_sc == 2)
+    {
+        for (y = 0; y < LCD_HEIGHT; y++)
+        {
+            const fb_data *r = fb + y * LCD_WIDTH;
+            for (x = 0; x < LCD_WIDTH; x++) kp_row2[2 * x] = kp_row2[2 * x + 1] = (uint16_t)r[x];
+            bcm_io_lock();
+            bcm_io_write(kp_addr[back] + (unsigned)(2 * y) * LCD_WIDTH * 4, kp_row2, LCD_WIDTH * 4);
+            bcm_io_write(kp_addr[back] + (unsigned)(2 * y + 1) * LCD_WIDTH * 4, kp_row2, LCD_WIDTH * 4);
+            bcm_io_unlock();
+        }
+    }
+    else
     for (y = 0; y < LCD_HEIGHT; y += 16)
     {
         bcm_io_lock();
@@ -10349,9 +10936,9 @@ static int kp_push(void)
     if (bcm_gfx_rpc(1, NULL, 0, o, NULL, 300) != 0) return -2;
     memset(pl, 0, sizeof pl);
     pl[0] = kp_tv ? 2 : 0; pl[1] = (uint32_t)(cfg_osd_layer + 30); pl[3] = kp_img[back];
-    ((uint16_t *)pl)[8]  = kp_tv ? (720 - LCD_WIDTH) / 2 : 0;     /* on a TV: the 320 x 240 screen in the middle */
-    ((uint16_t *)pl)[9]  = kp_tv ? (uint16_t)((th - LCD_HEIGHT) / 2) : 0;
-    ((uint16_t *)pl)[12] = LCD_WIDTH; ((uint16_t *)pl)[13] = LCD_HEIGHT;
+    ((uint16_t *)pl)[8]  = kp_tv ? (720 - LCD_WIDTH * kp_sc) / 2 : 0;     /* on a TV: in the middle */
+    ((uint16_t *)pl)[9]  = kp_tv ? (uint16_t)((th - LCD_HEIGHT * kp_sc) / 2) : 0;
+    ((uint16_t *)pl)[12] = (uint16_t)(LCD_WIDTH * kp_sc); ((uint16_t *)pl)[13] = (uint16_t)(LCD_HEIGHT * kp_sc);
     if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) != 0 || !o[0]) { bcm_gfx_rpc(2, NULL, 0, o, NULL, 300); return -3; }
     kp_win[back] = o[0];
     if (kp_front >= 0 && kp_win[kp_front])
@@ -10407,7 +10994,7 @@ static void kp_thread(void)
             else if (kp_sleep_req) { why = "the display goes to sleep"; slept_req = true; }
             else if (usb_inserted()) why = "USB";
             else if (kp_setting() == 0) why = "the setting is off";
-            else if (kp_away && current_tick - kp_away > 3 * HZ) why = "left the video folders";
+            else if (kp_away && current_tick - kp_away > HZ) why = "left the video folders";   /* v141: 1 s (was 3) */
             else if (current_tick - kp_since > limit) why = "no video for a while";
             else if (kp_dirty && current_tick - kp_last_push >= HZ / 10)
             {
@@ -10482,7 +11069,17 @@ static bool kp_enter(void)
     bcm_lcd_set_hosted(kp_upd_hook, kp_sleep_hook);
     kp_hosted = true;
     mutex_unlock(&kp_mtx);
-    if (kp_tv) backlight_off();                        /* the panel shows nothing while the TV is driven */
+    if (kp_tv)
+    {   /* v142 TV menus: the TV's output on (the video's end turned it off; a folder start never had it) */
+        static char tr[128];
+        char c[48];
+        int r2;
+        snprintf(c, sizeof c, "display_control 2 dac=1 encoding=%d", cfg_tv_enc >= 0 ? cfg_tv_enc : global_settings.bcm_tv_signal ? 1 : 5);
+        r2 = bcm_gencmd_watched(c, tr, sizeof tr, 3);
+        bcm_log_text(c, r2, tr);
+        BLOG("keep ready: TV menus -- the browser is shown on the TV%s", r2 ? " (the TV output did not answer)" : "");
+        backlight_off();                               /* the panel shows nothing while the TV is driven */
+    }
     else backlight_set_brightness(global_settings.brightness);
     return true;
 }
@@ -10506,7 +11103,32 @@ static bool kp_take(void)
 
 /* v99: the file browser loaded a folder (ft_load).  In a video folder, with Keep VideoCore Ready on, start the VideoCore
    now (standby) so the first video there is a warm start too.  About 1.5 s, the same start-up as a video. */
+/* v141: entering a video folder no longer starts the VideoCore at once: the boot (~1.7 s, the screen cannot change
+   meanwhile) waited until the folder had been on screen, untouched, for 1.5 s (apps/tree.c calls bcm_video_folder_idle
+   twice a second).  Passing through a video folder costs nothing now; the boot happens while you read the list. */
+static char kp_pend_dir[MAX_PATH];
+static long kp_pend_t;
 void bcm_video_folder_hint(const char *dir)
+{
+    if (!dir || !kp_setting() || kp_hosted || bcm_video_running || bcm_play_path || !kp_in_area(dir, false))
+    { kp_pend_dir[0] = 0; return; }
+    strlcpy(kp_pend_dir, dir, sizeof kp_pend_dir);
+    kp_pend_t = current_tick;
+}
+static void kp_folder_start(const char *dir);
+void bcm_video_folder_idle(int action)
+{
+    struct tree_context *tc;
+    if (!kp_pend_dir[0]) return;
+    if (action != ACTION_NONE) { kp_pend_t = current_tick; return; }       /* still moving around */
+    if (current_tick - kp_pend_t < HZ * 3 / 2) return;
+    tc = tree_get_context();
+    if (!tc || strcmp(tc->currdir, kp_pend_dir) || get_current_activity() != ACTIVITY_FILEBROWSER)
+    { kp_pend_dir[0] = 0; return; }
+    kp_folder_start(kp_pend_dir);
+    kp_pend_dir[0] = 0;
+}
+static void kp_folder_start(const char *dir)
 {
     char d[MAX_PATH];
     if (!kp_setting() || kp_hosted || bcm_video_running || bcm_play_path || !dir || !kp_in_area(dir, false)) return;
@@ -10514,7 +11136,9 @@ void bcm_video_folder_hint(const char *dir)
     if (battery_level() >= 0 && battery_level() < 10) return;      /* keep what is left for the iPod itself */
     strlcpy(d, dir, sizeof d);
     bcm_standby = true;
-    bcm_tv = false;                                    /* standby is on the iPod's screen; a TV video decides again */
+    /* standby is on the iPod's screen; a TV video decides again.  v142 (cfg tv_menu=1): with Video Out On (or Auto on
+       a dock that wants the TV) the browser goes to the TV instead */
+    bcm_tv = cfg_tv_menu && (global_settings.bcm_video_out == 0 || (global_settings.bcm_video_out == 3 && iap_dock_tv_choice() == 1));
     bcm_run(d);
     bcm_standby = false;
     if (!kp_hosted) kp_fail_until = current_tick + 60 * HZ;
@@ -10550,7 +11174,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v140, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v142, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -10864,6 +11488,7 @@ out:
         {   /* v119 */
             sl_want = false;
             bcm_sleep();
+            sl_play_hold = false;                      /* v141 */
         }
         if (pl_sys_event)
         {   /* v96: the power off / reboot that came during the video */
@@ -11210,7 +11835,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v140 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v142 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -11235,7 +11860,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v140, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v142, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
@@ -11272,6 +11897,7 @@ static const struct {
 #ifdef IPOD_VIDEO
         { "BCM host test", dbg_bcm_host },
         { "Drive Transfer Test", dbg_xfer_test },       /* v139 */
+        { "Dock & Bluetooth Test", dbg_dock_test },    /* v142 */
         { "CABAC tests", dbg_cabac_tests },
         { "Storage report (exFAT prep)", dbg_storage_report },
         { "Dump flash ROM (exFAT prep)", dbg_flash_dump },

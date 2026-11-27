@@ -83,6 +83,21 @@ static void get_volume_params(int db, int *dac, int *amp)
 
 #if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
 static int cur_fsel = -1;     /* bcm overlay v60: rate the PLL is programmed for (-1 = unknown) */
+/* bcm overlay v142: Settings > Sound > Dock Line Out.  The dock line-out (OUT2) gets the DAC's signal; the DAC is at
+   0 dB for every volume above -57 dB and the headphone amp (OUT1) does the volume, so the line-out is already at full
+   level -- except below -57 dB, where the DAC itself turned down and took the line-out with it.  "Bluetooth" keeps the
+   DAC at 0 dB always (the headphones go silent instead).  The gain is the line-out amp's own: 0 dB = line level
+   (about 1 V rms at full scale); OUT2 has ~1 dB of headroom above that before it clips on a full-scale signal, so
+   +2..+6 dB is louder only for music mastered below full scale (Settings > Debug > Dock & Bluetooth Test plays tones
+   to find the most your transmitter takes cleanly). */
+static bool lo_bt;
+static int lo_gain_tdb;
+void wm8758_lineout_cfg(bool bluetooth, int gain_db);
+void wm8758_lineout_cfg(bool bluetooth, int gain_db)
+{
+    lo_bt = bluetooth;
+    lo_gain_tdb = (gain_db < 0 ? 0 : gain_db > 6 ? 6 : gain_db) * 10;
+}
 #endif
 
 static void audiohw_mute(bool mute)
@@ -160,6 +175,13 @@ void audiohw_set_volume(int vol_l, int vol_r)
 
     get_volume_params(vol_l, &dac_l, &amp_l);
     get_volume_params(vol_r, &dac_r, &amp_r);
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    if (lo_bt)
+    {   /* v142: the line-out stays at full level; below -57 dB the headphone amp is muted instead */
+        if (dac_l < 255) { dac_l = 255; amp_l = 0x40; }
+        if (dac_r < 255) { dac_r = 255; amp_r = 0x40; }
+    }
+#endif
 
     /* set DAC
        Important: DAC is global and will also affect lineout */
@@ -174,6 +196,11 @@ void audiohw_set_volume(int vol_l, int vol_r)
 void audiohw_set_lineout_volume(int vol_l, int vol_r)
 {
     int dac_l, amp_l, dac_r, amp_r;
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+    vol_l += lo_gain_tdb; vol_r += lo_gain_tdb;    /* v142 */
+    if (vol_l > 60) vol_l = 60;
+    if (vol_r > 60) vol_r = 60;
+#endif
 
     vol_l = vol_tenthdb2hw(vol_l);
     vol_r = vol_tenthdb2hw(vol_r);

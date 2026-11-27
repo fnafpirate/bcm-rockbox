@@ -195,6 +195,7 @@ static struct {
     int pin;
     volatile bool video;
     char name[40], maker[32], model[24], key[72];
+    char fw[16], hw[16], serial[32];   /* v142 */
     volatile bool ui_connect, ui_disconnect, ui_power;
     int snap[3], prof_tv, gone_tv;     /* snap: picture, signal, wide while docked */
     char gone_key[72], gone_name[40];
@@ -219,6 +220,7 @@ void iap_dock_identified(uint32_t lingoes)
         iap_dock_pin21(15, dk.pin);                   /* another accessory: the old one is gone */
     /* (dk.lingoes == 0: it was known by its resistor only and now says who it is: no "disconnected" for that) */
     dk.name[0] = dk.maker[0] = dk.model[0] = 0;
+    dk.fw[0] = dk.hw[0] = dk.serial[0] = 0;
     dk.lingoes = lingoes;
     dk.pin = iap_acc_id_code;
     dk.video = false;
@@ -230,7 +232,26 @@ void iap_dock_accinfo(int type, const unsigned char *s, int len)
     if (type == 0x01) dk_clean(dk.name, sizeof dk.name, s, len);
     else if (type == 0x06) dk_clean(dk.maker, sizeof dk.maker, s, len);
     else if (type == 0x07) dk_clean(dk.model, sizeof dk.model, s, len);
+    else if (type == 0x08) dk_clean(dk.serial, sizeof dk.serial, s, len);
+    else if ((type == 0x04 || type == 0x05) && len >= 3)
+        snprintf(type == 0x04 ? dk.fw : dk.hw, sizeof dk.fw, "%d.%d.%d", s[0], s[1], s[2]);
 }
+/* v142: Debug > Dock & Bluetooth Test */
+const char *iap_dock_field(int type)
+{
+    switch (type)
+    {
+        case 1: return dk.name;
+        case 4: return dk.fw;
+        case 5: return dk.hw;
+        case 6: return dk.maker;
+        case 7: return dk.model;
+        case 8: return dk.serial;
+    }
+    return "";
+}
+int iap_dock_state(void) { return dk.state; }
+unsigned long iap_dock_lingoes(void) { return (unsigned long)dk.lingoes; }
 void iap_dock_video_interest(void)
 {
     dk.video = true;
@@ -286,6 +307,7 @@ void iap_dock_poll(void)
     else if (dk.state == 0 && iap_acc_id_code >= 0 && iap_acc_id_code < 15 && TIME_AFTER(current_tick, dk.pin_since + 5 * HZ))
     {
         dk.name[0] = dk.maker[0] = dk.model[0] = 0;
+    dk.fw[0] = dk.hw[0] = dk.serial[0] = 0;
         dk.lingoes = 0; dk.pin = iap_acc_id_code; dk.video = false;
         dk_connected();
     }
@@ -1506,6 +1528,7 @@ void iap_handlepkt_mode0(const unsigned int len, const unsigned char *buf)
 
 #ifdef IPOD_VIDEO
                 case 0x01: case 0x06: case 0x07:    /* v74: name, manufacturer, model: the dock's notice and key */
+                case 0x04: case 0x05: case 0x08:    /* v142: firmware, hardware, serial (Dock & Bluetooth Test) */
                     iap_dock_accinfo(buf[0x02], &buf[0x03], (int)len - 3);
                     break;
 #endif

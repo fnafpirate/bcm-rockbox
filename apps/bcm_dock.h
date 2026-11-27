@@ -9,6 +9,11 @@ void iap_dock_ui(void);                /* UI thread: notices, the dock's TV sett
 int iap_dock_tv_choice(void);          /* -1 unknown / no dock, 0 iPod screen, 1 TV */
 void iap_dock_remember_tv(bool tv);
 const char *iap_dock_name(void);       /* NULL = no dock */
+/* v142: Debug > Dock & Bluetooth Test */
+const char *iap_dock_field(int type);  /* RetAccessoryInfo: 1 name, 4 firmware, 5 hardware, 6 maker, 7 model, 8 serial */
+int iap_dock_state(void);              /* 0 none, 1 identified (waiting for its name), 2 connected */
+unsigned long iap_dock_lingoes(void);
+extern void (*iap_rx_hook)(const unsigned char *pkt, int len);   /* every packet from the accessory (iAP thread) */
 #else
 #define iap_dock_ui() do { } while (0)
 #define iap_dock_tv_choice() (-1)

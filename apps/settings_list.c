@@ -97,6 +97,12 @@
 #ifdef HAVE_BATTERY_SMOOTH_API
 static void battery_reading_cb(int v) { battery_set_reading(v); }
 #endif
+#ifdef IPOD_VIDEO
+/* bcm overlay v142: Settings > Sound > Dock Line Out / Line Out Gain (firmware/drivers/audio/wm8758.c) */
+void bcm_line_out_apply(int mode, int gain);
+static void dock_line_out_apply(int v) { bcm_line_out_apply(v, global_settings.line_out_gain); }
+static void line_out_gain_apply(int v) { bcm_line_out_apply(global_settings.dock_line_out, v); }
+#endif
 
 #define NODEFAULT INT(0)
 
@@ -1388,6 +1394,10 @@ const struct settings_list settings[] = {
                    NULL, 3, ID2P(LANG_OFF), ID2P(LANG_VIDEO_RESUME_ASK), ID2P(LANG_ALWAYS)),                 /* v96 */
     CHOICE_SETTING(0, start_volume, LANG_START_VOLUME, 1, "start volume", "off,playback start,every track",
                    NULL, 3, ID2P(LANG_OFF), ID2P(LANG_START_VOLUME_PLAY), ID2P(LANG_START_VOLUME_TRACK)),     /* v138 */
+    CHOICE_SETTING(0, dock_line_out, LANG_DOCK_LINE_OUT, 0, "dock line out", "normal,bluetooth",
+                   dock_line_out_apply, 2, ID2P(LANG_NORMAL), ID2P(LANG_LINE_OUT_BLUETOOTH)),                 /* v142 */
+    INT_SETTING(0, line_out_gain, LANG_LINE_OUT_GAIN, 0, "line out gain", UNIT_DB, 0, 6, 1,
+                NULL, NULL, line_out_gain_apply),                                                            /* v142 */
     CHOICE_SETTING(0, bcm_keep_vc, LANG_KEEP_VC, 1, "keep videocore ready", "off,in video folders",
                    NULL, 2, ID2P(LANG_OFF), ID2P(LANG_KEEP_VC_FOLDER)),                                      /* v99 */
     OFFON_SETTING(0, bcm_dock_notify, LANG_DOCK_NOTICES, true, "dock notifications", NULL),
@@ -2702,7 +2712,12 @@ const struct settings_list settings[] = {
     (CONFIG_KEYPAD == IPOD_4G_PAD) || \
     (CONFIG_KEYPAD == IRIVER_H10_PAD)
     OFFON_SETTING(0, clear_settings_on_hold, LANG_CLEAR_SETTINGS_ON_HOLD,
-                  true, "clear settings on hold", NULL),
+#ifdef IPOD_VIDEO
+                  false,  /* bcm overlay v141: off -- starting with Hold on wiped every setting (theme too) */
+#else
+                  true,
+#endif
+                  "clear settings on hold", NULL),
 #endif
 #if defined(HAVE_EROS_QN_CODEC)
     CHOICE_SETTING(0, hp_lo_select, LANG_HP_LO_SELECT, 0, "headphone lineout select",

@@ -12,6 +12,7 @@ on:
     branches: [ bcm-host ]
     paths:
       - 'tools/bcm/ipod_exfat_setup.py'
+      - 'tools/bcm/ipod_defrag.pyw'
       - '.github/workflows/exfat-setup-exe.yml'
 
 jobs:
@@ -37,3 +38,14 @@ jobs:
         with:
           name: ipod-exfat-setup-exe
           path: dist/iPod exFAT Setup.exe
+
+      # v142: iPod Defrag (tools/bcm/ipod_defrag.pyw) the same way: artifact "ipod-defrag-exe"
+      - name: Build iPod Defrag.exe
+        run: >
+          pyinstaller --onefile --windowed --uac-admin --clean
+          --name "iPod Defrag" tools/bcm/ipod_defrag.pyw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipod-defrag-exe
+          path: dist/iPod Defrag.exe

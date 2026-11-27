@@ -90,6 +90,8 @@ MENUITEM_SETTING(volume, &global_status.volume, NULL);
 MENUITEM_SETTING(volume_limit, &global_settings.volume_limit, volume_limit_callback);
 #ifdef IPOD_VIDEO
 MENUITEM_SETTING(start_volume, &global_settings.start_volume, NULL);   /* bcm overlay v138 */
+MENUITEM_SETTING(dock_line_out, &global_settings.dock_line_out, NULL);   /* bcm overlay v142 */
+MENUITEM_SETTING(line_out_gain, &global_settings.line_out_gain, NULL);   /* bcm overlay v142 */
 #endif
 #ifdef AUDIOHW_HAVE_BASS
 MENUITEM_SETTING(bass, &global_settings.bass,
@@ -262,6 +264,7 @@ MAKE_MENU(sound_settings, ID2P(LANG_SOUND_SETTINGS), NULL, Icon_Audio,
           ,&volume_limit
 #ifdef IPOD_VIDEO
           ,&start_volume
+          ,&dock_line_out, &line_out_gain
 #endif
 #ifdef AUDIOHW_HAVE_BASS
           ,&bass

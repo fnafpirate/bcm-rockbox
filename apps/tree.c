@@ -769,6 +769,12 @@ static int dirbrowse(void)
         keyclick_set_callback(gui_synclist_keyclick_callback, &tree_lists);
         button = get_action(CONTEXT_TREE|ALLOW_SOFTLOCK,
                             list_do_action_timeout(&tree_lists, HZ/2));
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+        {   /* bcm overlay v141: Keep VideoCore Ready starts once a video folder has been left alone for 1.5 s */
+            extern void bcm_video_folder_idle(int action);
+            bcm_video_folder_idle(button);
+        }
+#endif
         oldbutton = button;
         gui_synclist_do_button(&tree_lists, &button);
         tc.selected_item = gui_synclist_get_sel_pos(&tree_lists);

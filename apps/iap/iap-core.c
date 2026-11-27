@@ -23,6 +23,10 @@
 #include "panic.h"
 #include "iap-core.h"
 #include "iap-lingo.h"
+#ifdef IPOD_VIDEO
+#include "bcm_dock.h"
+void (*iap_rx_hook)(const unsigned char *pkt, int len);   /* bcm overlay v142 */
+#endif
 #include "button.h"
 #include "config.h"
 #include "cpu.h"
@@ -1472,6 +1476,9 @@ void iap_handlepkt(void)
 
         if (length != 0) {
             unsigned char mode = *(iap_rxstart+2);
+#ifdef IPOD_VIDEO
+            if (iap_rx_hook) iap_rx_hook(iap_rxstart+2, length);   /* bcm overlay v142: Dock & Bluetooth Test */
+#endif
             switch (mode) {
             case 0: iap_handlepkt_mode0(length, iap_rxstart+2); break;
 #ifdef HAVE_LINE_REC
