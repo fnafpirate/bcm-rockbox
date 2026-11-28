@@ -2652,7 +2652,8 @@ def http_get(urls, log=print, timeout=30):
     raise RuntimeError('could not download (%s)' % last)
 
 # ---- 1.16: own folder, built-in files, GitHub releases ----------------------------------------------------------------
-RELEASE_REPO = 'fnafpirate/bcm-rockbox'      # where the releases are (Settings: settings.json "repo" overrides it)
+RELEASE_REPO = 'fnafpirate/rockbox-with-video'   # where the releases are; a release build stamps its own repo here
+                                               # (settings.json "repo" overrides it)
 _DATA = None
 
 def _real_home():
