@@ -33,9 +33,9 @@ fork is not an official Rockbox release, and problems with it should not be repo
 ## Apple's software
 
 This repository and its releases contain **no Apple software**.  The iPod's video chip needs Apple's VideoCore
-firmware files, which are part of Apple's iPod software update.  The setup tool downloads that update from Apple's
-own server on the user's computer (found through the public firmware list on The Apple Wiki), checks it against
-the known checksum, and copies the needed files to the user's own iPod.  Apple's software remains subject to Apple's
+firmware files, which are part of Apple's iPod software update (an `.ipsw` file).  The setup tool downloads that file
+on the user's computer through the firmware list on The Apple Wiki (a community wiki that is not run by Apple), checks
+it against the SHA-1 checksum of Apple's original, and copies the needed files to the user's own iPod.  Apple's software remains subject to Apple's
 license terms; use it only with an iPod you own.
 
 The way Rockbox talks to the VideoCore was worked out by studying how the hardware behaves, so that independently

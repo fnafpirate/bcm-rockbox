@@ -1,30 +1,27 @@
-# bcm overlay v145: publishes ONLY the newest version to the public repository -- no history.
+# bcm overlay v146: publishes ONLY the newest version to the public repository -- no history.
 #
-# Your own repository (this one) stays private and keeps every commit.  This workflow copies the current files
-# (minus what .publicignore lists) into the public repository as ONE new commit that replaces everything there,
-# tags it with the version, and that tag makes the public repository build and publish the release
-# (.github/workflows/release.yml runs there).  The public repository's release step then deletes the older
-# releases, so only the newest one can be downloaded.
+# This (dev) repository keeps every commit.  This workflow copies the current files (minus what .publicignore lists)
+# into the public repository as ONE new commit that replaces everything there, tags it with the public version, and
+# that tag makes the public repository build and publish the release (.github/workflows/release.yml runs there).
+# The release step there then deletes the older releases, so only the newest one can be downloaded.
 #
-# One-time setup (see the going-public guide):
-#   1. a new empty PUBLIC repository, e.g. fnafpirate/bcm-rockbox (rename this private one first, e.g. to
-#      bcm-rockbox-dev, so the public one can have the short name the formatter looks for)
-#   2. a fine-grained token: github.com -> Settings -> Developer settings -> Fine-grained tokens -> Generate:
-#      Repository access = only the public repository; Permissions: Contents = Read and write,
-#      Workflows = Read and write; any expiry you like
-#   3. in THIS repository: Settings -> Secrets and variables -> Actions:
-#        New repository secret   PUBLIC_REPO_TOKEN = the token
-#        Variables tab: New repository variable   PUBLIC_REPO = fnafpirate/bcm-rockbox
+# One-time setup (done):
+#   dev repository     fnafpirate/bcm-rockbox-dev  (this one; work branch bcm-host)
+#   public repository  fnafpirate/rockbox-with-video
+#   Settings -> Secrets and variables -> Actions here:
+#     secret    PUBLIC_REPO_TOKEN = fine-grained token, only the public repository, Contents + Workflows read/write
+#     variable  PUBLIC_REPO       = fnafpirate/rockbox-with-video
 #
-# Use: Actions -> "Publish to public repo" -> Run workflow -> version (e.g. v145)
-#   or, without the Actions page (works from any branch):  git tag publish-v145 && git push origin publish-v145
+# Use (works from any branch):  git tag publish-v1 && git push origin publish-v1   (next time publish-v2, ...)
+# Public releases count on their own: v1, v2, ...  The dev build they come from ("bcm host test vNNN") is named in
+# the commit message.  The commit is made in your name (the account that pushed the tag), not by a bot.
 name: Publish to public repo
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version, e.g. v145'
+        description: 'Public version, e.g. v1'
         required: true
   push:
     tags: [ 'publish-v*' ]
@@ -40,13 +37,16 @@ jobs:
           VER: ${{ github.event.inputs.version || github.ref_name }}
           TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
           REPO: ${{ vars.PUBLIC_REPO }}
+          WHO: ${{ github.actor }}
+          WHO_ID: ${{ github.actor_id }}
         run: |
           set -e
           VER="${VER#publish-}"
           if [ -z "$TOKEN" ] || [ -z "$REPO" ]; then
             echo "::error::Set the secret PUBLIC_REPO_TOKEN and the variable PUBLIC_REPO first (see the top of this file)"; exit 1
           fi
-          case "$VER" in v[0-9]*) ;; *) echo "::error::version must look like v145"; exit 1;; esac
+          case "$VER" in v[0-9]*) ;; *) echo "::error::version must look like v1"; exit 1;; esac
+          DEV=$(grep -o -m1 'bcm host test v[0-9]*' apps/debug_menu.c | sed 's/bcm host test //')
           mkdir -p "$RUNNER_TEMP/pub"
           git archive HEAD | tar -x -C "$RUNNER_TEMP/pub"
           # leave out what .publicignore lists (one path or glob per line, # = comment)
@@ -65,13 +65,13 @@ jobs:
           PY
           cd "$RUNNER_TEMP/pub"
           git init -q -b main
-          git config user.name "bcm-rockbox"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "$WHO"
+          git config user.email "${WHO_ID}+${WHO}@users.noreply.github.com"
           git add -A
-          git commit -q -m "bcm-rockbox $VER"
+          git commit -q -m "bcm-rockbox $VER" -m "Built from dev $DEV (bcm-rockbox-dev, branch bcm-host)."
           git tag -a "$VER" -m "bcm-rockbox $VER"
           URL="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
           git push -q --force "$URL" main
           git push -q --force "$URL" "refs/tags/$VER"
-          echo "### Published $VER to https://github.com/$REPO" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Published $VER (dev $DEV) to https://github.com/$REPO" >> "$GITHUB_STEP_SUMMARY"
           echo "The release builds there now: https://github.com/$REPO/actions" >> "$GITHUB_STEP_SUMMARY"

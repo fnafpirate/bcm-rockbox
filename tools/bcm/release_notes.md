@@ -1,15 +1,16 @@
-## bcm-rockbox v145
+## bcm-rockbox v1
 
-First public release.  Rockbox for the iPod Video (5G / 5.5G) with hardware video playback on the iPod's VideoCore
-chip, TV out and exFAT drives of any size.
+The first public release.  Rockbox for the iPod Video (5G / 5.5G) that plays video on the iPod's own video chip,
+sends video and menus to a TV, and runs on exFAT drives of any size.
 
-**New in v145**
-* iPod exFAT Setup 1.16 works from anywhere: its files live in `C:\bcm rockbox` (Mac / Linux: `~/bcm rockbox`), the
-  .exe carries the Rockbox build and bootloader inside, and it checks this page for updates.
-* *Update Rockbox on iPod*: installs a newer release on a Rockbox iPod without formatting (settings, music and video
-  files stay).
-* Everything from v144: TV screensaver, display rescue (MENU three times), sleep fade, exact Opus seeking, Battery Load
-  Check, series view, faster start, exFAT "dirty" mark only while writing, and more.
+**What's in it**
+* Hardware H.264 / MPEG-4 video (.mp4 / .m4v) up to 640x480, including Main / High profile (CABAC) files, with
+  seeking, subtitles (.srt / .vtt / .ass next to the video), sleep and continue-where-you-left-off.
+* TV out (composite, NTSC / PAL), a TV File Browser that shows your video folders on the TV, a TV screensaver.
+* exFAT support for big iFlash / SD / CF cards, and **iPod exFAT Setup**: formats and sets up the iPod in one step,
+  fetches Apple's firmware file for the video chip for you, and updates Rockbox later without formatting.
+* A steadier battery reading that can learn your battery (Learn Battery), dock and remote control of videos, and
+  more -- see the [User Guide](../../blob/HEAD/GUIDE.md).
 
-**Which file do I need?**  Windows 10 / 11: `iPod-exFAT-Setup-win64.exe` -- Windows 7 / 8: `-win32.exe` -- Mac:
-`-mac-arm64.zip` (Apple silicon) or `-mac-intel.zip` -- anything with Python 3.8+: `ipod_exfat_setup.py`.
+**Which file do I need?**  Windows 10 / 11: `iPod-exFAT-Setup-win64.exe` -- Windows 7 / 8: `iPod-exFAT-Setup-win32.exe`
+-- Linux: `ipod_exfat_setup.py` (Python 3.8+, run with sudo).  Mac is not supported.

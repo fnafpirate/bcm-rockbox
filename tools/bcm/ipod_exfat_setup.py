@@ -8,7 +8,7 @@ What it does (after a full backup of the boot area):
      OS image in it with the Rockbox bootloader only (like ipodpatcher -wf)
   2. replaces the data partition with one standard exFAT partition (type
      0x07) filling the rest of the disk -- no 2 TB / 4 GB limits, opens on
-     any Windows / macOS / Linux PC
+     any Windows / macOS / Linux PC (the tool itself runs on Windows and Linux)
   3. installs Rockbox (rockbox.zip) on it, plus your old settings, themes,
      fonts and VideoCore files from the current /.rockbox
   4. reads everything back and checks it
@@ -84,14 +84,14 @@ partition is 2 MB (was 32 MB on a new drive, Apple's size on a converted iPod): 
 directory and the bootloader (~1.1 MB with room for a bigger bootloader); Apple's other images stay in the backup.
 --itunes-fw keeps the old sizes.  Can be built into a Windows .exe (no Python needed): see build_exe.txt.
 
-1.15 (bcm overlay v144): no .ipsw?  "Download" fetches Apple's firmware package for the iPod's model from the list
-at theapplewiki.com (Firmware/iPod) -- iPod_25.1.3.ipsw for a 5.5G, iPod_20.1.3.ipsw for a 5G -- and keeps it only if
-its size and SHA-1 match the known file.  Copying reads the next file while the last one is written (two threads).
+1.15 (bcm overlay v144): no .ipsw?  "Download" finds Apple's firmware package for the iPod's model through the list
+on The Apple Wiki (theapplewiki.com/wiki/Firmware/iPod, a community wiki, not Apple) -- iPod_25.1.3.ipsw for a 5.5G,
+iPod_20.1.3.ipsw for a 5G -- downloads it and keeps it only if its SHA-1 matches the known file.  Copying reads the next file while the last one is written (two threads).
 Quick format first tells the drive the whole partition is free (TRIM) where the drive and the connection support it
-(an iPod's own USB mode does not; most card readers do not either; it is skipped then).  Runs on macOS and Linux too
-(as root: sudo; see "Start iPod exFAT Setup.command").
+(an iPod's own USB mode does not; most card readers do not either; it is skipped then).  Runs on Linux too (as root:
+sudo).
 
-1.16 (bcm overlay v145): works from anywhere.  Its own folder is C:\bcm rockbox (macOS / Linux: "bcm rockbox" in your
+1.16 (bcm overlay v145): works from anywhere.  Its own folder is C:\bcm rockbox (Linux: "bcm rockbox" in your
 home folder): the Rockbox build, the bootloader, downloaded .ipsw files, backups and logs live there.  The .exe
 carries the Rockbox build and the bootloader inside and puts them there at the first start, so the .exe alone is
 enough.  "Check for updates" asks the project's GitHub releases for a newer iPod exFAT Setup (downloads it, checks its
@@ -99,11 +99,14 @@ SHA-256, swaps itself and restarts) and a newer Rockbox build -- only while the 
 opened ("Check when opened", can be turned off) or on the button; nothing runs in the background; "Update Rockbox on iPod" puts the newest build on a
 connected Rockbox iPod without formatting (settings, themes, music and the video files stay; rockbox.ipod is written
 last, under a temporary name, so an unplugged cable cannot leave half of it).
+
+1.17 (bcm overlay v146): macOS is no longer supported (Windows and Linux).  Public releases are numbered v1, v2, ...;
+a build that did not come from a release says "dev" and is always offered the newest release.
 """
 import base64, datetime, hashlib, io, json, os, queue, re, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.16'
-BCM_VERSION = 'v145'                      # the bcm overlay this copy came with
+VERSION = '1.17'
+BCM_VERSION = 'dev'                       # the public release this copy came with (release builds stamp it)
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -813,7 +816,7 @@ else:
 
     # 1.15: macOS / Linux.  Disks are numbered in the order disk_paths() lists them; needs root (sudo).
     import subprocess
-    MAC = sys.platform == 'darwin'
+    MAC = False        # 1.17: macOS support dropped (the code paths below stay unused)
     BUS_NAMES = {}
 
     def disk_paths():
@@ -2735,7 +2738,9 @@ def settings_save(d):
         pass
 
 def ver_tuple(v):
-    """'v145' / '1.16' / 'bcm host: v144' -> (145,) / (1, 16) / (144,); () = unknown"""
+    """'v2' / '1.16' -> (2,) / (1, 16); () = unknown or a dev build (always older than any release)"""
+    if not v or 'dev' in v.lower():
+        return ()
     m = re.search(r'(\d+(?:\.\d+)*)', v or '')
     return tuple(int(x) for x in m.group(1).split('.')) if m else ()
 
@@ -3824,10 +3829,11 @@ def main2():
                                      'to disks.  Start it again and answer "Yes" when Windows asks.')
                 w.destroy()
             return
-        if os.name != 'nt' and not is_admin():          # 1.15: macOS / Linux
-            msg = ('iPod exFAT Setup needs root rights to write to disks.  Start it with\n\n  sudo "%s"\n\n(or double-'
-                   'click "Start iPod exFAT Setup.command").' % (sys.executable if getattr(sys, 'frozen', False)
-                                                                else os.path.abspath(sys.argv[0])))
+        if sys.platform == 'darwin':                    # 1.17
+            sys.exit('iPod exFAT Setup runs on Windows and Linux only (macOS support was dropped).')
+        if os.name != 'nt' and not is_admin():          # 1.15: Linux
+            msg = ('iPod exFAT Setup needs root rights to write to disks.  Start it with\n\n  sudo "%s"'
+                   % (sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])))
             try:
                 import tkinter as tk
                 from tkinter import messagebox

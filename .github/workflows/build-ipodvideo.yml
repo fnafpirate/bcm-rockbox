@@ -62,8 +62,10 @@ jobs:
       - name: Configure (ipodvideo, normal build)
         run: |
           export PATH=/opt/rbdev/bin:$PATH
-          mkdir -p build
-          cd build
+          # v145: through a short path (the dependency step's single shell command must stay under 128 KB)
+          ln -sfn "$GITHUB_WORKSPACE" /tmp/r
+          mkdir -p /tmp/r/build
+          cd /tmp/r/build
           ../tools/configure --target=ipodvideo --type=n
 
       - name: Build

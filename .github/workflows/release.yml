@@ -1,33 +1,31 @@
-# bcm overlay v145: makes a public GitHub Release with everything a user needs, from this repository's own source.
+# bcm overlay v146: makes a public GitHub Release with everything a user needs, from this repository's own source.
 #
-# Start it:  github.com -> your repo -> Actions -> "Release" -> Run workflow -> branch bcm-host, version e.g. v145
-#            (or push a tag:  git tag v145 && git push origin v145)
+# Started by the tag that "Publish to public repo" (in the dev repository) pushes here: v1, v2, ...
+# (or by hand: Actions -> "Release" -> Run workflow -> version, e.g. v1)
 #
 # The release gets:
 #   rockbox-ipodvideo.zip            Rockbox for the iPod Video built here (+ .rockbox/bcm-version.txt)
 #   bootloader-ipodvideo.ipod        the bootloader (tools/bcm/, built from this repo's bootloader/ source)
 #   iPod-exFAT-Setup-win64.exe       formatter, Windows 10 / 11, with the build and bootloader inside
 #   iPod-exFAT-Setup-win32.exe       formatter, Windows 7 SP1 and later (32- and 64-bit)
-#   iPod-exFAT-Setup-mac-arm64.zip   formatter, Macs with Apple silicon
-#   iPod-exFAT-Setup-mac-intel.zip   formatter, Intel Macs
 #   iPod-Defrag-win64.exe / -win32.exe
-#   ipod_exfat_setup.py, ipod_defrag.pyw   the same tools as plain Python
+#   ipod_exfat_setup.py, ipod_defrag.pyw   the same tools as plain Python (Linux)
 #   release.json                     versions + SHA-256 of every file (the formatter's update check reads it)
 #   SHA256SUMS.txt                   the same for people
-# GitHub adds "Source code (zip / tar.gz)" of the tagged commit by itself.
-# Nothing from Apple is ever in a release: the formatter downloads Apple's firmware from Apple on the user's PC.
-# Release text: tools/bcm/release_notes.md (edit it before starting the release).
+# GitHub adds "Source code (zip / tar.gz)" of the tagged commit by itself.  Mac is not supported (v146).
+# Nothing from Apple is ever in a release: the formatter fetches Apple's .ipsw on the user's PC (found through The
+# Apple Wiki's firmware list, checked against Apple's SHA-1).
+# Release text: tools/bcm/release_notes.md + tools/bcm/release_footer.md.
 #
-# v145: runs only in a PUBLIC repository (in the private one it does nothing): "Publish to public repo" in the
-# private repository pushes the snapshot + tag, and the tag starts this.  KEEP_RELEASES = how many releases stay
-# downloadable; older ones (and their tags) are deleted once the new one is published.
+# Runs only in a PUBLIC repository.  KEEP_RELEASES = how many releases stay downloadable; older ones (and their
+# tags) are deleted once the new one is published.
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag, e.g. v145'
+        description: 'Version tag, e.g. v1'
         required: true
   push:
     tags: [ 'v*' ]
@@ -165,45 +163,8 @@ jobs:
           name: win-${{ matrix.name }}
           path: out/*
 
-  mac:
-    needs: rockbox
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: mac-arm64, runner: macos-14 }
-          - { name: mac-intel, runner: macos-13 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/download-artifact@v4
-        with:
-          name: rockbox
-      - name: Build the app
-        run: |
-          python -m pip install pyinstaller==6.11.1
-          sed -i '' "s/^BCM_VERSION = .*/BCM_VERSION = '$VER'/" tools/bcm/ipod_exfat_setup.py
-          sed -i '' "s#^RELEASE_REPO = '[^']*'#RELEASE_REPO = '$GITHUB_REPOSITORY'#" tools/bcm/ipod_exfat_setup.py
-          mkdir -p bundle
-          cp rockbox-ipodvideo.zip bundle/rockbox.zip
-          cp tools/bcm/bootloader-ipodvideo.ipod bundle/
-          pyinstaller --windowed --clean --noupx --add-data "bundle:bundle" --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
-          mkdir -p out
-          cp -R "dist/iPod exFAT Setup.app" out/
-          cp tools/bcm/start_ipod_exfat_setup.command "out/Start iPod exFAT Setup.command"
-          chmod +x "out/Start iPod exFAT Setup.command"
-          (cd out && zip -qry "../iPod-exFAT-Setup-${{ matrix.name }}.zip" .)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: iPod-exFAT-Setup-${{ matrix.name }}.zip
-
   publish:
-    needs: [ rockbox, windows, mac ]
+    needs: [ rockbox, windows ]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

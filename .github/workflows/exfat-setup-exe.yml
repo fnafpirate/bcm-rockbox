@@ -5,12 +5,10 @@
 #   - PyInstaller's start-up stub (the "bootloader") is compiled here from PyInstaller's source instead of using the
 #     pre-built one that every PyInstaller program shares (antivirus programs that once saw that stub in malware
 #     flag it everywhere); no UPX packing; a version resource (company, product, description) like any normal program
-#   - two macOS builds (Apple silicon and Intel): "iPod exFAT Setup.app" plus "Start iPod exFAT Setup.command"
 #   These lower the false alarms; only code signing (a certificate) removes SmartScreen's "unknown publisher"
 #   warning -- see build_exe.txt.
 # Runs when tools/bcm/ipod_exfat_setup.py changes on branch bcm-host, or from Actions -> "iPod exFAT Setup exe" ->
-# Run workflow.  Artifacts: ipod-exfat-setup-win64, ipod-exfat-setup-win32, ipod-exfat-setup-mac-arm64,
-# ipod-exfat-setup-mac-intel (and iPod Defrag for Windows).
+# Run workflow.  Artifacts: ipod-exfat-setup-win64, ipod-exfat-setup-win32 (and iPod Defrag for Windows).
 name: iPod exFAT Setup exe
 
 on:
@@ -102,44 +100,3 @@ jobs:
         with:
           name: ipod-defrag-${{ matrix.name }}
           path: dist/iPod Defrag.exe
-
-  mac:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: mac-arm64
-            runner: macos-14
-          - name: mac-intel
-            runner: macos-13
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install PyInstaller
-        run: python -m pip install pyinstaller==6.11.1
-
-      - name: Build the app
-        run: |
-          pyinstaller --windowed --clean --noupx --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
-          mkdir -p out
-          cp -R "dist/iPod exFAT Setup.app" out/
-          cat > "out/Start iPod exFAT Setup.command" <<'CMD'
-          #!/bin/bash
-          # Starts iPod exFAT Setup with the rights it needs to write to disks (asks for your Mac password).
-          cd "$(dirname "$0")"
-          xattr -dr com.apple.quarantine "iPod exFAT Setup.app" 2>/dev/null
-          sudo "./iPod exFAT Setup.app/Contents/MacOS/iPod exFAT Setup"
-          CMD
-          chmod +x "out/Start iPod exFAT Setup.command"
-          cd out && zip -r -y "../iPod exFAT Setup ${{ matrix.name }}.zip" .
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ipod-exfat-setup-${{ matrix.name }}
-          path: iPod exFAT Setup ${{ matrix.name }}.zip
