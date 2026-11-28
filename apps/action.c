@@ -325,6 +325,10 @@ static inline bool action_poll_button(action_last_t *last, action_cur_t *cur)
     int *button = &cur->button;
 
     *button = button_get_w_tmo(cur->timeout);
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+    if (*button == BUTTON_MENU)
+    {   extern void bcm_menu_tap(void); bcm_menu_tap(); }   /* bcm overlay v144: MENU x3 = display rescue */
+#endif
 
    /* ********************************************************
     * Can return button immediately, sys_event & multimedia

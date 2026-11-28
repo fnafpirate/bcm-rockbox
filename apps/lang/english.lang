@@ -19288,3 +19288,37 @@
     ipodvideo: "Line Out Gain"
   </voice>
 </phrase>
+<phrase>
+  id: LANG_SSD_OPTIMIZE
+  desc: bcm overlay v143: Disk: optimizations for solid-state storage (iFlash)
+  user: core
+  <source>
+    *: none
+    ipodvideo: "Optimize Solid State"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "Optimize Solid State"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "Optimize Solid State"
+  </voice>
+</phrase>
+<phrase>
+  id: LANG_TV_BROWSER
+  desc: bcm overlay v143: Video Out: the video folders browsed on the TV
+  user: core
+  <source>
+    *: none
+    ipodvideo: "TV File Browser"
+  </source>
+  <dest>
+    *: none
+    ipodvideo: "TV File Browser"
+  </dest>
+  <voice>
+    *: none
+    ipodvideo: "TV File Browser"
+  </voice>
+</phrase>

@@ -286,6 +286,7 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
     {
         extern void usb_storage_speed_save(void);
         usb_storage_speed_save();  /* bcm overlay v107: /.rockbox/usb_speed.txt */
+        {   extern void bcm_usb_tune_session(void); bcm_usb_tune_session(); }   /* bcm overlay v143: USB Speed Test */
     }
 #endif
 

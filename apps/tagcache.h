@@ -190,6 +190,9 @@ bool tagcache_modify_numeric_entry(struct tagcache_search *tcs,
 struct tagcache_stat* tagcache_get_stat(void);
 int tagcache_get_commit_step(void);
 bool tagcache_prepare_shutdown(void);
+#ifdef IPOD_VIDEO
+void tagcache_mark_unchanged(void);   /* bcm overlay v144 */
+#endif
 void tagcache_shutdown(void);
 void tagcache_remove_statefile(void);
 

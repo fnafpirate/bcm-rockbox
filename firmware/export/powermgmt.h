@@ -147,6 +147,7 @@ void battery_set_reading(int mode);   /* v92: 0 balanced, 1 smooth, 2 exact */
 void powermgmt_set_load_hint(int load, bool on);   /* load 3 = the video decoder (BCM) */
 void battery_smooth_info(struct battery_smooth_info *i);
 void battery_set_learned_curve(const unsigned short *mv);   /* v138 */
+void battery_set_video_sag(int mv);   /* v144: Battery Load Check: the video's drop for this kind of video (mV) */
 #endif
 int battery_time(void); /* minutes */
 int battery_voltage(void); /* filtered batt. voltage in millivolts */

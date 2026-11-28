@@ -771,13 +771,16 @@ static int dirbrowse(void)
                             list_do_action_timeout(&tree_lists, HZ/2));
 #if defined(IPOD_VIDEO) && !defined(SIMULATOR)
         {   /* bcm overlay v141: Keep VideoCore Ready starts once a video folder has been left alone for 1.5 s */
-            extern void bcm_video_folder_idle(int action);
-            bcm_video_folder_idle(button);
+            extern int bcm_video_folder_idle(int action);
+            button = bcm_video_folder_idle(button);   /* v143: may swallow a MENU (TV File Browser) */
         }
 #endif
         oldbutton = button;
         gui_synclist_do_button(&tree_lists, &button);
         tc.selected_item = gui_synclist_get_sel_pos(&tree_lists);
+#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
+        {   extern void bcm_tv_browser_tree(void); bcm_tv_browser_tree(); }   /* bcm overlay v143: the list on the TV */
+#endif
         int customaction = ONPLAY_NO_CUSTOMACTION;
         bool do_restore_display = true;
         #ifdef HAVE_TAGCACHE

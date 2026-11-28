@@ -137,7 +137,26 @@ static int strnatcmp0(char const *a, char const *b,
 
           /* process run of digits */
           if (nat_isdigit(ca)  &&  nat_isdigit(cb)) {
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+               /* bcm overlay v144: leading zeros do not change a number ("Pokemon 010" after "Pokemon 9"; stock
+                  compared every number starting with 0 as a decimal fraction, so 010 came first).  Fractions only
+                  right after a digit and a '.' ("1.05" < "1.5"). */
+               fractional = (ai > 1 && bi > 1 && a[ai-1] == '.' && b[bi-1] == '.' &&
+                             nat_isdigit(to_int(a[ai-2])) && nat_isdigit(to_int(b[bi-2])));
+               if (!fractional) {
+                    int za = 0, zb = 0;
+                    while (a[ai+za] == '0' && nat_isdigit(to_int(a[ai+za+1]))) za++;
+                    while (b[bi+zb] == '0' && nat_isdigit(to_int(b[bi+zb+1]))) zb++;
+                    if ((result = compare_right(a+ai+za, b+bi+zb)) != 0)
+                         return result;
+                    /* the same value: past both numbers (the same length once the zeros are skipped) */
+                    ai += za; bi += zb;
+                    while (nat_isdigit(to_int(a[ai])) && nat_isdigit(to_int(b[bi]))) { ai++; bi++; }
+                    continue;
+               }
+#else
                fractional = (ca == '0' || cb == '0');
+#endif
 
                if (fractional) {
                     if ((result = compare_left(a+ai, b+bi)) != 0)

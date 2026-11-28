@@ -446,6 +446,9 @@ static bool clean_shutdown(enum shutdown_type sd_type,
 #endif
 
             system_flush();
+#if defined(IPOD_VIDEO) && defined(HAVE_TAGCACHE)
+            tagcache_mark_unchanged();   /* bcm overlay v144: the next start may skip the drive walk */
+#endif
 #ifdef HAVE_EEPROM_SETTINGS
             if (firmware_settings.initialized)
             {

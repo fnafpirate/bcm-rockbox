@@ -394,6 +394,24 @@ file_error:;
     return rc;
 }
 
+#if defined(IPOD_VIDEO) && (CONFIG_PLATFORM & PLATFORM_NATIVE) && !defined(BOOTLOADER)
+/* bcm overlay v144: exFAT's "dirty" mark only while something is being written.  v67 cleared it at USB connect and at
+   a clean shutdown, so a crash or a forced restart (MENU+SELECT) at any time left the volume "dirty" and the PC asked
+   to check it.  Now it is cleared (everything flushed first) whenever the last file open for writing is closed and
+   after a remove / rename; the next write marks it again.  A crash leaves it set only in the middle of a write.
+   Call with the WRITER lock held. */
+static void clean_if_no_writers(void)
+{
+    for (unsigned int i = 0; i < MAX_OPEN_FILES; i++)
+        if ((open_streams[i].stream.flags & (FDO_BUSY | FD_WRITE)) == (FDO_BUSY | FD_WRITE))
+            return;
+    fat_mark_clean();
+}
+#define CLEAN_IF_NO_WRITERS() clean_if_no_writers()
+#else
+#define CLEAN_IF_NO_WRITERS() do { } while (0)
+#endif
+
 /* finish with the file and free resources */
 static int close_internal(struct filestr_desc *file)
 {
@@ -936,9 +954,12 @@ int rbfs_close(int fildes)
         FILE_ERROR(EBADF, -2);
     }
 
+    bool was_writer = (file->stream.flags & (FD_WRITE | FD_NONEXIST)) == FD_WRITE;
     rc = close_internal(file);
     if (rc < 0)
         FILE_ERROR(ERRNO, rc * 10 - 3);
+    if (was_writer)
+        CLEAN_IF_NO_WRITERS();
 
 file_error:
     file_internal_unlock_WRITER();
@@ -1103,6 +1124,8 @@ int rbfs_remove(const char *path)
 
     file_internal_lock_WRITER();
     int rc = remove_stream_internal(path, NULL, FF_FILE);
+    if (rc >= 0)
+        CLEAN_IF_NO_WRITERS();
     file_internal_unlock_WRITER();
     return rc;
 }
@@ -1248,6 +1271,8 @@ file_error:
             rc = rc2 * 10 - 9;
         }
     }
+    if (rc >= 0)
+        CLEAN_IF_NO_WRITERS();
 
     file_internal_unlock_WRITER();
     return rc;
@@ -1409,3 +1434,18 @@ bool rbfs_file_exists(const char *path)
     file_internal_unlock_WRITER();
     return rc;
 }
+
+#ifndef BOOTLOADER
+/* bcm overlay v144: Debug > Fragmentation: the pieces of an open file on the drive */
+long file_fragments(int fildes, unsigned long *clusters)
+{
+    long rc = -1;
+    struct filestr_desc * const file = GET_FILESTR(READER, fildes);
+    *clusters = 0;
+    if (!file)
+        return -1;
+    rc = fat_file_fragments(file->stream.fatstr.fatfilep, clusters);
+    RELEASE_FILESTR(READER, file);
+    return rc;
+}
+#endif

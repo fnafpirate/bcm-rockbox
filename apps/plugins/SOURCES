@@ -214,6 +214,9 @@ superdom.c
 
 
 
+#if defined(IPOD_VIDEO) && !defined(HAVE_TEST_PLUGINS)
+test_codec.c   /* bcm overlay v144: System > Debug > Codec A/B measures with it */
+#endif
 #ifdef HAVE_TEST_PLUGINS /* enable in advanced build options */
 #ifdef HAVE_ADJUSTABLE_CPU_FREQ
 test_boost.c

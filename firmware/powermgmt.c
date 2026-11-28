@@ -253,6 +253,15 @@ void battery_smooth_info(struct battery_smooth_info *i)
     i->loads = bsm.cls;
     for (k = 0; k < 4; k++) { i->sag_mv[k] = bsm.sag[k]; i->measured[k] = bsm.learned[k]; }
 }
+/* bcm v144: Battery Load Check: the drop measured for this kind of video (size, CABAC, TV) replaces the guess.  It
+   counts as three measurements, so the drop measured at the video's own start (30 s in) moves it by a quarter only. */
+void battery_set_video_sag(int mv)
+{
+    if (mv < 0 || mv > BSM_SAG_MAX) return;
+    bsm.meas[BSM_VIDEO] = (int16_t)mv;
+    if (bsm.learned[BSM_VIDEO] < 3) bsm.learned[BSM_VIDEO] = 3;
+    bsm_update_sags(&bsm);
+}
 /* bcm v138: Learn Battery: use a learned discharge curve now (it is also written to battery_levels.cfg for the next
    start) */
 void battery_set_learned_curve(const unsigned short *mv)

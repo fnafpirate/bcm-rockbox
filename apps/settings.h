@@ -541,6 +541,9 @@ struct user_settings
     int disk_spindown; /* time until disk spindown, in seconds (0=off) */
 #if (CONFIG_STORAGE & STORAGE_ATA) && defined(HAVE_ATA_POWER_OFF)
     int ssd_poweroff;  /* SSD power-off delay after standby, seconds (0 = never) */
+#ifdef IPOD_VIDEO
+    bool ssd_optimize; /* bcm v143: Optimize Solid State (set once at the first start from what the drive is) */
+#endif
 #endif
     int buffer_margin; /* audio buffer watermark margin, in seconds */
 #endif
@@ -765,6 +768,7 @@ struct user_settings
     int bcm_tv_signal;   /* 0 NTSC, 1 PAL */
     int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
     bool bcm_tv_wide;    /* the TV is 16:9 (stock "Widescreen") */
+    bool bcm_tv_browser; /* bcm v143: TV File Browser: the video folders on the TV at 640 x 480 */
     int battery_reading; /* v92: 0 balanced (default), 1 smooth (stock-like), 2 exact (Rockbox) */
     bool bcm_subs;       /* bcm overlay v73: video subtitles shown when the video has some */
     int bcm_sub_size;    /* 0 small, 1 medium, 2 large */

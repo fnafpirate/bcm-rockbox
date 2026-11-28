@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""iPod Defrag 1.0 (bcm overlay v142) -- finds and fixes fragmented files on an exFAT iPod.
+"""iPod Defrag 1.1 (bcm overlay v144) -- finds and fixes fragmented files on an exFAT iPod.
 
 Windows' own Defragment tool does not do exFAT.  This reads the iPod's exFAT file system directly, lists every file and
 folder that is in more than one piece, and moves each one into a single run of free clusters.  If no free run is big
@@ -16,12 +16,19 @@ Command line:
     ipod_defrag.pyw --scan E:          (Windows drive letter)      list what is fragmented
     ipod_defrag.pyw --defrag E: --yes                               fix it
     ipod_defrag.pyw --scan /dev/sdb2   (Linux / macOS: the unmounted partition, or an image file)
+    ipod_defrag.pyw --check E: [--fix --yes]                       check the volume (and repair it)
 Options: --no-verify (skip reading every copy back), --no-pack (never move unfragmented files),
          --files-only (leave folders alone), --full (pack every file to the start: free space in one piece)
+
+1.1: "Check & fix".  A volume marked dirty (the iPod lost power, crashed or was unplugged while writing) could only be
+defragmented after Windows' "Check" / chkdsk.  The check here goes through every file and folder: clusters marked used
+that no file owns (what an interrupted write leaves) are given back, clusters a file owns that are marked free are
+marked used, and the dirty mark is cleared.  It repairs nothing else: a damaged directory entry, a cluster owned by two
+files or a broken cluster chain stop it (then chkdsk /f is the right tool).
 """
 import os, sys, struct, time, bisect, threading
 
-VERSION = '1.0'
+VERSION = '1.1'
 APP = 'iPod Defrag'
 
 def log_path():
@@ -261,6 +268,7 @@ class Volume:
         self.items = []
         self.bitmap = None
         self.fixed = set()          # clusters that never move: root folder, bitmap, up-case table
+        self.problems = []          # 1.1: what the scan could not read cleanly (the check refuses to repair then)
         self.scan()
 
     # -- clusters
@@ -338,6 +346,7 @@ class Volume:
             ents = data[o:o + 32 * (sec + 1)]
             if set_checksum(ents) != le16(ents, 2) or ents[32] != 0xC0:
                 self.log('  skipped a damaged entry in %s/ (run chkdsk)' % prefix)
+                self.problems.append('a damaged entry in %s/' % prefix)
                 o += 32 * (sec + 1)
                 continue
             attr = le16(ents, 4)
@@ -361,6 +370,7 @@ class Volume:
             it.clusters = self.chain(it.first, it.nofat, it.size) if ents[st + 1] & 1 else []
             if not it.nofat and it.size and len(it.clusters) * self.cs < it.size:
                 self.log('  %s: its cluster chain is shorter than its size (run chkdsk) -- left alone' % it.path)
+                self.problems.append('%s: cluster chain shorter than the file' % it.path)
                 it.clusters = []
             self.items.append(it)
             if it.is_dir and it.clusters:
@@ -420,6 +430,57 @@ class Volume:
         struct.pack_into('<H', vbr, 0x6A, f)
         self.dev.write(0, bytes(vbr))
         self.dev.flush()
+
+    def check(self, fix=False):
+        """1.1: compare the allocation bitmap with what the files and folders own.  Returns (leaked, unmarked, errors);
+        fix=True gives the leaked clusters back, marks the unmarked ones used and clears the dirty mark -- only when
+        there are no errors."""
+        owner = bytearray(self.nclus + 2)          # 0 free, 1 owned once, 2 owned twice or more
+        errors = list(self.problems)
+
+        def own(clusters, what):
+            for c in clusters:
+                if not 2 <= c < self.nclus + 2:
+                    errors.append('%s points outside the volume (cluster %d)' % (what, c))
+                    return
+                if owner[c]:
+                    if owner[c] == 1:
+                        errors.append('cluster %d belongs to two files (one is %s)' % (c, what))
+                    owner[c] = 2
+                else:
+                    owner[c] = 1
+        own(sorted(self.fixed), 'the root folder / bitmap / up-case table')
+        for it in self.items:
+            own(it.clusters, it.path)
+        leaked, unmarked = [], []
+        for c in range(2, self.nclus + 2):
+            used = self.is_used(c)
+            if used and not owner[c]:
+                leaked.append(c)
+            elif owner[c] and not used:
+                unmarked.append(c)
+        self.log('check: %d files and folders; %s; %s; %s' % (
+            len(self.items),
+            '%d clusters marked used but owned by nothing (%s)' % (len(leaked), human(len(leaked) * self.cs))
+            if leaked else 'no lost clusters',
+            '%d clusters in use but marked free' % len(unmarked) if unmarked else 'nothing in use marked free',
+            '%d problem(s)' % len(errors) if errors else 'no damage found'))
+        for e in errors[:20]:
+            self.log('  PROBLEM: %s' % e)
+        if fix:
+            if errors:
+                raise DefragError('the volume has damage this tool does not repair -- run "Check" on it in Explorer '
+                                  '(or chkdsk /f) instead')
+            if leaked:
+                self.bitmap_set(leaked, False)
+            if unmarked:
+                self.bitmap_set(unmarked, True)
+            self.dev.flush()
+            self.set_dirty(False)
+            self.dirty = False
+            self.log('fixed: %d clusters given back, %d marked used; the volume is marked clean'
+                     % (len(leaked), len(unmarked)))
+        return leaked, unmarked, errors
 
     def free_runs(self):
         """sorted [(start, length)] of the free clusters"""
@@ -856,6 +917,8 @@ def gui():
         s = var.get().strip()
         return s.split()[0] if s else ''
     def work(do_fix):
+        if do_fix == 'check':
+            return work_check()
         dev = None
         try:
             t = target()
@@ -871,7 +934,8 @@ def gui():
             frag = d.report()
             if do_fix:
                 if vol.dirty:
-                    raise DefragError('the volume is marked dirty: run "Check" on it in Explorer (or chkdsk %s /f) first' % t)
+                    raise DefragError('the volume is marked dirty: press "Check & fix" first (or run "Check" on it in '
+                                      'Explorer / chkdsk %s /f)' % t)
                 if not frag and not v_full.get():
                     log('nothing to do')
                 else:
@@ -885,12 +949,47 @@ def gui():
             if dev:
                 dev.close()
             state['job'] = None
-            w.after(0, lambda: [b.configure(state='normal') for b in (b_scan, b_fix)])
+            w.after(0, lambda: [b.configure(state='normal') for b in (b_scan, b_fix, b_chk)])
+    def work_check():
+        dev = None
+        try:
+            t = target()
+            if not t:
+                raise DefragError('no exFAT drive found -- connect the iPod (Rockbox: USB mode)')
+            log('---- %s %s %s: check %s' % (APP, VERSION, time.strftime('%Y-%m-%d %H:%M'), t))
+            dev = open_dev(t, True)
+            dev.lock()
+            vol = Volume(dev, log)
+            leaked, unmarked, errors = vol.check(False)
+            if errors:
+                log('not repaired: run "Check" on the drive in Explorer (or chkdsk %s /f)' % t)
+            elif leaked or unmarked or vol.dirty:
+                vol.check(True)
+            else:
+                log('nothing to fix')
+        except DefragError as ex:
+            log('ERROR: %s' % ex)
+        except Exception as ex:
+            import traceback
+            log('ERROR: %s\n%s' % (ex, traceback.format_exc()))
+        finally:
+            if dev:
+                dev.close()
+            w.after(0, lambda: [b.configure(state='normal') for b in (b_scan, b_fix, b_chk)])
+
     def start(do_fix):
+        if do_fix == 'check':
+            if not messagebox.askyesno(APP, 'Check %s and repair lost space / the dirty mark?\n\nThe drive is locked '
+                                       'for a minute or two; do not unplug the iPod.' % target()):
+                return
+            for b in (b_scan, b_fix, b_chk):
+                b.configure(state='disabled')
+            threading.Thread(target=work, args=('check',), daemon=True).start()
+            return
         if do_fix and not messagebox.askyesno(APP, 'Defragment %s now?\n\nThe drive is locked while this runs; do not '
                                               'unplug the iPod.  Large moves take a while (about 1 minute per GB).' % target()):
             return
-        for b in (b_scan, b_fix):
+        for b in (b_scan, b_fix, b_chk):
             b.configure(state='disabled')
         threading.Thread(target=work, args=(do_fix,), daemon=True).start()
     def stop():
@@ -899,6 +998,8 @@ def gui():
             log('stopping after the current file ...')
     b_scan = ttk.Button(btns, text='Scan', command=lambda: start(False)); b_scan.pack(side='left')
     b_fix = ttk.Button(btns, text='Defragment', command=lambda: start(True)); b_fix.pack(side='left', padx=8)
+    b_chk = ttk.Button(btns, text='Check & fix', command=lambda: start('check'))
+    b_chk.pack(side='left', padx=(0, 8))
     ttk.Button(btns, text='Stop', command=stop).pack(side='left')
     if not drives:
         log('No exFAT drive found.  Connect the iPod (in Rockbox: USB mode) and restart this tool.')
@@ -922,6 +1023,24 @@ def main():
         return gui()
     def opt(name):
         return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else None
+    if '--check' in a:
+        target = opt('--check')
+        fix = '--fix' in a
+        if fix and '--yes' not in a:
+            sys.exit('add --yes to really repair')
+        dev = open_dev(target, fix)
+        try:
+            if fix:
+                dev.lock()
+            vol = Volume(dev, print)
+            leaked, unmarked, errors = vol.check(False)
+            if fix and (leaked or unmarked or vol.dirty) and not errors:
+                vol.check(True)
+            sys.exit(1 if errors else 0)
+        except DefragError as ex:
+            sys.exit('ERROR: %s' % ex)
+        finally:
+            dev.close()
     target = opt('--scan') or opt('--defrag')
     if not target:
         sys.exit(__doc__)

@@ -302,6 +302,9 @@ MENUITEM_SETTING(disk_spindown, &global_settings.disk_spindown, NULL);
 #if (CONFIG_STORAGE & STORAGE_ATA) && defined(HAVE_ATA_POWER_OFF)
 MENUITEM_SETTING(ssd_poweroff, &global_settings.ssd_poweroff, NULL);
 #endif
+#ifdef IPOD_VIDEO
+MENUITEM_SETTING(ssd_optimize, &global_settings.ssd_optimize, NULL);   /* bcm overlay v143 */
+#endif
 #ifdef HAVE_DIRCACHE
 static int dircache_callback(int action,
                              const struct menu_item_ex *this_item,
@@ -334,6 +337,9 @@ MAKE_MENU(disk_menu, ID2P(LANG_DISK_MENU), 0, Icon_NOICON,
 #endif
 #if (CONFIG_STORAGE & STORAGE_ATA) && defined(HAVE_ATA_POWER_OFF)
           &ssd_poweroff,
+#endif
+#ifdef IPOD_VIDEO
+          &ssd_optimize,
 #endif
 #ifdef HAVE_DIRCACHE
             &dircache,
@@ -881,8 +887,9 @@ MENUITEM_SETTING(bcm_video_out_item, &global_settings.bcm_video_out, NULL);
 MENUITEM_SETTING(bcm_tv_signal_item, &global_settings.bcm_tv_signal, NULL);
 MENUITEM_SETTING(bcm_tv_picture_item, &global_settings.bcm_tv_picture, NULL);
 MENUITEM_SETTING(bcm_tv_wide_item, &global_settings.bcm_tv_wide, NULL);
+MENUITEM_SETTING(bcm_tv_browser_item, &global_settings.bcm_tv_browser, NULL);   /* v143 */
 MAKE_MENU(video_out_menu, ID2P(LANG_VIDEO_OUT), 0, Icon_Display_menu,
-          &bcm_video_out_item, &bcm_tv_signal_item, &bcm_tv_wide_item, &bcm_tv_picture_item);
+          &bcm_video_out_item, &bcm_tv_browser_item, &bcm_tv_signal_item, &bcm_tv_wide_item, &bcm_tv_picture_item);
 /* bcm overlay v73: video subtitles */
 MENUITEM_SETTING(bcm_subs_item, &global_settings.bcm_subs, NULL);
 MENUITEM_SETTING(bcm_sub_size_item, &global_settings.bcm_sub_size, NULL);

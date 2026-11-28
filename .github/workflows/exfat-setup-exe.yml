@@ -1,9 +1,16 @@
 # bcm overlay v138: builds "iPod exFAT Setup.exe" (no Python needed on the PC) on GitHub's Windows runner.
+# v144 (exFAT Setup 1.15):
+#   - two Windows builds: "win64" (Python 3.12, Windows 10 / 11) and "win32" (Python 3.8, 32-bit: Windows 7 SP1, 8,
+#     8.1, 10 and 11 -- 32- and 64-bit; Python 3.8 is the last one that runs on Windows 7)
+#   - PyInstaller's start-up stub (the "bootloader") is compiled here from PyInstaller's source instead of using the
+#     pre-built one that every PyInstaller program shares (antivirus programs that once saw that stub in malware
+#     flag it everywhere); no UPX packing; a version resource (company, product, description) like any normal program
+#   - two macOS builds (Apple silicon and Intel): "iPod exFAT Setup.app" plus "Start iPod exFAT Setup.command"
+#   These lower the false alarms; only code signing (a certificate) removes SmartScreen's "unknown publisher"
+#   warning -- see build_exe.txt.
 # Runs when tools/bcm/ipod_exfat_setup.py changes on branch bcm-host, or from Actions -> "iPod exFAT Setup exe" ->
-# Run workflow.  Output: artifact "ipod-exfat-setup-exe" (the .exe).  Put the .exe in the same folder as
-# rockbox.zip and bootloader-ipodvideo.ipod (the exFAT Setup package folder) and double-click it; Windows asks for
-# administrator rights (needed to write to disks).  Every setting of the window and every command-line option of
-# the .py works the same in the .exe.
+# Run workflow.  Artifacts: ipod-exfat-setup-win64, ipod-exfat-setup-win32, ipod-exfat-setup-mac-arm64,
+# ipod-exfat-setup-mac-intel (and iPod Defrag for Windows).
 name: iPod exFAT Setup exe
 
 on:
@@ -16,9 +23,97 @@ on:
       - '.github/workflows/exfat-setup-exe.yml'
 
 jobs:
-  exe:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win64
+            python: '3.12'
+            arch: x64
+            pyinstaller: '6.11.1'
+          - name: win32
+            python: '3.8'
+            arch: x86
+            pyinstaller: '6.10.0'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Install PyInstaller (start-up stub compiled from source)
+        shell: pwsh
+        run: |
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          python -m pip install --no-binary pyinstaller "pyinstaller==${{ matrix.pyinstaller }}"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Compiling the stub failed: using PyInstaller's pre-built one"
+            python -m pip install "pyinstaller==${{ matrix.pyinstaller }}"
+          }
+
+      - name: Version resource
+        shell: python
+        run: |
+          import re
+          src = open('tools/bcm/ipod_exfat_setup.py', encoding='utf-8').read()
+          v = re.search(r"^VERSION = '([\d.]+)'", src, re.M).group(1)
+          parts = (v.split('.') + ['0', '0', '0'])[:4]
+          t = tuple(int(x) for x in parts)
+          def info(name, desc, exe):
+              return f"""VSVersionInfo(
+            ffi=FixedFileInfo(filevers={t}, prodvers={t}, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+            kids=[StringFileInfo([StringTable('040904B0', [
+              StringStruct('CompanyName', 'bcm-rockbox (open source)'),
+              StringStruct('FileDescription', '{desc}'),
+              StringStruct('FileVersion', '{v}'),
+              StringStruct('InternalName', '{name}'),
+              StringStruct('LegalCopyright', 'GPL-2.0-or-later'),
+              StringStruct('OriginalFilename', '{exe}'),
+              StringStruct('ProductName', '{name}'),
+              StringStruct('ProductVersion', '{v}')])]),
+              VarFileInfo([VarStruct('Translation', [1033, 1200])])])"""
+          open('ver_setup.txt', 'w').write(info('iPod exFAT Setup', 'Formats an iPod Video with exFAT and installs Rockbox', 'iPod exFAT Setup.exe'))
+          open('ver_defrag.txt', 'w').write(info('iPod Defrag', 'Defragments an iPod exFAT drive', 'iPod Defrag.exe'))
+
+      - name: Build iPod exFAT Setup.exe
+        run: >
+          pyinstaller --onefile --windowed --uac-admin --clean --noupx
+          --version-file ver_setup.txt
+          --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipod-exfat-setup-${{ matrix.name }}
+          path: dist/iPod exFAT Setup.exe
+
+      # v142: iPod Defrag (tools/bcm/ipod_defrag.pyw) the same way
+      - name: Build iPod Defrag.exe
+        run: >
+          pyinstaller --onefile --windowed --uac-admin --clean --noupx
+          --version-file ver_defrag.txt
+          --name "iPod Defrag" tools/bcm/ipod_defrag.pyw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipod-defrag-${{ matrix.name }}
+          path: dist/iPod Defrag.exe
+
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mac-arm64
+            runner: macos-14
+          - name: mac-intel
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -29,23 +124,22 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install pyinstaller==6.11.1
 
-      - name: Build the .exe
-        run: >
-          pyinstaller --onefile --windowed --uac-admin --clean
-          --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
+      - name: Build the app
+        run: |
+          pyinstaller --windowed --clean --noupx --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
+          mkdir -p out
+          cp -R "dist/iPod exFAT Setup.app" out/
+          cat > "out/Start iPod exFAT Setup.command" <<'CMD'
+          #!/bin/bash
+          # Starts iPod exFAT Setup with the rights it needs to write to disks (asks for your Mac password).
+          cd "$(dirname "$0")"
+          xattr -dr com.apple.quarantine "iPod exFAT Setup.app" 2>/dev/null
+          sudo "./iPod exFAT Setup.app/Contents/MacOS/iPod exFAT Setup"
+          CMD
+          chmod +x "out/Start iPod exFAT Setup.command"
+          cd out && zip -r -y "../iPod exFAT Setup ${{ matrix.name }}.zip" .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ipod-exfat-setup-exe
-          path: dist/iPod exFAT Setup.exe
-
-      # v142: iPod Defrag (tools/bcm/ipod_defrag.pyw) the same way: artifact "ipod-defrag-exe"
-      - name: Build iPod Defrag.exe
-        run: >
-          pyinstaller --onefile --windowed --uac-admin --clean
-          --name "iPod Defrag" tools/bcm/ipod_defrag.pyw
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ipod-defrag-exe
-          path: dist/iPod Defrag.exe
+          name: ipod-exfat-setup-${{ matrix.name }}
+          path: iPod exFAT Setup ${{ matrix.name }}.zip

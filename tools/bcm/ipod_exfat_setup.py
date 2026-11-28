@@ -83,10 +83,17 @@ through Windows' cache.  The firmware
 partition is 2 MB (was 32 MB on a new drive, Apple's size on a converted iPod): the boot ROM reads only its
 directory and the bootloader (~1.1 MB with room for a bigger bootloader); Apple's other images stay in the backup.
 --itunes-fw keeps the old sizes.  Can be built into a Windows .exe (no Python needed): see build_exe.txt.
-"""
-import base64, datetime, io, json, os, queue, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.13'
+1.15 (bcm overlay v144): no .ipsw?  "Download" fetches Apple's firmware package for the iPod's model from the list
+at theapplewiki.com (Firmware/iPod) -- iPod_25.1.3.ipsw for a 5.5G, iPod_20.1.3.ipsw for a 5G -- and keeps it only if
+its size and SHA-1 match the known file.  Copying reads the next file while the last one is written (two threads).
+Quick format first tells the drive the whole partition is free (TRIM) where the drive and the connection support it
+(an iPod's own USB mode does not; most card readers do not either; it is skipped then).  Runs on macOS and Linux too
+(as root: sudo; see "Start iPod exFAT Setup.command").
+"""
+import base64, datetime, hashlib, io, json, os, queue, re, shutil, struct, sys, threading, time, zipfile, zlib
+
+VERSION = '1.15'
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -471,8 +478,11 @@ class ImageDisk:
     def prepare_write(self, log=print):
         pass
 
-    def lock_volumes(self):
+    def lock_volumes(self, log=print):
         pass
+
+    def trim(self, off, length):
+        return False
 
     def finish(self):
         self.flush()
@@ -727,6 +737,19 @@ if os.name == 'nt':
         def volumes(self):
             return disk_volumes(self.number)
 
+        def trim(self, off, length):
+            """1.15: IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES, DeviceDsmAction_Trim; False = not supported"""
+            step = 1 << 30
+            try:
+                while length > 0:
+                    n = min(step, length)
+                    hdr = struct.pack('<IIIIIII4x', 28, 1, 0, 0, 0, 32, 16) + struct.pack('<qQ', off, n)
+                    _ioctl(self.h, 0x002D9404, hdr)
+                    off += n; length -= n
+                return True
+            except OSError:
+                return False
+
         def lock_volumes(self, log=print):
             """lock + dismount every volume on the iPod so Windows lets us write"""
             for vol, paths in self.volumes():
@@ -777,6 +800,174 @@ if os.name == 'nt':
 else:
     def is_admin():
         return os.geteuid() == 0 if hasattr(os, 'geteuid') else True
+
+    # 1.15: macOS / Linux.  Disks are numbered in the order disk_paths() lists them; needs root (sudo).
+    import subprocess
+    MAC = sys.platform == 'darwin'
+    BUS_NAMES = {}
+
+    def disk_paths():
+        if MAC:
+            try:
+                out = subprocess.run(['diskutil', 'list'], capture_output=True, text=True).stdout
+            except OSError:
+                return []
+            ids = sorted({int(m) for m in re.findall(r'^/dev/disk(\d+)', out, re.M)})
+            return ['/dev/rdisk%d' % i for i in ids]
+        out = []
+        for d in sorted(os.listdir('/sys/block')) if os.path.isdir('/sys/block') else []:
+            if d.startswith(('loop', 'ram', 'zram', 'dm-', 'md', 'sr')):
+                continue
+            out.append('/dev/' + d)
+        return out
+
+    def _mounts():
+        """[(device, mount point)]"""
+        if MAC:
+            try:
+                out = subprocess.run(['mount'], capture_output=True, text=True).stdout
+            except OSError:
+                return []
+            return [(m.group(1), m.group(2)) for m in re.finditer(r'^(/dev/\S+) on (.+?) \(', out, re.M)]
+        try:
+            with open('/proc/mounts') as f:
+                return [(l.split()[0], l.split()[1].replace('\\040', ' ')) for l in f if l.startswith('/dev/')]
+        except OSError:
+            return []
+
+    def system_disks():
+        """disk numbers holding / (never offered)"""
+        paths = disk_paths(); out = set()
+        for dev, mp in _mounts():
+            if mp in ('/', '/System/Volumes/Data', '/boot', '/boot/efi', '/usr', '/home'):
+                for i, p in enumerate(paths):
+                    if dev.replace('/dev/disk', '/dev/rdisk').startswith(p) or dev.startswith(p):
+                        out.add(i)
+        if MAC:
+            out.add(0)            # the internal disk is always disk0 on a Mac
+        return out
+
+    class PosixDisk:
+        def __init__(self, number, writable=True):
+            import fcntl
+            paths = disk_paths()
+            if not (0 <= number < len(paths)):
+                raise OSError(2, 'no disk %d' % number)
+            self.number, self.path = number, paths[number]
+            self.fd = os.open(self.path, (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, 'O_SYNC', 0))
+            buf = bytearray(8)
+            try:
+                if MAC:
+                    fcntl.ioctl(self.fd, 0x40046418, buf)          # DKIOCGETBLOCKSIZE
+                    self.sector = struct.unpack_from('<I', buf)[0]
+                    fcntl.ioctl(self.fd, 0x40086419, buf)          # DKIOCGETBLOCKCOUNT
+                    self.size = struct.unpack_from('<Q', buf)[0] * self.sector
+                else:
+                    fcntl.ioctl(self.fd, 0x1268, buf)              # BLKSSZGET
+                    self.sector = struct.unpack_from('<I', buf)[0]
+                    fcntl.ioctl(self.fd, 0x80081272, buf)          # BLKGETSIZE64
+                    self.size = struct.unpack_from('<Q', buf)[0]
+            except OSError:
+                os.close(self.fd)
+                raise
+            if not self.size:
+                os.close(self.fd)
+                raise OSError(21, 'no medium')
+            self.name = os.path.basename(self.path)
+            self.removable = False
+            try:
+                if MAC:
+                    info = subprocess.run(['diskutil', 'info', self.path.replace('rdisk', 'disk')],
+                                          capture_output=True, text=True).stdout
+                    m = re.search(r'Device / Media Name:\s*(.+)', info)
+                    if m:
+                        self.name = m.group(1).strip()
+                    self.removable = bool(re.search(r'(Removable Media|Ejectable):\s*(Removable|Yes)', info)) or \
+                        bool(re.search(r'Device Location:\s*External', info)) or 'USB' in info
+                else:
+                    b = '/sys/block/' + os.path.basename(self.path)
+                    with open(b + '/removable') as f:
+                        self.removable = f.read().strip() == '1'
+                    try:
+                        with open(b + '/device/model') as f:
+                            self.name = f.read().strip() or self.name
+                    except OSError:
+                        pass
+                    self.removable = self.removable or '/usb' in os.path.realpath(b)
+            except (OSError, ValueError):
+                pass
+            self.bus = 'USB' if self.removable else 'internal'
+            self.locked = False
+
+        def read(self, off, n):
+            d = os.pread(self.fd, n, off)
+            if len(d) != n:
+                raise SetupError('short read at %d' % off)
+            return d
+
+        def write(self, off, data):
+            if off + len(data) > self.size:
+                raise SetupError('write past the end of the disk')
+            done = 0
+            while done < len(data):
+                done += os.pwrite(self.fd, data[done:], off + done)
+
+        def flush(self):
+            try:
+                os.fsync(self.fd)
+            except OSError:
+                pass
+
+        def prepare_write(self, log=print):
+            pass
+
+        def volumes(self):
+            base = self.path.replace('/dev/rdisk', '/dev/disk')
+            out = []
+            for dev, mp in _mounts():
+                if dev == base or (dev.startswith(base) and dev[len(base):].lstrip('sp').isdigit()):
+                    out.append((dev, [mp]))
+            return out
+
+        def lock_volumes(self, log=print):
+            """unmount every volume of the disk (macOS: diskutil unmountDisk)"""
+            if MAC:
+                r = subprocess.run(['diskutil', 'unmountDisk', self.path.replace('rdisk', 'disk')],
+                                   capture_output=True, text=True)
+                if r.returncode:
+                    raise SetupError('cannot unmount the disk -- close any Finder window or program using it '
+                                     '(%s)' % (r.stderr or r.stdout).strip())
+            else:
+                for dev, paths in self.volumes():
+                    r = subprocess.run(['umount', dev], capture_output=True, text=True)
+                    if r.returncode:
+                        raise SetupError('cannot unmount %s (%s)' % (paths[0], r.stderr.strip()))
+            self.locked = True
+
+        def trim(self, off, length):
+            """tell the drive the range is free; False = not supported"""
+            if MAC:
+                return False
+            import fcntl
+            try:
+                fcntl.ioctl(self.fd, 0x1277, struct.pack('<QQ', off, length))   # BLKDISCARD
+                return True
+            except OSError:
+                return False
+
+        def finish(self):
+            self.flush()
+
+        def close(self):
+            os.close(self.fd)
+            if MAC and self.locked:
+                subprocess.run(['diskutil', 'mountDisk', self.path.replace('rdisk', 'disk')],
+                               capture_output=True, text=True)
+
+if os.name == 'nt':
+    Disk = WinDisk
+else:
+    Disk = PosixDisk
 
 # --------------------------------------------------------------------------
 # the iPod's layout
@@ -989,12 +1180,10 @@ def new_drive(disk, unit, rockbox_zip, bootloader, keep_dir=None, label='IPOD', 
 def list_disks():
     """[(number, WinDisk-info dict)] of every disk; 'ok' = may be offered for a new layout"""
     out = []
-    if os.name != 'nt':
-        return out
     sysd = system_disks()
-    for n in range(64):
+    for n in (range(64) if os.name == 'nt' else range(len(disk_paths()))):
         try:
-            d = WinDisk(n, writable=False)
+            d = Disk(n, writable=False)
         except OSError:
             continue
         try:
@@ -1016,11 +1205,9 @@ def list_disks():
 def find_ipods():
     """[(disk_number, Ipod or error string, disk)]"""
     out = []
-    if os.name != 'nt':
-        return out
-    for n in range(32):
+    for n in (range(32) if os.name == 'nt' else range(len(disk_paths()))):
         try:
-            d = WinDisk(n, writable=False)
+            d = Disk(n, writable=False)
         except OSError:
             continue
         try:
@@ -1316,6 +1503,113 @@ def ipsw_files(path, log=print):
     log('  from %s: %d VideoCore files (%s) %s' % (member, len(vc), human(sum(len(d) for d in vc.values())), ui))
     return out
 
+# 1.15: Apple's firmware package straight from Apple's servers, found through the list on The Apple Wiki.  Only the
+# exact known files are accepted (SHA-1), so neither a changed page nor a bad mirror can slip anything in.
+IPSW_WIKI = 'https://theapplewiki.com/wiki/Firmware/iPod'
+IPSW_KNOWN = {
+    '5.5g': ('iPod_25.1.3.ipsw', 6533633, '0f2dd984c5d56475bdf3c14b4bc7541b799f2c85'),
+    '5g':   ('iPod_20.1.3.ipsw', 6526335, 'bf041893dbf1e0ad965bafb9a6eae0be276e164a'),
+}
+
+def ipsw_ok(path, model):
+    name, size, sha = IPSW_KNOWN[model]
+    try:
+        if os.path.getsize(path) > size + (1 << 20):     # the SHA-1 decides; the size only stops a wrong big file
+            return False
+        h = hashlib.sha1()
+        with open(path, 'rb') as f:
+            for b in iter(lambda: f.read(1 << 20), b''):
+                h.update(b)
+        return h.hexdigest() == sha
+    except OSError:
+        return False
+
+def ipsw_cache_dirs(here):
+    out = [here]
+    base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), '.cache')
+    out.append(os.path.join(base, 'iPod exFAT Setup'))
+    return out
+
+def ipsw_find_local(here, model):
+    """an already downloaded / copied package for this model (checked), or None"""
+    name = IPSW_KNOWN[model][0]
+    for d in ipsw_cache_dirs(here):
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and ipsw_ok(p, model):
+            return p
+    return None
+
+def ipsw_links(page, name):
+    """links on the wiki page that end in the file name (any host -- the checksum decides)"""
+    import html
+    from urllib.parse import urljoin, unquote
+    out = []
+    for m in re.finditer(r'href\s*=\s*["\']([^"\']+)["\']', page, re.I):
+        u = urljoin(IPSW_WIKI, html.unescape(m.group(1)))
+        if u.lower().startswith(('http://', 'https://')) and unquote(u.split('?')[0].split('#')[0]).rsplit('/', 1)[-1].lower() == name.lower():
+            if u not in out:
+                out.append(u)
+    out.sort(key=lambda u: 'theapplewiki.com' in u.split('/')[2].lower())   # Apple's own server first
+    return out
+
+def ipsw_download(model, here, log=print, progress=lambda f: None):
+    """the path of the checked package for '5.5g' / '5g'; downloads it if needed"""
+    import urllib.request
+    name, size, sha = IPSW_KNOWN[model]
+    p = ipsw_find_local(here, model)
+    if p:
+        log('%s is already here (%s), checksum OK' % (name, p))
+        return p
+    log('looking up %s on %s' % (name, IPSW_WIKI))
+    try:
+        page = http_get(IPSW_WIKI, log).decode('utf-8', 'replace')
+    except Exception as ex:
+        raise SetupError('no internet connection to theapplewiki.com (%s).  Download %s yourself and choose it '
+                         'with Browse.' % (ex, name))
+    links = ipsw_links(page, name)
+    if not links:
+        raise SetupError('the wiki page has no link to %s any more.  Download it yourself and choose it with '
+                         'Browse.' % name)
+    for d in ipsw_cache_dirs(here):
+        try:
+            os.makedirs(d, exist_ok=True)
+            test = os.path.join(d, '.write_test')
+            open(test, 'w').close(); os.remove(test)
+            break
+        except OSError:
+            continue
+    else:
+        raise SetupError('no folder to save the download in')
+    dest = os.path.join(d, name)
+    for u in links:
+        log('  downloading %s' % u)
+        tmp = dest + '.part'
+        try:
+            req = urllib.request.Request(u, headers={'User-Agent': 'iPod-exFAT-Setup/%s' % VERSION})
+            h = hashlib.sha1(); got = 0
+            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, 'wb') as f:
+                while True:
+                    b = r.read(1 << 16)
+                    if not b:
+                        break
+                    got += len(b)
+                    if got > size + (1 << 20):
+                        raise SetupError('bigger than the known file')
+                    h.update(b); f.write(b)
+                    progress(min(1.0, got / size))
+            if h.hexdigest() != sha:
+                raise SetupError('size %d / SHA-1 %s do not match the known file' % (got, h.hexdigest()))
+            os.replace(tmp, dest)
+            log('  %s saved to %s (SHA-1 %s checked)' % (name, d, sha))
+            return dest
+        except Exception as ex:
+            log('  %s: %s' % (u, ex))
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    raise SetupError('could not download %s from any link on the wiki page' % name)
+
 def _norm(name):
     return ''.join(c for c in name.lower() if c.isalnum())
 
@@ -1533,21 +1827,50 @@ class ExfatPlan:
         w.put(self.up_raw + bytes(self.up_clus * cs - len(self.up_raw)))
         for i, d in enumerate(self.dirs):
             w.put(self.dir_bytes(d, i == 0))
-        for path, n in self.files:
-            if not n.size:
-                continue
-            got = 0; crc = 0
-            with n.opener() as f:
-                while True:
-                    b = f.read(CHUNK)
-                    if not b:
-                        break
-                    crc = zlib.crc32(b, crc); got += len(b)
-                    w.put(b)
-            if got != n.size:
-                raise SetupError('%s changed while copying' % path)
-            n.crc = crc
-            w.put(bytes(n.nclus * cs - n.size))
+        # 1.15: a second thread reads (and checksums) the next pieces while this one writes: the source (a PC disk,
+        # the old iPod card in Move) and the iPod work at the same time instead of taking turns.  At most 4 pieces
+        # (16 MB) wait.
+        rq = queue.Queue(maxsize=4)
+        stop = threading.Event()
+        def reader():
+            try:
+                for path, n in self.files:
+                    if not n.size:
+                        continue
+                    got = 0; crc = 0
+                    with n.opener() as f:
+                        while not stop.is_set():
+                            b = f.read(CHUNK)
+                            if not b:
+                                break
+                            crc = zlib.crc32(b, crc); got += len(b)
+                            rq.put(('data', b))
+                    if stop.is_set():
+                        return
+                    if got != n.size:
+                        raise SetupError('%s changed while copying' % path)
+                    n.crc = crc
+                    rq.put(('data', bytes(n.nclus * cs - n.size)))
+                rq.put(('end', None))
+            except BaseException as ex:
+                rq.put(('error', ex))
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        try:
+            while True:
+                kind, b = rq.get()
+                if kind == 'end':
+                    break
+                if kind == 'error':
+                    raise b
+                w.put(b)
+        finally:
+            stop.set()
+            while th.is_alive():               # let a blocked reader finish
+                try:
+                    rq.get(timeout=0.1)
+                except queue.Empty:
+                    pass
         w.close()
         # boot regions last: until here the partition is not an exFAT volume
         serial = struct.unpack('<I', os.urandom(4))[0]
@@ -1821,6 +2144,15 @@ def setup(disk, rockbox_zip, bootloader, backup_path, keep=True, keep_dir=None, 
         (surface_test if OPTIONS['full'] == 'check' else zero_fill)(
             disk, part_off if layout != 'whole' else align_up(fw_end, ALIGN),
             part_off + part_len if layout != 'whole' else part_len, log, progress)
+    elif OPTIONS.get('trim', True):
+        # 1.15: quick format: the drive learns the whole new partition is free (flash keeps more spare blocks and
+        # writes faster later).  Before anything new is written, so nothing of the new volume can be lost.
+        t_a = part_off if layout != 'whole' else align_up(fw_end, ALIGN)
+        t_b = part_off + part_len if layout != 'whole' else part_len
+        if disk.trim(t_a, t_b - t_a):
+            log('  TRIM: the drive was told %s are free' % human(t_b - t_a))
+        else:
+            log('  (TRIM not supported by this drive / connection -- skipped)')
     plan.write(disk, log, progress)     # (whole disk: its boot sector is the new sector 0)
     if layout != 'whole':
         pu = 512 if pc else unit
@@ -2285,6 +2617,263 @@ def clock_helper_uninstall():
 # --------------------------------------------------------------------------
 # window
 
+
+# --------------------------------------------------------------------------------------------------------------------
+# 1.14: Extras for a connected Rockbox iPod -- themes from the Rockbox theme site, the Rockbox font pack, a settings
+# backup / restore, the TV animation.  Uses only Python's own urllib / zipfile.
+
+THEMES_URL = ('https://themes.rockbox.org/rbutilqt.php?target=ipodvideo&release=&revision=&rbutilver=1.5.1',
+              'http://themes.rockbox.org/rbutilqt.php?target=ipodvideo&release=&revision=&rbutilver=1.5.1')
+FONTS_URL = ('https://download.rockbox.org/daily/fonts/rockbox-fonts.zip',
+             'https://download.rockbox.org/release/4.0/rockbox-fonts-4.0.zip',
+             'http://download.rockbox.org/daily/fonts/rockbox-fonts.zip')
+SETTINGS_FILES = ('config.cfg', 'bcm_test.cfg', 'battery_levels.cfg', 'usb_tune.cfg', 'tv.gif', 'timesync.dat',
+                  'fmpresets.fmr', 'playlist_control', 'most-recent.bmark')
+SETTINGS_DIRS = ('themes', 'wps', 'sbs', 'fonts', 'backdrops', 'icons', 'playlists')
+
+def http_get(urls, log=print, timeout=30):
+    import urllib.request
+    last = None
+    for u in (urls if isinstance(urls, (list, tuple)) else (urls,)):
+        try:
+            req = urllib.request.Request(u, headers={'User-Agent': 'iPod-exFAT-Setup/%s' % VERSION})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as ex:
+            last = ex
+            log('  %s: %s' % (u, ex))
+    raise RuntimeError('could not download (%s)' % last)
+
+def theme_list(log=print):
+    """[{'id', 'name', 'author', 'size', 'image', 'image2', 'archive', 'about', 'current'}] for the iPod Video"""
+    import configparser
+    raw = http_get(THEMES_URL, log).decode('utf-8', 'replace')
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    cp.read_string(raw)
+    if cp.has_section('error') and cp.get('error', 'code', fallback='0').strip() not in ('0', ''):
+        raise RuntimeError(cp.get('error', 'description', fallback='the theme site refused the list').strip('"'))
+    out = []
+    for sec in cp.sections():
+        if sec in ('error', 'status'):
+            continue
+        g = lambda k: cp.get(sec, k, fallback='').strip().strip('"')
+        if not g('archive'):
+            continue
+        out.append(dict(id=sec, name=html_unescape(g('name')) or sec, author=html_unescape(g('author')),
+                        size=g('size'), image=g('image'), image2=g('image2'), archive=g('archive'),
+                        about=html_unescape(g('about')), current=bool(g('pass_current'))))
+    return out
+
+def html_unescape(t):
+    import html
+    return html.unescape(t)
+
+def safe_extract(zdata, root, log=print, only_rockbox=True):
+    """a theme / font zip onto the iPod: every member must land under /.rockbox (no absolute paths, no '..')"""
+    import zipfile, io
+    n = 0
+    with zipfile.ZipFile(io.BytesIO(zdata)) as z:
+        for m in z.infolist():
+            name = m.filename.replace('\\', '/')
+            parts = [x for x in name.split('/') if x not in ('', '.')]
+            if not parts or '..' in parts or ':' in parts[0]:
+                log('  skipped %s (unsafe path)' % m.filename); continue
+            if only_rockbox and parts[0].lower() != '.rockbox':
+                log('  skipped %s (not under .rockbox)' % m.filename); continue
+            dest = os.path.join(root, *parts)
+            if m.is_dir():
+                os.makedirs(dest, exist_ok=True); continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(m) as src, open(dest, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            n += 1
+    return n
+
+def settings_backup(root, dest_zip, log=print):
+    import zipfile
+    rb = os.path.join(root, '.rockbox')
+    n = 0
+    with zipfile.ZipFile(dest_zip, 'w', zipfile.ZIP_DEFLATED) as z:
+        for f in SETTINGS_FILES:
+            p = os.path.join(rb, f)
+            if os.path.isfile(p):
+                z.write(p, '.rockbox/' + f); n += 1
+        for d in SETTINGS_DIRS:
+            base = os.path.join(rb, d)
+            for dp, dn, fn in os.walk(base):
+                for f in fn:
+                    p = os.path.join(dp, f)
+                    z.write(p, '.rockbox/' + os.path.relpath(p, rb).replace(os.sep, '/')); n += 1
+    log('settings backup: %d files -> %s' % (n, dest_zip))
+    return n
+
+def settings_restore(root, src_zip, log=print):
+    with open(src_zip, 'rb') as f:
+        n = safe_extract(f.read(), root, log)
+    log('settings restored: %d files from %s' % (n, src_zip))
+    return n
+
+def extras_window(parent, TITLE):
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    w = tk.Toplevel(parent)
+    w.title('%s: Extras' % TITLE)
+    w.geometry('900x620')
+    q = queue.Queue()
+    top = ttk.Frame(w, padding=8); top.pack(fill='x')
+    ttk.Label(top, text='iPod:').pack(side='left')
+    roots = clock_sync_drives()
+    root_var = tk.StringVar(value=roots[0] if roots else '')
+    ttk.Combobox(top, textvariable=root_var, values=roots, width=20).pack(side='left', padx=6)
+    ttk.Label(top, text='(a Rockbox iPod in USB mode)', foreground='#555').pack(side='left')
+    body = ttk.PanedWindow(w, orient='horizontal'); body.pack(fill='both', expand=True, padx=8)
+    left = ttk.Frame(body); right = ttk.Frame(body, padding=(8, 0))
+    body.add(left, weight=1); body.add(right, weight=1)
+    only_ok = tk.BooleanVar(value=True)
+    lb = tk.Listbox(left, activestyle='dotbox'); lb.pack(fill='both', expand=True)
+    ttk.Checkbutton(left, text='Only themes marked as working with current Rockbox', variable=only_ok,
+                    command=lambda: fill()).pack(anchor='w')
+    img_lbl = ttk.Label(right); img_lbl.pack(anchor='n')
+    about = tk.Text(right, height=8, wrap='word', state='disabled'); about.pack(fill='both', expand=True, pady=6)
+    logw = tk.Text(w, height=7, wrap='word', state='disabled'); logw.pack(fill='x', padx=8)
+    btns = ttk.Frame(w, padding=8); btns.pack(fill='x')
+    st = dict(themes=[], shown=[], imgs={}, busy=False)
+
+    def log(s):
+        to_logfile(s); q.put(('log', s))
+    def pump():
+        try:
+            while True:
+                k, v = q.get_nowait()
+                if k == 'log':
+                    logw.configure(state='normal'); logw.insert('end', v + '\n'); logw.see('end'); logw.configure(state='disabled')
+                elif k == 'themes':
+                    st['themes'] = v; fill()
+                elif k == 'img':
+                    tid, data = v
+                    try:
+                        import base64
+                        st['imgs'][tid] = tk.PhotoImage(data=base64.b64encode(data).decode('ascii'))
+                    except Exception:
+                        st['imgs'][tid] = None
+                    show()
+                elif k == 'done':
+                    st['busy'] = False
+        except queue.Empty:
+            pass
+        if w.winfo_exists():
+            w.after(100, pump)
+    def bg(fn, *a):
+        if st['busy']:
+            return
+        st['busy'] = True
+        def run():
+            try:
+                fn(*a)
+            except Exception as ex:
+                log('ERROR: %s' % ex)
+            q.put(('done', None))
+        threading.Thread(target=run, daemon=True).start()
+    def fill():
+        lb.delete(0, 'end')
+        st['shown'] = [t for t in st['themes'] if t['current'] or not only_ok.get()]
+        for t in st['shown']:
+            lb.insert('end', '%s  (%s)' % (t['name'], t['author']))
+    def sel():
+        i = lb.curselection()
+        return st['shown'][i[0]] if i else None
+    def show(*_):
+        t = sel()
+        if not t:
+            return
+        about.configure(state='normal'); about.delete('1.0', 'end')
+        about.insert('end', '%s\nby %s\n%s KB\n\n%s' % (t['name'], t['author'], t['size'], t['about']))
+        about.configure(state='disabled')
+        im = st['imgs'].get(t['id'], 'none')
+        if im == 'none':
+            st['imgs'][t['id']] = 'loading'
+            img_lbl.configure(image='', text='(loading the picture ...)')
+            def get():
+                try:
+                    q.put(('img', (t['id'], http_get(t['image'], lambda s: None))))
+                except Exception:
+                    q.put(('img', (t['id'], b'')))
+            threading.Thread(target=get, daemon=True).start()
+        elif im in ('loading', None):
+            img_lbl.configure(image='', text='' if im == 'loading' else '(no preview -- the picture is not PNG / GIF)')
+        else:
+            img_lbl.configure(image=im, text='')
+    lb.bind('<<ListboxSelect>>', show)
+    def need_root():
+        r = root_var.get().strip()
+        if not r or not os.path.isdir(os.path.join(r, '.rockbox')):
+            messagebox.showerror(TITLE, 'Choose the iPod (a drive with a .rockbox folder; Rockbox in USB mode).', parent=w)
+            return None
+        return r
+    def load_list():
+        log('downloading the theme list for the iPod Video ...')
+        th = theme_list(log)
+        log('%d themes (%d marked as working with current Rockbox)' % (len(th), sum(1 for t in th if t['current'])))
+        q.put(('themes', th))
+    def install_theme():
+        t, r = sel(), need_root()
+        if not t or not r:
+            return
+        def run():
+            log('downloading %s ...' % t['name'])
+            n = safe_extract(http_get(t['archive'], log, 120), r, log)
+            log('%s: %d files installed.  On the iPod: Settings > Theme Settings > Browse Theme Files.' % (t['name'], n))
+        bg(run)
+    def install_fonts():
+        r = need_root()
+        if not r:
+            return
+        def run():
+            log('downloading the Rockbox font pack (large fonts for the TV File Browser too) ...')
+            n = safe_extract(http_get(FONTS_URL, log, 300), r, log)
+            log('fonts: %d files installed in /.rockbox/fonts' % n)
+        bg(run)
+    def backup():
+        r = need_root()
+        if not r:
+            return
+        d = filedialog.asksaveasfilename(parent=w, defaultextension='.zip', initialfile='ipod_settings_%s.zip'
+                                         % time.strftime('%Y%m%d'), filetypes=[('zip', '*.zip')])
+        if d:
+            bg(settings_backup, r, d, log)
+    def restore():
+        r = need_root()
+        if not r:
+            return
+        f = filedialog.askopenfilename(parent=w, filetypes=[('zip', '*.zip')])
+        if f and messagebox.askyesno(TITLE, 'Copy the settings in %s onto the iPod (files with the same name are '
+                                     'replaced)?' % os.path.basename(f), parent=w):
+            bg(settings_restore, r, f, log)
+    def tv_gif():
+        r = need_root()
+        if not r:
+            return
+        f = filedialog.askopenfilename(parent=w, filetypes=[('GIF', '*.gif')])
+        if f:
+            with open(f, 'rb') as a:
+                head = a.read(10)
+            if head[:4] != b'GIF8':
+                messagebox.showerror(TITLE, 'Not a GIF file.', parent=w); return
+            ww, hh = struct.unpack('<HH', head[6:10])
+            if ww > 192 or hh > 128:
+                messagebox.showwarning(TITLE, 'The GIF is %d x %d; the iPod uses GIFs up to 192 x 128 (it is copied '
+                                       'anyway but will not be shown).' % (ww, hh), parent=w)
+            shutil.copyfile(f, os.path.join(r, '.rockbox', 'tv.gif'))
+            log('TV animation: %s -> /.rockbox/tv.gif (%d x %d)' % (os.path.basename(f), ww, hh))
+    ttk.Button(btns, text='Load theme list', command=lambda: bg(load_list)).pack(side='left')
+    ttk.Button(btns, text='Install theme', command=install_theme).pack(side='left', padx=6)
+    ttk.Button(btns, text='Install font pack', command=install_fonts).pack(side='left')
+    ttk.Button(btns, text='TV animation (GIF)...', command=tv_gif).pack(side='left', padx=6)
+    ttk.Button(btns, text='Restore settings...', command=restore).pack(side='right')
+    ttk.Button(btns, text='Back up settings...', command=backup).pack(side='right', padx=6)
+    pump()
+
 def gui():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -2346,6 +2935,13 @@ def gui():
     ipsws = sorted(f for f in os.listdir(here) if f.lower().endswith('.ipsw')) if os.path.isdir(here) else []
     ipsw_var = file_row(13, 'iPod firmware (.ipsw):', os.path.join(here, ipsws[-1]) if ipsws else '',
                         [('iPod firmware', '*.ipsw'), ('Firmware file', 'Firmware-*'), ('All files', '*')])
+    if not ipsw_var.get():                     # 1.15: one downloaded earlier
+        for m_ in ('5.5g', '5g'):
+            p_ = ipsw_find_local(here, m_)
+            if p_:
+                ipsw_var.set(p_); break
+    dl_btn = ttk.Button(frm, text='Download')
+    dl_btn.grid(row=13, column=3, padx=(4, 0))
 
     bk_lbl = ttk.Label(frm, text='Backup file:'); bk_lbl.grid(row=7, column=0, sticky='w')
     bdir = os.path.join(os.path.expanduser('~'), 'Documents')
@@ -2375,7 +2971,7 @@ def gui():
     cl_var = tk.StringVar(value='Auto')    # 1.8: chosen from the card's size
     ttk.Combobox(opt, textvariable=cl_var, values=['Auto', '32 KB', '64 KB', '128 KB', '256 KB', '512 KB'], width=8,
                  state='readonly').pack(side='left')
-    opt2 = ttk.Frame(frm); opt2.grid(row=13, column=0, columnspan=3, sticky='w', pady=(0, 4))   # 1.13
+    opt2 = ttk.Frame(frm); opt2.grid(row=14, column=0, columnspan=3, sticky='w', pady=(0, 4))   # 1.13
     ttk.Label(opt2, text='Format:').pack(side='left')
     FORMATS = [('Quick', ''), ('Full (rewrites every sector with zeros)', 'zero'),
                ('Full + check (test pattern written and read back: finds bad / fake cards; 2x as long)', 'check')]
@@ -2402,17 +2998,19 @@ def gui():
         row=10, column=1, columnspan=2, sticky='ew', padx=6, pady=(0, 4))
     def layout_choice():
         return dict(LAYOUTS)[lay_var.get()]
-    bar = ttk.Progressbar(frm, maximum=1000); bar.grid(row=14, column=0, columnspan=3, sticky='ew', pady=6)
+    bar = ttk.Progressbar(frm, maximum=1000); bar.grid(row=15, column=0, columnspan=3, sticky='ew', pady=6)
     logw = tk.Text(frm, height=13, wrap='word', state='disabled')
-    logw.grid(row=15, column=0, columnspan=3, sticky='nsew'); frm.rowconfigure(15, weight=1)
-    btns = ttk.Frame(frm); btns.grid(row=16, column=0, columnspan=3, sticky='ew', pady=(8, 0))
+    logw.grid(row=16, column=0, columnspan=4, sticky='nsew'); frm.rowconfigure(16, weight=1)
+    btns = ttk.Frame(frm); btns.grid(row=17, column=0, columnspan=4, sticky='ew', pady=(8, 0))
     go = ttk.Button(btns, text='Erase iPod and install Rockbox on exFAT'); go.pack(side='right')
     rs = ttk.Button(btns, text='Restore a backup...'); rs.pack(side='left')
-    extra = ttk.Frame(frm); extra.grid(row=17, column=0, columnspan=3, sticky='ew', pady=(6, 0))
+    extra = ttk.Frame(frm); extra.grid(row=18, column=0, columnspan=4, sticky='ew', pady=(6, 0))
     ttk.Label(extra, text='Connected Rockbox iPod (no reformat):').pack(side='left')
     vb = ttk.Button(extra, text='Copy video files from .ipsw'); vb.pack(side='left', padx=(8, 0))
     # 1.7: no clock sync (bcm overlay v85 uses Rockbox's own USB code again, which does not watch for it)
     ck = ttk.Button(extra, text='Set clock now')
+    ttk.Button(extra, text='Extras (themes, fonts, settings)...',
+               command=lambda: extras_window(root, TITLE)).pack(side='left', padx=(8, 0))   # 1.14
     auto_var = tk.BooleanVar(value=False)
     auto_chk = ttk.Checkbutton(extra, text='Keep the clock right automatically', variable=auto_var)
     if clock_helper_installed():
@@ -2540,9 +3138,13 @@ def gui():
                     logw['state'] = 'normal'; logw.insert('end', v + '\n'); logw.see('end'); logw['state'] = 'disabled'
                 elif k == 'prog':
                     bar['value'] = int(v * 1000)
+                elif k == 'ipsw':
+                    ipsw_var.set(v)
+                elif k == 'then':
+                    root.after(300, v)
                 elif k == 'done':
                     st['busy'] = False
-                    for b in (go, rs, rf):
+                    for b in (go, rs, rf, dl_btn):
                         b['state'] = 'normal'
                     if v == 'clock':
                         pass
@@ -2563,7 +3165,7 @@ def gui():
 
     def run(job):
         st['busy'] = True
-        for b in (go, rs, rf):
+        for b in (go, rs, rf, dl_btn):
             b['state'] = 'disabled'
         def worker():
             err = None
@@ -2588,6 +3190,30 @@ def gui():
                                      parent=root)
         return (ans or '').strip().upper() == 'ERASE'
 
+    def ipsw_model():
+        """'5.5g' / '5g' from the chosen iPod (or the model box); None = ask"""
+        i = disk_box.current()
+        if mode.get() in ('ipod', 'move') and 0 <= i < len(st['items']):
+            u = getattr(st['items'][i][1], 'unit', None)
+            if u in (512, 2048):
+                return '5.5g' if u == 2048 else '5g'
+        if mode.get() == 'new':
+            return '5g' if model_var.get().startswith('iPod 5G') else '5.5g'
+        a_ = messagebox.askyesnocancel(TITLE, 'Which iPod is it?\n\nYes: 5.5G (Enhanced: 30/80 GB, search in the '
+                                       'Music menu)\nNo: 5G (original 30/60 GB)')
+        return None if a_ is None else '5.5g' if a_ else '5g'
+    def do_download(then=None):
+        m_ = ipsw_model()
+        if not m_:
+            return
+        def job():
+            p_ = ipsw_download(m_, here, log, prog)
+            q.put(('ipsw', p_))
+            if then:
+                q.put(('then', then))
+            return 'clock'                     # (no "Done" box)
+        run(job)
+    dl_btn['command'] = do_download
     def ipsw_choice():
         v = ipsw_var.get().strip()
         if v and not os.path.isfile(v):
@@ -2627,7 +3253,7 @@ def gui():
                     dt['name'], human(dt['size']), (' (drives ' + ' '.join(dt['letters']) + ')') if dt['letters'] else '')):
                 return
             def job():
-                s_ = WinDisk(n, writable=False); d_ = WinDisk(m)
+                s_ = Disk(n, writable=False); d_ = Disk(m)
                 try:
                     migrate(s_, d_, unit=unit, rockbox_zip=zp, bootloader=bl, label=label_var.get() or None,
                             cluster=cl, log=log, progress=prog, layout=layout_choice(), ipsw=ip_)
@@ -2639,10 +3265,16 @@ def gui():
             kd = kd_var.get().strip() or None
             if kd and not os.path.isdir(kd):
                 messagebox.showwarning(TITLE, 'The saved .rockbox folder does not exist.'); return
-            if not kd and not ip_ and not messagebox.askyesno(TITLE, 'No saved .rockbox folder and no iPod '
-                                                  'firmware (.ipsw) chosen: the iPod gets fresh settings and NO '
-                                                  'VideoCore files (needed for video).  Continue?'):
-                return
+            if not kd and not ip_:
+                a_ = messagebox.askyesnocancel(TITLE, 'No saved .rockbox folder and no iPod firmware (.ipsw) chosen: '
+                                               'the iPod would get NO VideoCore files (needed for video).\n\n'
+                                               'Yes: download Apple\'s firmware package for this model now (about '
+                                               '6.5 MB, checked against its known checksum), then continue\n'
+                                               'No: continue without video files\nCancel: stop')
+                if a_ is None:
+                    return
+                if a_:
+                    return do_download(then=do_go)
             if it['internal'] and not messagebox.askyesno(TITLE, 'Disk %d (%s, %s) is connected INSIDE this PC, '
                                                           'not by USB.  Really use it for the iPod?'
                                                           % (n, it['name'], human(it['size'])), icon='warning'):
@@ -2651,7 +3283,7 @@ def gui():
                                          (' (drives ' + ' '.join(it['letters']) + ')') if it['letters'] else '')):
                 return
             def job():
-                d = WinDisk(n)
+                d = Disk(n)
                 try:
                     new_drive(d, unit, zip_var.get(), boot_var.get(), keep_dir=kd, label=label, cluster=cl,
                               log=log, progress=prog, layout=layout_choice(), ipsw=ip_)
@@ -2660,7 +3292,7 @@ def gui():
             return run(job)
         keep_dir = None
         if keep_var.get():
-            d = WinDisk(n, writable=False)
+            d = Disk(n, writable=False)
             try:
                 src = keep_source(d, log)
             finally:
@@ -2679,7 +3311,7 @@ def gui():
         if not confirm(it.describe() + '\n(music, videos, playlists ...) and removes the Apple OS'):
             return
         def job():
-            d = WinDisk(n)
+            d = Disk(n)
             try:
                 setup(d, zip_var.get(), boot_var.get(), bk_var.get(), keep=keep_var.get(), keep_dir=keep_dir,
                       label=label, cluster=cl, log=log, progress=prog, layout=layout_choice(), ipsw=ip_)
@@ -2702,7 +3334,7 @@ def gui():
             return
         n = st['items'][i][0]
         def job():
-            d = WinDisk(n)
+            d = Disk(n)
             try:
                 restore_backup(d, path, log)
             finally:
@@ -2712,9 +3344,9 @@ def gui():
     def do_vfiles():
         ip_ = ipsw_choice()
         if not ip_:
-            if ip_ is None:
-                messagebox.showwarning(TITLE, 'Choose your iPod firmware (.ipsw) first -- e.g. iPod_25.1.3.ipsw '
-                                       'for a 5G / 5.5G.')
+            if ip_ is None and messagebox.askyesno(TITLE, 'No iPod firmware (.ipsw) chosen.  Download Apple\'s package '
+                                                   'for your model now (about 6.5 MB, checksum checked)?'):
+                do_download(then=do_vfiles)
             return
         roots = clock_sync_drives()
         if not roots:
@@ -2804,6 +3436,17 @@ def main2():
                                      'to disks.  Start it again and answer "Yes" when Windows asks.')
                 w.destroy()
             return
+        if os.name != 'nt' and not is_admin():          # 1.15: macOS / Linux
+            msg = ('iPod exFAT Setup needs root rights to write to disks.  Start it with\n\n  sudo "%s"\n\n(or double-'
+                   'click "Start iPod exFAT Setup.command").' % (sys.executable if getattr(sys, 'frozen', False)
+                                                                else os.path.abspath(sys.argv[0])))
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                w = tk.Tk(); w.withdraw(); messagebox.showerror('iPod exFAT Setup', msg); w.destroy()
+            except Exception:
+                print(msg)
+            return
         return gui()
     if os.name == 'nt' and ('--list' in a or '--disks' in a or '--migrate' in a) and not is_admin():
         sys.exit('run this from a command prompt opened with "Run as administrator"')
@@ -2836,8 +3479,8 @@ def main2():
         if '--from-image' in a:
             src = ImageDisk(opt('--from-image'), int(opt('--sector', '512')), writable=False)
         else:
-            src = WinDisk(int(opt('--from')), writable=False)
-        dst = ImageDisk(opt('--image'), int(opt('--sector', '512'))) if '--image' in a else WinDisk(int(opt('--disk')))
+            src = Disk(int(opt('--from')), writable=False)
+        dst = ImageDisk(opt('--image'), int(opt('--sector', '512'))) if '--image' in a else Disk(int(opt('--disk')))
         try:
             model = opt('--model')
             migrate(src, dst, unit=MODELS[model.lower()] if model else None, rockbox_zip=opt('--rockbox-zip'),
@@ -2853,7 +3496,7 @@ def main2():
     elif '--disk' in a:
         if not is_admin():
             sys.exit('run this from a command prompt opened with "Run as administrator"')
-        disk = WinDisk(int(opt('--disk')))
+        disk = Disk(int(opt('--disk')))
     else:
         sys.exit(__doc__)
     try:

@@ -24,7 +24,9 @@ $(OPUSLIB) : CODECFLAGS := -DHAVE_CONFIG_H \
 # the comb filter and de-emphasis, and SILK's synthesis and 48 kHz up-sampling.  Every function gets its own section
 # (-ffunction-sections); the listed ones are renamed to .icode in the objects that go into the archive, the rest stay
 # in .text.  The lists name functions, so the file contents are not touched.
-ifeq ($(MODELNAME),ipodvideo)
+# v144: BCM_OPUS_IRAM=0 builds the stock layout (code in DRAM) for the System > Debug > Codec A/B comparison
+BCM_OPUS_IRAM ?= 1
+ifeq ($(MODELNAME)$(BCM_OPUS_IRAM),ipodvideo1)
 $(OPUSLIB) : CODECFLAGS += -ffunction-sections
 OPUS_IRAM_FN := opus_fft_impl kf_bfly2 kf_bfly3 kf_bfly4 kf_bfly5 clt_mdct_backward_c \
     comb_filter comb_filter_const_c deemphasis celt_synthesis tf_decode \

@@ -305,7 +305,11 @@
 
 /* 4 transfer descriptors per endpoint allow 64k transfers, which is the usual MSC
    transfer size, so it seems like a good size */
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+#define NUM_TDS_PER_EP 16   /* bcm overlay v143: up to 256 KB per transfer (System > Debug > USB Speed Test) */
+#else
 #define NUM_TDS_PER_EP 4
+#endif
 
 struct usb_drv_ep_spec usb_drv_ep_specs[USB_NUM_ENDPOINTS]; /* filled in usb_drv_startup */
 uint8_t usb_drv_ep_specs_flags = USB_ENDPOINT_SPEC_FORCE_IO_TYPE_MATCH;

@@ -102,6 +102,9 @@ static void battery_reading_cb(int v) { battery_set_reading(v); }
 void bcm_line_out_apply(int mode, int gain);
 static void dock_line_out_apply(int v) { bcm_line_out_apply(v, global_settings.line_out_gain); }
 static void line_out_gain_apply(int v) { bcm_line_out_apply(global_settings.dock_line_out, v); }
+/* bcm overlay v143: Settings > General Settings > System > Disk > Optimize Solid State */
+void bcm_ssd_apply(bool on);
+static void ssd_optimize_cb(bool on) { bcm_ssd_apply(on); }
 #endif
 
 #define NODEFAULT INT(0)
@@ -1374,6 +1377,7 @@ const struct settings_list settings[] = {
     /* the video player's TV output (BCM2722 composite / S-video: dock connector and the headphone jack's 4th contact) */
     CHOICE_SETTING(0, bcm_video_out, LANG_VIDEO_OUT, 2, "video out", "on,ask,off,auto", NULL, 4,
                    ID2P(LANG_ON), ID2P(LANG_ASK), ID2P(LANG_OFF), ID2P(LANG_VIDEO_OUT_AUTO)),
+    OFFON_SETTING(0, bcm_tv_browser, LANG_TV_BROWSER, false, "tv file browser", NULL),                    /* v143 */
     CHOICE_SETTING(0, bcm_tv_signal, LANG_TV_SIGNAL, 0, "tv signal", "ntsc,pal", NULL, 2,
                    ID2P(LANG_TV_NTSC), ID2P(LANG_TV_PAL)),
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,
@@ -1777,6 +1781,9 @@ const struct settings_list settings[] = {
     INT_SETTING(F_TIME_SETTING, ssd_poweroff, LANG_SSD_POWEROFF, 60, "ssd power off",
                     UNIT_SEC, 0, 300, 5, formatter_time_unit_0_is_off, getlang_time_unit_0_is_off,
                     ata_set_ssd_poweroff),
+#endif
+#ifdef IPOD_VIDEO
+    OFFON_SETTING(0, ssd_optimize, LANG_SSD_OPTIMIZE, false, "optimize solid state", ssd_optimize_cb),   /* v143 */
 #endif
 #endif /* HAVE_DISK_STORAGE */
     /* browser */

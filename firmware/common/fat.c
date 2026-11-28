@@ -5197,6 +5197,96 @@ uint32_t fat_lookup_want(const char *name)
 }
 #endif
 
+#ifndef BOOTLOADER
+/* bcm overlay v144: Debug > Fragmentation.  The pieces of an open file (a NoFatChain file is one piece by definition)
+   and its clusters; -1 = a read failed */
+long fat_file_fragments(const struct fat_file *file, unsigned long *clusters)
+{
+    struct bpb * const fat_bpb = FAT_BPB(file->volume);
+    long c, prev = -1, frags = 0;
+    unsigned long n = 0;
+    *clusters = 0;
+    if (!fat_bpb || file->firstcluster <= 0)
+        return 0;
+    if (fat_bpb->is_exfat && (file->firstcluster & EXFAT_CONTIG))
+    {
+        uint32_t r = exfat_run_length(fat_bpb, file);
+        if (r != 0xffffffff && r != EXFAT_RUN_CHAINED)
+        {
+            *clusters = r;
+            return 1;
+        }
+    }
+    c = exfat_clus(file->firstcluster);
+    while (c > 0 && n <= fat_bpb->dataclusters)
+    {
+        if (c != prev + 1)
+            frags++;
+        prev = c;
+        n++;
+        c = fat_bpb->is_exfat ? exfat_file_next(fat_bpb, file, c) : get_next_cluster(fat_bpb, c);
+        if (!(n & 1023))
+            yield();
+    }
+    *clusters = n;
+    return c < 0 ? -1 : frags;
+}
+
+/* the free space in pieces (exFAT: from the allocation bitmap, big direct reads); false = not exFAT or a read failed */
+bool fat_free_extents(IF_MV(int volume,) unsigned long *runs, unsigned long *largest, unsigned long *freec,
+                      unsigned long *cluster_bytes)
+{
+    struct bpb * const fat_bpb = FAT_BPB(volume);
+    if (!fat_bpb || !fat_bpb->is_exfat)
+        return false;
+    unsigned long total = fat_bpb->dataclusters, bits = 0, run = 0, ss = LOG_SECTOR_SIZE(fat_bpb);
+    unsigned long nsec = (total + ss * 8 - 1) / (ss * 8), per = sizeof(exfat_bitmap_buf) / ss;
+    bool ok = true;
+    *runs = *largest = *freec = 0;
+    *cluster_bytes = fat_bpb->bpb_secperclus * ss;
+    dc_lock_cache();
+    dc_commit_all(IF_MV(fat_bpb->volume));
+    for (unsigned long s = 0; s < nsec && ok; s += per)
+    {
+        unsigned long n = MIN(per, nsec - s);
+        if (storage_read_sectors(IF_MD(fat_bpb->drive,) fat_bpb->startsector + fat_bpb->ex_bitmap_sector + s,
+                                 n, exfat_bitmap_buf) < 0)
+        {
+            ok = false;
+            break;
+        }
+        for (unsigned long i = 0; i < n * ss && bits < total; i++)
+        {
+            uint8_t v = exfat_bitmap_buf[i];
+            unsigned int k = MIN(8ul, total - bits);
+            if (v == 0 && k == 8)
+                run += 8;                    /* all free */
+            else
+                for (unsigned int b = 0; b < k; b++)
+                {
+                    if (!(v >> b & 1))
+                        run++;
+                    else if (run)
+                    {
+                        (*runs)++; *freec += run;
+                        if (run > *largest) *largest = run;
+                        run = 0;
+                    }
+                }
+            bits += k;
+        }
+        yield();
+    }
+    if (run)
+    {
+        (*runs)++; *freec += run;
+        if (run > *largest) *largest = run;
+    }
+    dc_unlock_cache();
+    return ok;
+}
+#endif /* !BOOTLOADER */
+
 void fat_rewinddir(struct fat_dirscan_info *scan)
 {
     /* rewind the directory scan counter to the beginning */

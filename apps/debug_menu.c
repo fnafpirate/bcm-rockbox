@@ -149,6 +149,7 @@
 #include "bcm_subs.h"                     /* v73: soft subtitles */
 #include "bcm_dock.h"                     /* v74: docks */
 #include "bcm_cab2cav.h"                  /* v123: CABAC -> CAVLC */
+#include <ctype.h>
 #include "bcm_gif.h"                      /* v142: the TV-out animation */
 #endif
 
@@ -3227,6 +3228,12 @@ static int vc_seeks_boot;
 static int cfg_seek_budget = 110;                 /* v110: 90 -> 110 (deaths at 125-126) */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
 static int cfg_tv_menu = 0;                      /* v142: the file browser on the TV while on standby (Video Out On) */
+static int cfg_menu3 = 1;                        /* v144: MENU x3 outside a video = display rescue */
+static int cfg_saver_min = 2;                    /* v144: TV screensaver after this many minutes paused / idle */
+static bool pl_saver, sv_key;                    /* v144: the screensaver clip is playing / a button ended it */
+static long pl_bt_until, pl_bt_t0;              /* v144: Battery Load Check: a test clip plays (looped) until then */
+static int32_t bt_mv_sum, bt_other_sum;            /* v144: its readings: battery mV, the other loads' drops */
+static int bt_n;
 static int cfg_sleep_after_s = 120;               /* v119: a paused video sleeps after this long untouched (0 = never) */
 static int cfg_sleep_off_min = 30;                /* v119: asleep this long = power off (0 = no sleep: power off as before) */
 static int cfg_sleep_32k = 1;                     /* v121: Apple's light sleep (SDRAM self-refresh, 32 kHz, CPU stopped) */
@@ -5211,6 +5218,8 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
         else if (!strcmp(p, "keep_min")) cfg_keep_min = v < 1 ? 1 : v;
         else if (!strcmp(p, "tv_menu")) cfg_tv_menu = v;
+        else if (!strcmp(p, "menu3_rescue")) cfg_menu3 = v;
+        else if (!strcmp(p, "tv_saver_min")) cfg_saver_min = v;
         else if (!strcmp(p, "sleep_after_s")) cfg_sleep_after_s = v < 0 ? 0 : v < 10 ? 10 : v;   /* v119 */
         else if (!strcmp(p, "sleep_off_min")) cfg_sleep_off_min = v < 0 ? 0 : v;
         else if (!strcmp(p, "sleep_32k")) cfg_sleep_32k = v;
@@ -5640,7 +5649,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v142 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v144 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -6068,12 +6077,20 @@ static void clk_fmt(char *b, size_t n, long sod)
     snprintf(b, n, "%d:%02d%s", h12, m, h < 12 ? "AM" : "PM");
 }
 /* ---- drawing (into the canvases) */
+static bool osd_vol_fast;              /* v144: a volume click while the bar is up: only the bottom panel is drawn */
+static unsigned long osd_us_draw, osd_us_upd, osd_us_swap;   /* v144: where a volume click's time goes (the log) */
 static void osd_draw(void)
 {
     struct cv c0 = { osd_cv0, 48, 48 }, c1 = { osd_cv1, 112, 24 }, c2 = { osd_cv2, 320, 52 };
     uint32_t shown = sc_active ? pl_target_ms : pl_el_ms, rem;
     char a[16], d[20], t[8];
-    int fill, k, lvl = battery_level();
+    int fill, k, lvl;
+    if (osd_vol_fast && av_vol_until && TIME_BEFORE(current_tick, av_vol_until))
+    {   /* v144: the icon, battery and TV canvases are not shown again for a volume click: leave them as they are */
+        cv_clear(&c2);
+        goto vol_panel;
+    }
+    lvl = battery_level();
     cv_clear(&c0); cv_clear(&c1); cv_clear(&c2);
     if (bcm_tv)
     {   /* v55: the LCD shows a TV while the picture is on the TV: screen 72x48 with a frame, two antennas, a stand */
@@ -6132,6 +6149,7 @@ static void osd_draw(void)
         }
     }
     cv_tint = 0xFFFFFF;
+vol_panel:
     if (av_vol_until && TIME_BEFORE(current_tick, av_vol_until))
     {   /* v51: stock volume view 22060 instead of the progress bar: speaker, 246x24 bar, loud speaker */
         int vf = 246 * av_vol_pct / 100;
@@ -6258,9 +6276,11 @@ static void osd_present_mask(int mask)
     uint32_t o[4], pl[8], w4[4];
     int k, adds = 0;
     bool open = false, ch[OSD_NS] = { false, false, false, false };
+    unsigned long tq = USEC_TIMER;
     if (osd_ok <= 0) return;
     osd_bytes = 0;
     osd_draw();
+    osd_us_draw += USEC_TIMER - tq; tq = USEC_TIMER;
     if (mask & 4) osd_bottom_vol = av_vol_until && TIME_BEFORE(current_tick, av_vol_until);
     for (k = 0; k < OSD_NS; k++)
     {
@@ -6272,6 +6292,7 @@ static void osd_present_mask(int mask)
         else
             ch[k] = osd_update(s, s->front, !s->win[0] && !s->tvwin);
     }
+    osd_us_upd += USEC_TIMER - tq; tq = USEC_TIMER;
     for (k = 0; k < OSD_NS; k++)
     {
         struct osd_strip *s = &osd_s[k];
@@ -6340,6 +6361,7 @@ static void osd_present_mask(int mask)
         if (s->front < 0) s->front = 0;
     }
     if (open) bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+    osd_us_swap += USEC_TIMER - tq;
     osd_visible = true;
 }
 /* v142: TV out: the animated picture on the iPod's screen (/.rockbox/tv.gif) in place of the drawn TV (strip 3) */
@@ -7869,15 +7891,16 @@ out:
     core_unpin(h); core_free(h);
 }
 /* one frame on: the next image's window goes up, the last one's comes down (one update) */
-static void ta_tick(void)
+/* hold = keep the frame shown (paused video; v143: the TV File Browser with the iPod's backlight off) */
+static void ta_advance(bool hold)
 {
     uint32_t o[4], pl[8], w4[4];
     unsigned long now;
-    if (!bcm_tv || !ta_n || !osd_visible) return;
+    if (!ta_n) return;
     now = USEC_TIMER;
     if (ta_win)
     {
-        if (pl_paused || (long)(now - ta_next_us) < 0) return;
+        if (hold || (long)(now - ta_next_us) < 0) return;
         ta_cur = ta_cur + 1 < ta_n ? ta_cur + 1 : 0;
         ta_next_us += TA_FRAME_US;
         if ((long)(now - ta_next_us) > 100000) { ta_next_us = now + TA_FRAME_US; ta_late++; }
@@ -7894,6 +7917,11 @@ static void ta_tick(void)
         ta_win = nw; ta_shown++;
     }
     bcm_gfx_rpc(2, NULL, 0, o, NULL, 300);
+}
+static void ta_tick(void)
+{
+    if (!bcm_tv || !ta_n || !osd_visible) return;
+    ta_advance(pl_paused);
 }
 static bool ta_running(void) { return bcm_tv && ta_n && ta_win && !pl_paused; }
 static void bcm_osd_tick(void)
@@ -7915,7 +7943,9 @@ static void bcm_osd_tick(void)
             if (osd_ok < 0) osd_init();
             if (!osd_visible) osd_vol_only = true;
             if (bcm_tv && (!osd_tv_until || TIME_BEFORE(osd_tv_until, av_vol_until))) osd_tv_until = av_vol_until;
+            osd_vol_fast = osd_bottom_vol && osd_s[2].win[0];   /* v144: the bar is already up: draw only the panel */
             osd_present_mask(4);
+            osd_vol_fast = false;
             if (direct) { vol_direct_n++; vol_us_direct += USEC_TIMER - t0; }
             else { vol_full_n++; vol_us_full += USEC_TIMER - t0; }
             if (!bcm_tv && !pl_paused && !sc_active && (!osd_hide_at || TIME_BEFORE(osd_hide_at, av_vol_until))) osd_hide_at = av_vol_until;
@@ -7924,9 +7954,13 @@ static void bcm_osd_tick(void)
     }
     if (vol_direct_n + vol_full_n && av_vol_until && !TIME_BEFORE(current_tick, av_vol_until))
     {   /* v54: one line per volume burst */
-        BLOG("  volume %d %%: %d direct bar updates (avg %lu us), %d full (avg %lu us)", av_vol_pct, vol_direct_n,
-             vol_direct_n ? vol_us_direct / vol_direct_n : 0, vol_full_n, vol_full_n ? vol_us_full / vol_full_n : 0);
+        int nv = vol_direct_n + vol_full_n;
+        BLOG("  volume %d %%: %d direct bar updates (avg %lu us), %d full (avg %lu us); per click: draw %lu us, "
+             "pixels to the VideoCore %lu us, window swap %lu us", av_vol_pct, vol_direct_n,
+             vol_direct_n ? vol_us_direct / vol_direct_n : 0, vol_full_n, vol_full_n ? vol_us_full / vol_full_n : 0,
+             osd_us_draw / nv, osd_us_upd / nv, osd_us_swap / nv);
         vol_direct_n = vol_full_n = 0; vol_us_direct = vol_us_full = 0;
+        osd_us_draw = osd_us_upd = osd_us_swap = 0;
     }
     if (bcm_tv && osd_visible && (osd_s[0].tvwin || osd_s[2].tvwin) && !osd_tv_want(0))
         osd_present_mask(0);                           /* v56: removes the TV windows (the iPod screen keeps its overlay) */
@@ -8108,6 +8142,12 @@ static int bcm_player_input(char *resp, size_t rn)
     if (vr_r != vr_w && vr_drain(resp, rn)) return 1;  /* v63 */
     b = button_get_w_tmo(0);
     if (b == BUTTON_NONE) return 0;
+    if ((pl_saver || pl_bt_until) && !IS_SYSEVENT(b) && !(b & (BUTTON_REL | BUTTON_REPEAT)))
+    {   /* v144: the screensaver (or a Battery Load Check clip): any button ends it */
+        BLOG("  screensaver: a button -> back");
+        sv_key = true;
+        return 1;
+    }
     if (b == SYS_PHONE_UNPLUGGED || b == SYS_PHONE_PLUGGED)
     {   /* v76: headphones out = pause (Settings > Playback > Pause on Headphone Unplug); back in = resume with
            "Pause and Resume".  Not on a TV or a dock: the sound is not in the headphones there. */
@@ -8129,6 +8169,21 @@ static int bcm_player_input(char *resp, size_t rn)
         {   /* v119: like the iPod -- a held PLAY, the idle power-off or the sleep timer puts it to sleep (the video comes
                back where it was at the next button press; asleep cfg sleep_off_min = 30 minutes, it powers off and the
                next start continues the video) */
+            if (!pl_paused && !sl_play_hold)
+            {   /* v144: playing when the sleep timer ran out: the sound fades out over 3 s, then it pauses (the volume
+                   goes back for the next time; paused, nothing is heard).  The position stays in memory while asleep:
+                   the only write is the one at the final power-off. */
+                static char fr[96];
+                int p0 = av_vol_pct, i, t;
+                BLOG("  sleep timer: fading out from %d %%", p0);
+                for (i = 1; i <= 30; i++)
+                {
+                    av_set_vol(p0 * (30 - i) / 30);
+                    for (t = 0; t < 10; t++) { bcm_host_service(); sleep(1); }
+                }
+                pl_set_paused(true, fr, sizeof fr);
+                av_set_vol(p0);
+            }
             sl_arm("power off asked (held PLAY / idle power-off / sleep timer)");
             return 1;
         }
@@ -8475,6 +8530,14 @@ static uint32_t pl_pos_now(void)
    counted on the PMU's clock: the resume point is written with a "*" (the one write) and it powers off; the next start
    plays that video on and clears the "*". */
 static bool sl_want, sl_replay, sl_force;
+/* v144: TV screensaver: /.rockbox/tv_saver.mp4 (any video the iPod plays; the one shipped is the GIF bouncing on black,
+   made on a PC) loops on the TV when a video has been paused on the TV for cfg tv_saver_min minutes (default 2,
+   instead of the sleep the iPod screen gets), or the TV File Browser has been untouched that long.  Any button ends
+   it: the paused video comes back where it was (the same way as after a sleep), or the list.  After 30 minutes of
+   screensaver the iPod sleeps as before (and powers off later). */
+#define TVS_PATH ROCKBOX_DIR "/tv_saver.mp4"
+static bool sv_want;
+static int sv_have = -1;                 /* the file exists (looked up once per video) */
 static uint32_t sl_pos;
 static char sl_path[MAX_PATH];
 static bool sl_ok(void)
@@ -8612,6 +8675,95 @@ static void bcm_sleep(void)
 }
 /* the same video again after a wake, at the point it slept */
 static bool bcm_run(const char *play_path);
+/* ---- v144: Battery Load Check.  Eight test clips (/.rockbox/battery_test/: simple and busy pictures, 320x240 at
+   200 kbit/s and 640x480 at 400 kbit/s, CAVLC and CABAC) play in turn, with the iPod idle (screen on, nothing playing)
+   before, between and after them.  Each clip's voltage drop = the mean of the idle readings on both sides minus the
+   reading while it plays, less the drops the battery reading already counts on its own (backlight, CPU boost, sound).
+   battery_loads.cfg keeps the drops for the iPod's screen and for the TV; a video then starts with the drop for its
+   size, CABAC or not and its output (between the two sizes: in proportion to the pixels) instead of the guess. */
+#define BT_DIR      ROCKBOX_DIR "/battery_test"
+#define BT_CFG      ROCKBOX_DIR "/battery_loads.cfg"
+#define BT_SETTLE   50                                 /* s before the readings count */
+#define BT_CLIP_S   160                                /* s per clip */
+#define BT_IDLE_S   100                                /* s idle between them */
+static const char * const bt_clip[8] = {
+    "simple_320x240_200k_cavlc", "stress_320x240_200k_cavlc", "simple_640x480_400k_cavlc", "stress_640x480_400k_cavlc",
+    "simple_320x240_200k_cabac", "stress_320x240_200k_cabac", "simple_640x480_400k_cabac", "stress_640x480_400k_cabac" };
+/* [tv][cabac][large][stress]: mV, -1 = not measured */
+static int16_t bt_tab[2][2][2][2];
+static int8_t bt_loaded = -1;
+static void bt_reading(void)
+{
+    struct battery_smooth_info bi;
+    int k, other = 0, mv = battery_voltage();
+    if (mv <= 0) return;
+    battery_smooth_info(&bi);
+    for (k = 0; k < 3; k++)                            /* backlight, boost, sound: not the video's own (bit 3) */
+        if (bi.loads & (1u << k)) other += bi.sag_mv[k];
+    bt_mv_sum += mv; bt_other_sum += other; bt_n++;
+}
+static void bt_load(void)
+{
+    char line[96];
+    int fd, a, b, c, d;
+    memset(bt_tab, 0xff, sizeof bt_tab);
+    bt_loaded = 0;
+    fd = open(BT_CFG, O_RDONLY);
+    if (fd < 0) return;
+    while (read_line(fd, line, sizeof line) > 0)
+    {   /* "lcd stress 640x480 cabac: 57" */
+        char *q = strchr(line, ':');
+        if (line[0] == '#' || !q) continue;
+        a = !strncmp(line, "tv ", 3);
+        b = strstr(line, " cabac") != NULL;
+        c = strstr(line, "640x480") != NULL;
+        d = strstr(line, "stress") != NULL;
+        bt_tab[a][b][c][d] = (int16_t)atoi(q + 1);
+        bt_loaded = 1;
+    }
+    close(fd);
+}
+static int bt_pair(int tv, int cab, int big)
+{   /* simple and busy: a real video lies between them, so their mean (or the one measured) */
+    int s = bt_tab[tv][cab][big][0], b = bt_tab[tv][cab][big][1];
+    if (s >= 0 && b >= 0) return (s + b + 1) / 2;
+    return s >= 0 ? s : b;
+}
+static void blc_apply(void)
+{
+    int tv = bcm_tv ? 1 : 0, cab = c2c_on ? 1 : 0, lo, hi, mv;
+    uint32_t px = m4.width * m4.height;
+    if (bt_loaded < 0) bt_load();
+    if (bt_loaded <= 0 || !px) return;
+    lo = bt_pair(tv, cab, 0); hi = bt_pair(tv, cab, 1);
+    if (lo < 0 && hi < 0) return;
+    if (lo < 0) mv = hi;
+    else if (hi < 0) mv = lo;
+    else if (px <= 320 * 240) mv = lo;
+    else if (px >= 640 * 480) mv = hi;
+    else mv = lo + (int)((int64_t)(hi - lo) * (int32_t)(px - 320 * 240) / (640 * 480 - 320 * 240));
+    battery_set_video_sag(mv);
+    BLOG("battery: Battery Load Check drop for %ux%u, %s, %s: %d mV", (unsigned)m4.width, (unsigned)m4.height,
+         cab ? "CABAC" : "CAVLC", tv ? "TV" : "iPod screen", mv);
+}
+/* v144: the screensaver clip on the TV until a button (or 30 minutes); from_browser = the TV File Browser was idle */
+static void sv_loop(bool from_browser)
+{
+    long t0 = current_tick;
+    sv_key = false;
+    while (!sv_key && current_tick - t0 < (long)cfg_sleep_off_min * 60 * HZ && !pl_sys_event && !usb_inserted())
+    {
+        bool tv = bcm_tv;
+        pl_saver = true; bcm_tv = true;
+        bcm_video_finished = false; bcm_video_next_request = 0; bcm_resume_ms = 0;
+        bcm_run(TVS_PATH);
+        pl_saver = false; bcm_tv = tv;
+        if (!bcm_video_finished) break;                /* it did not just reach its end (a button, an error, power) */
+    }
+    if (from_browser) return;
+    if (sv_key) sl_replay = true;                      /* the paused video comes back where it was */
+    else if (!pl_sys_event && !usb_inserted()) bcm_sleep();   /* 30 minutes: the sleep it would have had */
+}
 static bool bcm_run_sl(const char *path)
 {
     bool r = bcm_run(path);
@@ -8768,6 +8920,8 @@ static bool bln_curve(const uint16_t *mv, unsigned n, unsigned short out[11])
 }
 /* v142: the file keeps the curves of the last three runs ("# run" lines); the curve used is their median point by point
    (two runs: the mean), so one run spoilt by a warm pocket or a stray drive spin-up does not decide it alone */
+static int bln_run(bool cont);
+static int bln_health = 100;                           /* v143: % of the longest kept run */
 static bool bln_save_curve(const unsigned short c0[11], unsigned n)
 {
     unsigned short runs[3][11], c[11];
@@ -8797,6 +8951,11 @@ static bool bln_save_curve(const unsigned short c0[11], unsigned n)
         if (k == 11) nr++;
     }
     memcpy(runs[nr++], c0, sizeof runs[0]);
+    {   /* v143: this run's length against the longest kept: the same load, so the ratio is the capacity left */
+        unsigned mx = 0, me = (unsigned)((unsigned long)n * bln_period / 60);
+        for (r = 0; r < nh; r++) { unsigned m = (unsigned)atoi(hist[r] + 6); if (m > mx) mx = m; }
+        if (mx > me) bln_health = (int)(me * 100 / mx); else bln_health = 100;
+    }
     for (k = 0; k <= 10; k++)
     {
         unsigned short a = runs[0][k], b = nr > 1 ? runs[1][k] : a, d = nr > 2 ? runs[2][k] : b, t;
@@ -8815,6 +8974,7 @@ static bool bln_save_curve(const unsigned short c0[11], unsigned n)
     fdprintf(fd, "# written by Learn Battery (bcm overlay v142): the median of the last %d run(s), screen at full brightness\n"
                  "# mV at 0 %%, 10 %%, ... 100 %% (load-compensated).  Delete this file to go back to the built-in curve.\n", nr);
     for (r = 0; r < nh; r++) fdprintf(fd, "%s\n", hist[r]);
+    if (nh) fdprintf(fd, "# this run lasted %d %% as long as the longest kept one (same load: about the capacity left)\n", bln_health);
     fdprintf(fd, "# run %u min:", (unsigned)((unsigned long)n * bln_period / 60));
     for (k = 0; k <= 10; k++) fdprintf(fd, "%s %u", k ? "," : "", (unsigned)c0[k]);
     fdprintf(fd, "\ndischarge:");
@@ -8854,46 +9014,117 @@ void bcm_battery_learn_boot(void)
     }
     close(fd);
     if (done) return;
+    {   /* v143: did the low battery end it (finish it now), or a restart in the middle (offer to carry on)? */
+        extern unsigned short battery_level_shutoff;
+        unsigned last = bln_n ? bln_mv[bln_n - 1] : 0;
+        if (last > battery_level_shutoff + 80u)
+        {
+            const char *l[3];
+            struct text_message m;
+            int now = battery_voltage();
+            if (charger_inserted() || now > (int)last + 60)
+            {   bln_mark("stopped: interrupted, then charged"); splash(3 * HZ, "Learn Battery was interrupted (charged since)"); return; }
+            l[0] = "Learn Battery was interrupted"; l[1] = "(the iPod restarted)."; l[2] = "Carry on with it?";
+            m.message_lines = l; m.nb_lines = 3;
+            if (gui_syncyesno_run(&m, NULL, NULL) == YESNO_YES) { bln_run(true); return; }
+            bln_mark("stopped: interrupted"); return;
+        }
+    }
     bln_mark(bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n) ? "done (at the next start)" : "done: too short");
     if ((unsigned long)bln_n * bln_period >= 2 * 3600)
         splashf(3 * HZ, "Battery learned (%lu h %lu min run)", (unsigned long)bln_n * bln_period / 3600,
                 (unsigned long)bln_n * bln_period / 60 % 60);
 }
-int bcm_battery_learn(void)
+/* v143: the screen while learning.  The theme is switched off (its backdrop and status bar stayed the same for hours)
+   and the whole screen is a moving colour field: every pixel runs through every colour about every 16 s, redrawn 4
+   times a second -- the same work every second, so the load stays constant (a video would not: its decoder's power
+   changes with every scene).  The text box wanders. */
+static fb_data bln_pal[256];
+static void bln_anim(unsigned ph, const char t[][48], int nt)
+{
+    int x, y, w, fh, k, bx, by, bw = 0, bh;
+    fb_data *p;
+    if (!bln_pal[255])
+        for (k = 0; k < 256; k++)
+        {   /* a hue wheel at about 3/4 brightness */
+            int h = k * 6, f = h & 255, r, g, b, q = 190 - f * 190 / 256, u = f * 190 / 256;
+            switch (h >> 8)
+            {
+                case 0: r = 190; g = u; b = 0; break;
+                case 1: r = q; g = 190; b = 0; break;
+                case 2: r = 0; g = 190; b = u; break;
+                case 3: r = 0; g = q; b = 190; break;
+                case 4: r = u; g = 0; b = 190; break;
+                default: r = 190; g = 0; b = q; break;
+            }
+            bln_pal[k] = LCD_RGBPACK(r, g, b);
+        }
+    lcd_set_viewport(NULL);
+    p = FBADDR(0, 0);
+    for (y = 0; y < LCD_HEIGHT; y++)
+    {
+        unsigned base = (unsigned)y + ph * 4;
+        for (x = 0; x < LCD_WIDTH; x++) *p++ = bln_pal[(base + (unsigned)x) & 255];
+    }
+    for (k = 0; k < nt; k++) { lcd_getstringsize(t[k], &w, &fh); if (w > bw) bw = w; }
+    lcd_getstringsize("A", &w, &fh);
+    bw += 12; bh = nt * fh + 10;
+    bx = LCD_WIDTH > bw ? (int)(ph * 3 % (unsigned)(2 * (LCD_WIDTH - bw))) : 0;
+    if (bx > LCD_WIDTH - bw) bx = 2 * (LCD_WIDTH - bw) - bx;
+    by = LCD_HEIGHT > bh ? (int)(ph * 2 % (unsigned)(2 * (LCD_HEIGHT - bh))) : 0;
+    if (by > LCD_HEIGHT - bh) by = 2 * (LCD_HEIGHT - bh) - by;
+    lcd_set_foreground(LCD_BLACK);
+    lcd_fillrect(bx, by, bw, bh);
+    lcd_set_foreground(LCD_WHITE);
+    lcd_set_drawmode(DRMODE_FG);
+    for (k = 0; k < nt; k++) lcd_putsxy(bx + 6, by + 5 + k * fh, t[k]);
+    lcd_set_drawmode(DRMODE_SOLID);
+    lcd_update();
+}
+/* cont = carry on with the samples already in bln_mv (a run the iPod's restart interrupted) */
+static int bln_run(bool cont)
 {
     extern unsigned short battery_level_shutoff;
     struct battery_smooth_info bi;
     unsigned short c[11];
     const char *lines[3];
     struct text_message msg;
-    unsigned flushed = 0;
-    long next = current_tick + BLN_PERIOD * HZ, shown = 0, quiet_until = 0, sum = 0;
-    int cnt = 0;
+    unsigned flushed = cont ? bln_n : 0, ph = 0;
+    long next = current_tick + BLN_PERIOD * HZ, shown = 0, quiet_until = 0, sum = 0, next_read = current_tick + HZ;
+    int cnt = 0, raw0 = battery_voltage();
     int lvl = battery_level();
     if (charger_inserted())
     {
         splash(4 * HZ, "Charge to full, unplug the charger, then start Learn Battery");
         return 0;
     }
-    if (lvl >= 0 && lvl < 95)
-    {
-        splashf(4 * HZ, "Battery at %d %% -- charge to full first", lvl);
+    if (!cont && ((lvl >= 0 && lvl < 95) || (raw0 > 0 && raw0 < 4050)))
+    {   /* v143: also the voltage itself (a learned curve can be wrong -- that is why it is being learned again) */
+        splashf(4 * HZ, "Battery at %d %% (%d mV) -- charge to full first", lvl, raw0);
         return 0;
     }
-    lines[0] = "Screen on full until the battery is empty";
-    lines[1] = "(10-20 h). Do not use the iPod meanwhile.";
-    lines[2] = "MENU stops. Start?";
-    msg.message_lines = lines; msg.nb_lines = 3;
-    if (gui_syncyesno_run(&msg, NULL, NULL) != YESNO_YES) return 0;
-    remove(BLN_LOG);
-    bln_mark("# Learn Battery (bcm overlay v142): one load-compensated mV per 10 s (the mean of 10 readings)");
-    bln_mark("# period 10");
-    bln_n = 0; bln_period = BLN_PERIOD;
+    if (!cont)
+    {
+        lines[0] = "Screen on full until the battery is empty";
+        lines[1] = "(10-20 h). Do not use the iPod meanwhile.";
+        lines[2] = "MENU stops. Start?";
+        msg.message_lines = lines; msg.nb_lines = 3;
+        if (gui_syncyesno_run(&msg, NULL, NULL) != YESNO_YES) return 0;
+        remove(BLN_LOG);
+        bln_mark("# Learn Battery (bcm overlay v143): one load-compensated mV per 10 s (the mean of 10 readings)");
+        bln_mark("# period 10");
+        bln_n = 0; bln_period = BLN_PERIOD;
+    }
+    else bln_mark("# continued after a restart");
+    msg.message_lines = lines;
+    FOR_NB_SCREENS(i) viewportmanager_theme_enable(i, false, NULL);
+    lcd_set_backdrop(NULL);
+    cancel_cpu_boost();
     backlight_set_brightness(MAX_BRIGHTNESS_SETTING);
     button_clear_queue();
     while (1)
     {
-        int b = button_get_w_tmo(HZ);
+        int b = button_get_w_tmo(HZ / 4);
         int raw = battery_voltage();
         backlight_on();
         reset_poweroff_timer();
@@ -8901,14 +9132,17 @@ int bcm_battery_learn(void)
         {
             lines[0] = "Stop learning?"; msg.nb_lines = 1;
             if (gui_syncyesno_run(&msg, NULL, NULL) == YESNO_YES) { bln_flush(flushed, bln_n); bln_mark("stopped"); break; }
-            msg.nb_lines = 3;
         }
         if (charger_inserted())
         {   bln_flush(flushed, bln_n); bln_mark("stopped: charger"); splash(3 * HZ, "Charger in: learning stopped"); break; }
-        if (b == BUTTON_NONE && TIME_AFTER(current_tick, quiet_until))
-        {   /* one reading a second (the wait above), none in the 20 s after a log write */
-            battery_smooth_info(&bi);
-            sum += bi.comp_mv > 0 ? bi.comp_mv : raw; cnt++;
+        if (!TIME_BEFORE(current_tick, next_read))
+        {   /* one reading a second, none in the 20 s after a log write */
+            next_read += HZ;
+            if (TIME_AFTER(current_tick, quiet_until))
+            {
+                battery_smooth_info(&bi);
+                sum += bi.comp_mv > 0 ? bi.comp_mv : raw; cnt++;
+            }
         }
         if (!TIME_BEFORE(current_tick, next))
         {
@@ -8921,18 +9155,13 @@ int bcm_battery_learn(void)
         if (raw > 0 && raw <= battery_level_shutoff + 10)   /* v142: +10 mV (was +25): the run's end is the 0 % point */
         {   /* empty: finish here, before Rockbox's own low-battery power-off */
             bln_flush(flushed, bln_n);
-            if (bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n)) { bln_mark("done"); splash(4 * HZ, "Battery learned -- powering off"); }
+            if (bln_curve(bln_mv, bln_n, c) && bln_save_curve(c, bln_n)) { bln_mark("done"); splashf(4 * HZ, "Battery learned (%d %% of the longest run) -- powering off", bln_health); }
             else { bln_mark("done: too short"); splash(4 * HZ, "Run too short -- nothing learned"); }
             sys_poweroff();
             break;
         }
-        if (current_tick - shown >= 5 * HZ)
-        {   /* v140: nothing stays on one spot for hours -- the text moves every 5 s and the whole screen swaps between
-               light-on-dark and dark-on-light every minute, so every pixel spends about as long bright as dark
-               (no image retention on the LCD); the backlight stays at full brightness the whole time */
-            static unsigned step;
-            int w, fh, x, y, k;
-            bool light = (current_tick / (60 * HZ)) & 1;
+        if (current_tick - shown >= HZ / 4)
+        {
             char t[4][48];
             shown = current_tick;
             battery_smooth_info(&bi);
@@ -8941,21 +9170,383 @@ int bcm_battery_learn(void)
             snprintf(t[1], sizeof t[1], "%d mV (compensated %d)", raw, bi.comp_mv);
             snprintf(t[2], sizeof t[2], "empty at about %u mV", (unsigned)battery_level_shutoff);
             snprintf(t[3], sizeof t[3], "Leave it alone. MENU stops.");
-            lcd_getstringsize(t[3], &w, &fh);
-            step++;
-            x = LCD_WIDTH - w > 0 ? (int)(step * 37 % (unsigned)(LCD_WIDTH - w)) : 0;
-            y = LCD_HEIGHT - 4 * fh > 0 ? (int)(step * 53 % (unsigned)(LCD_HEIGHT - 4 * fh)) : 0;
-            lcd_set_background(light ? LCD_WHITE : LCD_BLACK);
-            lcd_set_foreground(light ? LCD_BLACK : LCD_WHITE);
-            lcd_clear_display();
-            for (k = 0; k < 4; k++) lcd_putsxy(x, y + k * fh, t[k]);
-            lcd_update();
+            bln_anim(ph++, (const char (*)[48])t, 4);
         }
     }
     backlight_set_brightness(global_settings.brightness);
     lcd_set_background(global_settings.bg_color);
     lcd_set_foreground(global_settings.fg_color);
+    FOR_NB_SCREENS(i) viewportmanager_theme_undo(i, true);
     return 0;
+}
+int bcm_battery_learn(void) { return bln_run(false); }
+
+/* v144: Codec A/B (Debug menu).  /.rockbox/codecs_alt/ holds a second build of the Opus, MP3 and AAC decoders with a
+   different IRAM layout; SELECT swaps it with the one in /.rockbox/codecs.  X.txt says what each file is: line 1 the
+   one in codecs_alt, line 2 the one in use.  Measure with Open With > test_codec > speed test, swap, measure again. */
+#define CAB_DIR ROCKBOX_DIR "/codecs_alt"
+static bool cab_desc(const char *c, char d[2][40])
+{
+    char p[MAX_PATH];
+    int fd;
+    snprintf(p, sizeof p, CAB_DIR "/%s.txt", c);
+    d[0][0] = d[1][0] = 0;
+    fd = open(p, O_RDONLY);
+    if (fd < 0) return false;
+    read_line(fd, d[0], 40); read_line(fd, d[1], 40);
+    close(fd);
+    return true;
+}
+static bool dbg_codec_ab(void)
+{
+    static const char * const name[3] = { "Opus", "MP3", "AAC / M4A" }, * const file[3] = { "opus", "mpa", "aac" };
+    int sel = 0, i, b;
+    char d[2][40], a[MAX_PATH], u[MAX_PATH], t[MAX_PATH];
+    audio_stop();                                      /* the decoder in use is read again at the next track */
+    while (1)
+    {
+        lcd_clear_display();
+        lcd_puts(0, 0, "Codec A/B (IRAM layout)");
+        for (i = 0; i < 3; i++)
+        {
+            snprintf(a, sizeof a, CAB_DIR "/%s.codec", file[i]);
+            if (!file_exists(a) || !cab_desc(file[i], d)) lcd_putsf(0, 2 + 2 * i, "%c %s: no second build", i == sel ? '>' : ' ', name[i]);
+            else
+            {
+                lcd_putsf(0, 2 + 2 * i, "%c %s: %s", i == sel ? '>' : ' ', name[i], d[1]);
+                lcd_putsf(0, 3 + 2 * i, "    (other: %s)", d[0]);
+            }
+        }
+        lcd_puts(0, 9, "SELECT swaps, MENU leaves.");
+        lcd_puts(0, 10, "Measure: Open With > test_codec");
+        lcd_puts(0, 11, "> speed test, swap, again.");
+        lcd_update();
+        b = button_get(true);
+        if (b == BUTTON_MENU || b == BUTTON_LEFT) return false;
+        if (b == BUTTON_SCROLL_FWD || b == BUTTON_RIGHT) sel = (sel + 1) % 3;
+        else if (b == BUTTON_SCROLL_BACK) sel = (sel + 2) % 3;
+        else if (b == BUTTON_SELECT)
+        {
+            int fd;
+            snprintf(a, sizeof a, CAB_DIR "/%s.codec", file[sel]);
+            snprintf(u, sizeof u, CODECS_DIR "/%s.codec", file[sel]);
+            snprintf(t, sizeof t, CODECS_DIR "/%s.codec.swap", file[sel]);
+            if (!file_exists(a) || !cab_desc(file[sel], d)) { splash(2 * HZ, "No second build of this one"); continue; }
+            if (rename(u, t) < 0) { splash(2 * HZ, "Swap failed"); continue; }
+            if (rename(a, u) < 0) { rename(t, u); splash(2 * HZ, "Swap failed"); continue; }
+            rename(t, a);
+            snprintf(t, sizeof t, CAB_DIR "/%s.txt", file[sel]);
+            fd = open(t, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd >= 0) { fdprintf(fd, "%s\n%s\n", d[1], d[0]); close(fd); }
+            splashf(HZ, "%s: %s now", name[sel], d[0]);
+        }
+        else if (IS_SYSEVENT(b) && default_event_handler(b) == SYS_USB_CONNECTED) return true;
+    }
+}
+/* v144: Fragmentation (Debug menu): every file on the drive in how many pieces, and the free space in how many.
+   Files the formatter / Move copied are one piece each (exFAT NoFatChain); what Rockbox or a PC wrote later may not be.
+   iPod Defrag (on the PC) puts files back into one piece. */
+extern long file_fragments(int fildes, unsigned long *clusters);
+extern bool fat_free_extents(IF_MV(int volume,) unsigned long *runs, unsigned long *largest, unsigned long *freec,
+                             unsigned long *cluster_bytes);
+struct fr_stat { unsigned long files, whole, pieces, clusters, scanned_dirs; long worst_n[3]; char worst[3][MAX_PATH]; bool stop; long shown; };
+static void fr_walk(char *path, int depth, struct fr_stat *st)
+{
+    DIR *d;
+    struct dirent *e;
+    size_t len = strlen(path);
+    if (depth > 12 || st->stop) return;
+    d = opendir(len ? path : "/");
+    if (!d) return;
+    st->scanned_dirs++;
+    while (!st->stop && (e = readdir(d)))
+    {
+        struct dirinfo di = dir_get_info(d, e);
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (len + strlen(e->d_name) + 2 >= MAX_PATH) continue;
+        path[len] = '/'; strcpy(path + len + 1, e->d_name);
+        if (di.attribute & ATTR_DIRECTORY) fr_walk(path, depth + 1, st);
+        else if (di.size > 0)
+        {
+            int fd = open(path, O_RDONLY);
+            if (fd >= 0)
+            {
+                unsigned long cl;
+                long n = file_fragments(fd, &cl);
+                close(fd);
+                if (n > 0)
+                {
+                    int k;
+                    st->files++; st->pieces += n; st->clusters += cl;
+                    if (n == 1) st->whole++;
+                    for (k = 0; k < 3; k++)
+                        if (n > st->worst_n[k])
+                        {   /* the three files in the most pieces */
+                            int j;
+                            for (j = 2; j > k; j--) { st->worst_n[j] = st->worst_n[j - 1]; strcpy(st->worst[j], st->worst[j - 1]); }
+                            st->worst_n[k] = n; strlcpy(st->worst[k], path, MAX_PATH);
+                            break;
+                        }
+                }
+            }
+        }
+        path[len] = 0;
+        if (current_tick - st->shown > HZ / 2)
+        {
+            int b = button_get(false);
+            st->shown = current_tick;
+            if (b == BUTTON_MENU) st->stop = true;
+            lcd_clear_display();
+            lcd_puts(0, 0, "Fragmentation: reading...");
+            lcd_putsf(0, 1, "%lu files, %lu folders", st->files, st->scanned_dirs);
+            lcd_puts_scroll(0, 2, len ? path : "/");
+            lcd_puts(0, 4, "MENU stops");
+            lcd_update();
+        }
+    }
+    closedir(d);
+}
+static bool dbg_fragmentation(void)
+{
+    static struct fr_stat st;
+    static char path[MAX_PATH];
+    unsigned long runs = 0, largest = 0, freec = 0, cb = 0;
+    bool fx;
+    int b, y = 0, k;
+    long t0 = current_tick;
+    memset(&st, 0, sizeof st);
+    path[0] = 0;
+    st.shown = 0;
+    cpu_boost(true);
+    fr_walk(path, 0, &st);
+    fx = fat_free_extents(IF_MV(0,) &runs, &largest, &freec, &cb);
+    cpu_boost(false);
+    lcd_scroll_stop();
+    lcd_clear_display();
+    lcd_putsf(0, y++, "Fragmentation%s (%ld s)", st.stop ? " (stopped)" : "", (current_tick - t0) / HZ);
+    lcd_putsf(0, y++, "files: %lu, in one piece: %lu (%lu.%lu %%)", st.files, st.whole,
+              st.files ? st.whole * 100 / st.files : 0, st.files ? st.whole * 1000 / st.files % 10 : 0);
+    lcd_putsf(0, y++, "pieces: %lu, %lu.%02lu per file", st.pieces, st.files ? st.pieces / st.files : 0,
+              st.files ? st.pieces * 100 / st.files % 100 : 0);
+    for (k = 0; k < 3 && st.worst_n[k] > 1; k++)
+        lcd_putsf(0, y++, "%ld: %s", st.worst_n[k], st.worst[k]);
+    if (fx)
+    {
+        lcd_putsf(0, y++, "free: %lu MB in %lu pieces", (unsigned long)((uint64_t)freec * cb >> 20), runs);
+        lcd_putsf(0, y++, "largest free piece: %lu MB", (unsigned long)((uint64_t)largest * cb >> 20));
+    }
+    else lcd_puts(0, y++, "free space: exFAT only");
+    y++;
+    lcd_puts(0, y++, st.whole == st.files ? "Nothing to defragment." : "iPod Defrag (on the PC) joins the pieces.");
+    lcd_update();
+    while ((b = button_get(true)) == BUTTON_NONE || (b & BUTTON_REL)) ;
+    return IS_SYSEVENT(b) && default_event_handler(b) == SYS_USB_CONNECTED;
+}
+/* v144: AV Cable Probe (Debug menu).  Rockbox does not know of a signal that tells Apple's AV (composite) cable from
+   headphones in the 3.5 mm jack -- Apple's own firmware asks "TV On / Off" instead.  This screen looks for one: the 12
+   GPIO ports (only the bits that hold still), the jack's headphone detect and the accessory ADC with nothing in the jack,
+   with headphones, and with the AV cable.  A bit that differs between headphones and the AV cable is a candidate;
+   av_probe.txt keeps the readings. */
+struct avp_snap { uint32_t and_[12], or_[12]; int adc_lo, adc_hi; bool hp; };
+static void avp_take(struct avp_snap *p)
+{
+    int i, k;
+    for (k = 0; k < 12; k++) { p->and_[k] = 0xffffffffu; p->or_[k] = 0; }
+    p->adc_lo = 99999; p->adc_hi = -1; p->hp = headphones_inserted();
+    for (i = 0; i < 100; i++)
+    {
+        uint32_t v[12] = { GPIOA_INPUT_VAL, GPIOB_INPUT_VAL, GPIOC_INPUT_VAL, GPIOD_INPUT_VAL, GPIOE_INPUT_VAL, GPIOF_INPUT_VAL,
+                           GPIOG_INPUT_VAL, GPIOH_INPUT_VAL, GPIOI_INPUT_VAL, GPIOJ_INPUT_VAL, GPIOK_INPUT_VAL, GPIOL_INPUT_VAL };
+        int a = adc_scan(ADC_ACCESSORY);
+        for (k = 0; k < 12; k++) { p->and_[k] &= v[k] & 0xff; p->or_[k] |= v[k] & 0xff; }
+        if (a < p->adc_lo) p->adc_lo = a;
+        if (a > p->adc_hi) p->adc_hi = a;
+        sleep(1);
+    }
+}
+static bool dbg_av_probe(void)
+{
+    static const char * const step[3] = { "Nothing in the headphone jack", "Headphones in the jack", "The AV (composite) cable in" };
+    static struct avp_snap sn[3];
+    int i, k, b, y, cand = 0, fd;
+    for (i = 0; i < 3; i++)
+    {
+        lcd_clear_display();
+        lcd_puts(0, 0, "AV Cable Probe");
+        lcd_putsf(0, 2, "Step %d of 3:", i + 1);
+        lcd_puts(0, 3, step[i]);
+        lcd_puts(0, 5, "then SELECT (MENU leaves)");
+        lcd_update();
+        while ((b = button_get(true)) != BUTTON_SELECT)
+        {
+            if (b == BUTTON_MENU) return false;
+            if (IS_SYSEVENT(b) && default_event_handler(b) == SYS_USB_CONNECTED) return true;
+        }
+        splash(0, "Reading...");
+        avp_take(&sn[i]);
+    }
+    fd = open(ROCKBOX_DIR "/av_probe.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) fdprintf(fd, "AV Cable Probe (bcm overlay v144): GPIO A..L low bytes, steady bits; accessory ADC min-max\n");
+    for (i = 0; i < 3 && fd >= 0; i++)
+    {
+        fdprintf(fd, "%s: headphone detect %d, ADC %d-%d\n ", step[i], sn[i].hp, sn[i].adc_lo, sn[i].adc_hi);
+        for (k = 0; k < 12; k++) fdprintf(fd, " %c=%02lx/%02lx", 'A' + k, (unsigned long)sn[i].and_[k], (unsigned long)sn[i].or_[k]);
+        fdprintf(fd, "\n");
+    }
+    lcd_clear_display();
+    lcd_puts(0, 0, "AV Cable Probe: headphones vs AV");
+    y = 2;
+    for (k = 0; k < 12; k++)
+    {   /* bits steady in both readings and different between them */
+        uint32_t st1 = ~(sn[1].and_[k] ^ sn[1].or_[k]) & 0xff, st2 = ~(sn[2].and_[k] ^ sn[2].or_[k]) & 0xff;
+        uint32_t d = st1 & st2 & (sn[1].and_[k] ^ sn[2].and_[k]);
+        if (d)
+        {
+            cand++;
+            lcd_putsf(0, y++, "GPIO %c bits %02lx: %02lx -> %02lx", 'A' + k, (unsigned long)d,
+                      (unsigned long)(sn[1].and_[k] & d), (unsigned long)(sn[2].and_[k] & d));
+            if (fd >= 0) fdprintf(fd, "candidate: GPIO %c bits %02lx (headphones %02lx, AV %02lx)\n", 'A' + k, (unsigned long)d,
+                                  (unsigned long)(sn[1].and_[k] & d), (unsigned long)(sn[2].and_[k] & d));
+        }
+    }
+    if (sn[2].adc_hi < sn[1].adc_lo - 8 || sn[2].adc_lo > sn[1].adc_hi + 8)
+    {
+        cand++;
+        lcd_putsf(0, y++, "accessory ADC: %d -> %d", (sn[1].adc_lo + sn[1].adc_hi) / 2, (sn[2].adc_lo + sn[2].adc_hi) / 2);
+        if (fd >= 0) fdprintf(fd, "candidate: accessory ADC\n");
+    }
+    if (sn[1].hp != sn[2].hp) lcd_putsf(0, y++, "headphone detect: %d -> %d", sn[1].hp, sn[2].hp);
+    if (fd >= 0) close(fd);
+    y++;
+    lcd_puts(0, y++, cand ? "Candidates found: send av_probe.txt" : "No difference found (as expected:");
+    lcd_puts(0, y++, cand ? "(in /.rockbox) so it can be used." : "the jack may not tell them apart).");
+    lcd_update();
+    while ((b = button_get(true)) == BUTTON_NONE || (b & BUTTON_REL)) ;
+    return IS_SYSEVENT(b) && default_event_handler(b) == SYS_USB_CONNECTED;
+}
+/* v144: Battery Load Check (Debug menu): see bt_reading above */
+static bool bt_idle(int seconds, const char *what, int *mv)
+{   /* the iPod idle with the screen on as it is during a video; false = MENU or the charger */
+    long t0 = current_tick, shown = 0;
+    bt_mv_sum = bt_other_sum = 0; bt_n = 0;
+    while (current_tick - t0 < seconds * HZ)
+    {
+        int b = button_get_w_tmo(HZ / 4);
+        static long nx;
+        backlight_on();
+        reset_poweroff_timer();
+        if (b == BUTTON_MENU || charger_inserted()) return false;
+        if (current_tick - t0 >= BT_SETTLE * HZ && TIME_AFTER(current_tick, nx)) { nx = current_tick + HZ; bt_reading(); }
+        if (current_tick - shown >= HZ)
+        {
+            shown = current_tick;
+            lcd_clear_display();
+            lcd_puts(0, 0, "Battery Load Check");
+            lcd_puts(0, 1, what);
+            lcd_putsf(0, 2, "idle: %d s left", (int)(seconds - (current_tick - t0) / HZ));
+            lcd_putsf(0, 3, "%d mV", battery_voltage());
+            lcd_puts(0, 5, "Leave it alone. MENU stops.");
+            lcd_update();
+        }
+    }
+    if (!bt_n) return false;
+    *mv = (bt_mv_sum + bt_n / 2) / bt_n;
+    mv[1] = (bt_other_sum + bt_n / 2) / bt_n;
+    return true;
+}
+static bool dbg_battery_loads(void)
+{
+    static const char * const outs[2] = { "iPod screen", "TV" };
+    int res[8], base[2], prev[2], n = 0, i, have = 0, tv, fd;
+    bool stop = false, tv_save = bcm_tv;
+    char path[MAX_PATH], line[96];
+    const char *lines[3];
+    struct text_message msg = { lines, 3 };
+    for (i = 0; i < 8; i++)
+    {
+        snprintf(path, sizeof path, BT_DIR "/%s.mp4", bt_clip[i]);
+        if (file_exists(path)) have |= 1 << i;
+    }
+    if (!have) { splash(4 * HZ, "Copy the test clips to /.rockbox/battery_test first"); return false; }
+    if (charger_inserted()) { splash(4 * HZ, "Unplug the charger first"); return false; }
+    if (battery_level() >= 0 && battery_level() < 30) { splash(4 * HZ, "Charge to 30 %% or more first"); return false; }
+    {
+        MENUITEM_STRINGLIST(om, "Measure on", NULL, "iPod screen", "TV");
+        int sel = do_menu(&om, NULL, NULL, false);
+        if (sel != 0 && sel != 1) return false;
+        tv = sel;
+    }
+    lines[0] = "About 35 minutes. Leave the";
+    lines[1] = tv ? "TV cable in, the iPod alone." : "iPod alone meanwhile.";
+    lines[2] = "MENU stops. Start?";
+    if (gui_syncyesno_run(&msg, NULL, NULL) != YESNO_YES) return false;
+    for (i = 0; i < 8; i++) res[i] = -1;
+    backlight_set_brightness(MAX_BRIGHTNESS_SETTING);  /* as during a video */
+    cancel_cpu_boost();
+    if (!bt_idle(BT_IDLE_S, "before the first clip", prev)) stop = true;
+    for (i = 0; i < 8 && !stop; i++)
+    {
+        int clip[2];
+        if (!(have & (1 << i))) continue;
+        snprintf(path, sizeof path, BT_DIR "/%s.mp4", bt_clip[i]);
+        splashf(HZ, "%d of 8: %s", i + 1, bt_clip[i]);
+        bcm_tv = tv;
+        bt_mv_sum = bt_other_sum = 0; bt_n = 0;
+        pl_bt_t0 = current_tick; pl_bt_until = current_tick + BT_CLIP_S * HZ;
+        sv_key = false;
+        bcm_video_next_request = 0; bcm_video_finished = false; bcm_resume_ms = 0;
+        bcm_run_sl(path);
+        pl_bt_until = 0;
+        bcm_tv = tv_save;
+        if (sv_key || !bcm_video_finished || bt_n < 30) { stop = true; break; }
+        clip[0] = (bt_mv_sum + bt_n / 2) / bt_n; clip[1] = (bt_other_sum + bt_n / 2) / bt_n;
+        backlight_set_brightness(MAX_BRIGHTNESS_SETTING);
+        if (!bt_idle(BT_IDLE_S, bt_clip[i], base)) { stop = true; break; }
+        /* the drop: idle on both sides (the battery ran down meanwhile) minus the clip, less what is counted already */
+        res[i] = (prev[0] + base[0] + 1) / 2 - clip[0] - (clip[1] - (prev[1] + base[1] + 1) / 2);
+        if (res[i] < 0) res[i] = 0;
+        if (res[i] > 250) res[i] = 250;
+        prev[0] = base[0]; prev[1] = base[1];
+        n++;
+    }
+    backlight_set_brightness(global_settings.brightness);
+    if (n)
+    {   /* the other output's lines stay */
+        char keep[16][96];
+        int nk = 0;
+        fd = open(BT_CFG, O_RDONLY);
+        if (fd >= 0)
+        {
+            while (read_line(fd, line, sizeof line) > 0 && nk < 16)
+                if (line[0] != '#' && strchr(line, ':') && (!strncmp(line, "tv ", 3)) != tv) strlcpy(keep[nk++], line, sizeof keep[0]);
+            close(fd);
+        }
+        fd = open(BT_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0)
+        {
+            fdprintf(fd, "# Battery Load Check (bcm overlay v144): the voltage drop of each test clip, mV\n");
+            for (i = 0; i < nk; i++) fdprintf(fd, "%s\n", keep[i]);
+            for (i = 0; i < 8; i++)
+                if (res[i] >= 0)
+                    fdprintf(fd, "%s %s %s %s: %d\n", tv ? "tv" : "lcd", bt_clip[i][1] == 't' ? "stress" : "simple",
+                             strstr(bt_clip[i], "640") ? "640x480" : "320x240", strstr(bt_clip[i], "cabac") ? "cabac" : "cavlc", res[i]);
+            close(fd);
+        }
+        bt_loaded = -1;                                /* read again at the next video */
+    }
+    /* the results */
+    {
+        int b;
+        lcd_clear_display();
+        lcd_putsf(0, 0, "Battery Load Check: %s%s", outs[tv], stop ? " (stopped)" : "");
+        for (i = 0; i < 8; i++)
+            if (res[i] >= 0) lcd_putsf(0, 1 + i, "%-26s %3d mV", bt_clip[i], res[i]);
+            else lcd_putsf(0, 1 + i, "%-26s  --", bt_clip[i]);
+        lcd_puts(0, 10, n ? "Saved to battery_loads.cfg" : "Nothing measured");
+        lcd_update();
+        while ((b = button_get(true)) == BUTTON_NONE || (b & BUTTON_REL) || IS_SYSEVENT(b)) ;
+    }
+    return false;
 }
 
 /* ---- v96: recovery.  A VideoCore that stops (no frame request for hang_s while playing, four player commands in a row
@@ -9211,6 +9802,7 @@ static void bcm_video_run(int secs)
     av_open(bcm_play_path ? bcm_play_path : v_path);   /* v51: sound (starts when the picture moves) */
     if (!bcm_tv) backlight_on();                       /* v87: not on the TV (see above) */
     bool hold_was = button_hold();
+    bool bt_applied = false;                           /* v144 */
     bool probed = !cfg_trickprobe || qz_on;            /* v88: the trick probe seeks around: not in the quiz */
     qz_ran = true;
     if (qz_on)
@@ -9227,7 +9819,7 @@ static void bcm_video_run(int secs)
         bcm_cmd_t0 = current_tick; r2 = bcm_gencmd_watched(c, resp, sizeof resp, 2); bcm_log_text(c, r2, resp);
     }
     mon_start("mp_play (start-up pre-buffer)");
-    if (bcm_tv) osd_show_for(3000);                    /* v55: TV: controls + TV symbol on the LCD the whole time; v56: 3 s on the TV */
+    if (bcm_tv && !pl_saver) osd_show_for(3000);                    /* v55: TV: controls + TV symbol on the LCD the whole time; v56: 3 s on the TV */
     vr_r = vr_w; sc_remote = false; vr_el_tick = 0;      /* v63: dock commands from before this video are dropped */
     st_seeked(); st_fast_until = current_tick + 10 * HZ;  /* v73: subtitles: frequent position reads while the picture starts */
     bcm_video_running = true;
@@ -9249,7 +9841,35 @@ static void bcm_video_run(int secs)
                (log of 27 Nov) */
             if (!pl_paused) last_req = current_tick;
         }
-        if (cfg_sleep_after_s > 0 && pl_paused && !sc_active && sl_ok() &&
+        if (sv_have < 0) sv_have = bcm_tv && file_exists(TVS_PATH);
+        if (!pl_saver && sv_have && cfg_saver_min > 0 && pl_paused && !sc_active && sl_ok() &&
+            TIME_AFTER(current_tick, pause_t + cfg_saver_min * 60 * HZ) &&
+            TIME_AFTER(current_tick, pl_input_tick + cfg_saver_min * 60 * HZ))
+        {   /* v144: paused on the TV and untouched: the screensaver (the video comes back after it) */
+            sv_want = true;
+            sl_arm("TV screensaver");
+            break;
+        }
+        if ((pl_saver || pl_bt_until) && v_eos_tick)
+        {   /* v144: the screensaver clip loops: from the start again before its end */
+            pl_restart(); v_eos = 0; v_eos_tick = 0;
+        }
+        if (pl_bt_until)
+        {   /* v144: Battery Load Check: one reading a second once the voltage has settled (Rockbox's average needs ~40 s) */
+            static long bt_next;
+            if (TIME_AFTER(current_tick, pl_bt_t0 + BT_SETTLE * HZ) && TIME_AFTER(current_tick, bt_next))
+            {
+                bt_next = current_tick + HZ;
+                bt_reading();
+            }
+            if (TIME_AFTER(current_tick, pl_bt_until)) { bcm_video_finished = true; break; }
+        }
+        else if (!bt_applied && current_tick - run_t0 > 3 * HZ)
+        {   /* v144: the drop measured for this kind of video (Battery Load Check) for the battery reading */
+            bt_applied = true;
+            blc_apply();
+        }
+        if (cfg_sleep_after_s > 0 && pl_paused && !sc_active && sl_ok() && !(sv_have > 0 && cfg_saver_min > 0) &&
             TIME_AFTER(current_tick, pause_t + cfg_sleep_after_s * HZ) &&
             TIME_AFTER(current_tick, pl_input_tick + cfg_sleep_after_s * HZ))
         {   /* v119: the iPod's 2 minutes paused and untouched -> sleep */
@@ -10316,6 +10936,7 @@ static void bcm_reset_run_state(void)
     gfx_front = -1; gfx_presents = 0; memset(gfx_win, 0, sizeof gfx_win); memset(gfx_black, 0, sizeof gfx_black);
     osd_ok = -1; osd_visible = false;
     ta_n = 0; ta_win = 0; ta_tried = false; ta_shown = ta_late = 0; memset(ta_img, 0, sizeof ta_img);   /* v142 */
+    sv_have = -1;                                      /* v144 */
     for (k = 0; k < OSD_NS; k++) { osd_s[k].front = -1; memset(osd_s[k].win, 0, sizeof osd_s[k].win); osd_s[k].tvwin = 0; }
     pl_paused = false; pl_el_ms = 0; pl_dur_ms = 0; pl_target_ms = 0;
     sc_active = false; sc_btn = 0; mon_until = 0;
@@ -10541,14 +11162,258 @@ static int xt_cfg_put(int n)
     return 0;
 }
 /* at start-up: fat_xfer=N from bcm_test.cfg */
+/* ---- v143: Optimize Solid State.  At the very first start (no /.rockbox/.ssd_checked) the drive is checked once: what
+   it reports about itself (rotation rate, form factor, TRIM, CF timing -- ata_disk_isssd()) and how long random 4 KB
+   reads take (a hard disk needs 5-20 ms per seek, flash well under 1 ms).  Solid state -> the setting goes on.
+   On: the drive goes to standby after 3 s idle (it wakes in milliseconds; the Disk Spindown setting is for a disk that
+   takes seconds to spin up), file reads go out in up to 512 KB commands (+2 % on the v139 test; the Drive Transfer
+   Test result wins if there is one), and USB gets the fast write chunks and the read-ahead window. */
+#define SSD_MARK ROCKBOX_DIR "/.ssd_checked"
+static bool ssd_xfer_from_test;
+void bcm_ssd_apply(bool on)
+{
+#ifndef SIMULATOR
+    extern bool usb_storage_fast_writes, usb_storage_readahead;
+    storage_spindown(on ? 3 : global_settings.disk_spindown);
+    if (!ssd_xfer_from_test) fat_set_max_read(on ? 1024 : 256);
+    usb_storage_fast_writes = on || global_settings.bcm_usb_fast;
+    usb_storage_readahead = on || global_settings.bcm_usb_readahead;
+#else
+    (void)on;
+#endif
+}
+static unsigned ssd_seek_us(void)
+{   /* the mean time of 12 random 4 KB reads spread over the drive (the first, which may wake it, is not counted) */
+#ifndef SIMULATOR
+    static uint8_t b[4096] __attribute__((aligned(32)));
+    struct storage_info si;
+    unsigned long long n, x = 0x9e3779b97f4a7c15ull;
+    unsigned long t, sum = 0;
+    int i;
+    storage_get_info(0, &si);
+    n = si.num_sectors;
+    if (n < 100000) return 0;
+    storage_read_sectors(IF_MD(0,) n / 2, 8, b);
+    for (i = 0; i < 12; i++)
+    {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        t = USEC_TIMER;
+        if (storage_read_sectors(IF_MD(0,) (sector_t)(x % (n - 16)) & ~7ull, 8, b) != 0) return 0;
+        sum += USEC_TIMER - t;
+    }
+    return (unsigned)(sum / 12);
+#else
+    return 0;
+#endif
+}
+static void ssd_first_check(void)
+{
+    char model[41];
+    unsigned short *id = ata_get_identify();
+    unsigned us;
+    bool reported, flash;
+    int fd, i;
+    if (file_exists(SSD_MARK)) return;
+    reported = ata_disk_isssd();
+    us = ssd_seek_us();
+    flash = reported || (us > 0 && us < 2000);
+    for (i = 0; i < 20; i++) { model[2 * i] = id ? (char)(id[27 + i] >> 8) : ' '; model[2 * i + 1] = id ? (char)id[27 + i] : ' '; }
+    model[40] = 0;
+    for (i = 39; i >= 0 && model[i] == ' '; i--) model[i] = 0;
+    global_settings.ssd_optimize = flash;
+    settings_save();
+    bcm_ssd_apply(flash);
+    fd = open(SSD_MARK, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0)
+    {
+        fdprintf(fd, "drive \"%s\": reports %s, random 4 KB read %u us -> %s (Optimize Solid State %s)\n"
+                     "Delete this file to check again at the next start.\n", model,
+                 reported ? "solid state" : "nothing about solid state", us, flash ? "solid state" : "hard disk", flash ? "on" : "off");
+        close(fd);
+    }
+    splashf(3 * HZ, flash ? "Solid-state drive (%u us reads): Optimize Solid State on" : "Hard disk (%u us reads)", us);
+}
+/* ---- v143: System > Debug > USB Speed Test.  Each USB connection while the test runs uses the next of these settings;
+   copy the same big folder to the iPod and back each time, then unplug.  After every step a line goes to
+   /.rockbox/usb_tune_log.txt; after the last one the best read and write settings are kept (usb_tune.cfg) and used for
+   every connection from then on.  Read chunk / write chunk = how much one USB transfer carries (the controller now
+   takes up to 256 KB: 16 descriptors); read-ahead = how far ahead one disk command reads when the computer reads a file
+   in order.  A step with less than 32 MB moved in a direction does not count for it (do it again). */
+#define UT_CFG ROCKBOX_DIR "/usb_tune.cfg"
+#define UT_LOG ROCKBOX_DIR "/usb_tune_log.txt"
+static const struct { short rd, wr, ra; const char *name; } ut_steps[] = {
+    { 64, 24, -1, "stock Rockbox (64 KB reads, 24 KB writes, no read-ahead)" },
+    { 64, 64, 256, "v107 (64 / 64 KB, 256 KB read-ahead)" },
+    { 128, 128, 512, "128 / 128 KB, 512 KB read-ahead" },
+    { 256, 256, 1024, "256 / 256 KB, 1 MB read-ahead" },
+    { 64, 64, 1024, "64 / 64 KB, 1 MB read-ahead" },
+    { 256, 128, 512, "256 / 128 KB, 512 KB read-ahead" },
+};
+#define UT_N ((int)ARRAYLEN(ut_steps))
+static int ut_step;                                   /* 0 = not testing, k = step k-1 next */
+static unsigned long ut_rd[UT_N], ut_wr[UT_N];        /* KB/s, 0 = not measured */
+static int ut_best_rd = -1, ut_best_wr = -1;          /* the result: step indexes */
+static void ut_save(void)
+{
+    int fd = open(UT_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0666), k;
+    if (fd < 0) return;
+    fdprintf(fd, "step=%d\nbest_read=%d\nbest_write=%d\n", ut_step, ut_best_rd, ut_best_wr);
+    for (k = 0; k < UT_N; k++) fdprintf(fd, "r%d=%lu\nw%d=%lu\n", k, ut_rd[k], k, ut_wr[k]);
+    close(fd);
+}
+/* the settings for the next connection */
+static void ut_arm(void)
+{
+#ifndef SIMULATOR
+    extern int usb_storage_tune_read_kb, usb_storage_tune_write_kb, usb_storage_tune_ra_kb;
+    if (ut_step > 0)
+    {
+        usb_storage_tune_read_kb = ut_steps[ut_step - 1].rd; usb_storage_tune_write_kb = ut_steps[ut_step - 1].wr;
+        usb_storage_tune_ra_kb = ut_steps[ut_step - 1].ra;
+    }
+    else
+    {
+        usb_storage_tune_read_kb = ut_best_rd >= 0 ? ut_steps[ut_best_rd].rd : 0;
+        usb_storage_tune_ra_kb = ut_best_rd >= 0 ? ut_steps[ut_best_rd].ra : 0;
+        usb_storage_tune_write_kb = ut_best_wr >= 0 ? ut_steps[ut_best_wr].wr : 0;
+    }
+#endif
+}
+static void ut_load(void)
+{
+    char line[48];
+    int fd = open(UT_CFG, O_RDONLY);
+    if (fd >= 0)
+    {
+        while (read_line(fd, line, sizeof line) > 0)
+        {
+            int k;
+            if (!strncmp(line, "step=", 5)) ut_step = atoi(line + 5);
+            else if (!strncmp(line, "best_read=", 10)) ut_best_rd = atoi(line + 10);
+            else if (!strncmp(line, "best_write=", 11)) ut_best_wr = atoi(line + 11);
+            else if ((line[0] == 'r' || line[0] == 'w') && (k = atoi(line + 1)) >= 0 && k < UT_N && strchr(line, '='))
+                (line[0] == 'r' ? ut_rd : ut_wr)[k] = strtoul(strchr(line, '=') + 1, NULL, 10);
+        }
+        close(fd);
+    }
+    if (ut_step < 0 || ut_step > UT_N) ut_step = 0;
+    if (ut_best_rd >= UT_N) ut_best_rd = -1;
+    if (ut_best_wr >= UT_N) ut_best_wr = -1;
+    ut_arm();
+}
+static void ut_log(const char *fmt, ...)
+{
+    char b[200];
+    va_list ap;
+    int fd = open(UT_LOG, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) return;
+    va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    fdprintf(fd, "%s\n", b);
+    close(fd);
+}
+/* apps/gui/usb_screen.c, after the cable is pulled (usb_storage_speed_save has the numbers) */
+void bcm_usb_tune_session(void)
+{
+#ifndef SIMULATOR
+    extern unsigned long usb_storage_last_kb[2], usb_storage_last_kbps[2], usb_storage_last_big[2];
+    int k = ut_step - 1, j;
+    bool rd_ok, wr_ok;
+    if (ut_step <= 0) return;
+    rd_ok = usb_storage_last_kb[0] >= 32 * 1024; wr_ok = usb_storage_last_kb[1] >= 32 * 1024;
+    ut_log("step %d/%d, %s: read %lu MB at %lu KB/s%s, write %lu MB at %lu KB/s%s; computer commands over 64 KB: "
+           "%lu read, %lu write", ut_step, UT_N, ut_steps[k].name,
+           usb_storage_last_kb[0] / 1024, usb_storage_last_kbps[0], rd_ok ? "" : " (too little to count)",
+           usb_storage_last_kb[1] / 1024, usb_storage_last_kbps[1], wr_ok ? "" : " (too little to count)",
+           usb_storage_last_big[0], usb_storage_last_big[1]);
+    if (rd_ok) ut_rd[k] = usb_storage_last_kbps[0];
+    if (wr_ok) ut_wr[k] = usb_storage_last_kbps[1];
+    if (!rd_ok || !wr_ok)
+        splashf(3 * HZ, "USB Speed Test: copy at least 32 MB each way -- step %d again", ut_step);
+    else if (ut_step < UT_N)
+    {
+        ut_step++;
+        splashf(3 * HZ, "USB Speed Test: step %d of %d next", ut_step, UT_N);
+    }
+    else
+    {   /* done: the fastest of each, ties to the earlier (smaller) setting */
+        ut_best_rd = ut_best_wr = 0;
+        for (j = 1; j < UT_N; j++)
+        {
+            if (ut_rd[j] > ut_rd[ut_best_rd] * 102 / 100) ut_best_rd = j;
+            if (ut_wr[j] > ut_wr[ut_best_wr] * 102 / 100) ut_best_wr = j;
+        }
+        ut_step = 0;
+        ut_log("RESULT: reads %s (%lu KB/s), writes %s (%lu KB/s) -- used from now on",
+               ut_steps[ut_best_rd].name, ut_rd[ut_best_rd], ut_steps[ut_best_wr].name, ut_wr[ut_best_wr]);
+        splashf(4 * HZ, "USB Speed Test done: read %lu KB/s, write %lu KB/s", ut_rd[ut_best_rd], ut_wr[ut_best_wr]);
+    }
+    ut_save();
+    ut_arm();
+#endif
+}
+static bool dbg_usb_tune(void)
+{
+    int b, k, y;
+    lcd_setfont(FONT_SYSFIXED);
+    while (1)
+    {
+        lcd_clear_display();
+        y = 0;
+        lcd_puts(0, y++, "USB Speed Test");
+        if (ut_step > 0)
+        {
+            lcd_putsf(0, y++, "running: step %d of %d next", ut_step, UT_N);
+            lcd_puts(0, y++, ut_steps[ut_step - 1].name);
+            lcd_puts(0, y++, "Plug in USB, copy a big folder");
+            lcd_puts(0, y++, "(>= 32 MB) to the iPod and back,");
+            lcd_puts(0, y++, "unplug. Repeat for every step.");
+        }
+        else if (ut_best_rd >= 0)
+        {
+            lcd_puts(0, y++, "result in use:");
+            lcd_putsf(0, y++, "read  %d KB, ahead %d KB", ut_steps[ut_best_rd].rd, ut_steps[ut_best_rd].ra < 0 ? 0 : ut_steps[ut_best_rd].ra);
+            lcd_putsf(0, y++, "write %d KB", ut_steps[ut_best_wr].wr);
+        }
+        else lcd_puts(0, y++, "not run (USB as the settings say)");
+        y++;
+        for (k = 0; k < UT_N; k++)
+            if (ut_rd[k] || ut_wr[k]) lcd_putsf(0, y++, "%d: read %lu  write %lu KB/s", k + 1, ut_rd[k], ut_wr[k]);
+        y++;
+        lcd_puts(0, y++, ut_step > 0 ? "SELECT stop  MENU back" : "SELECT start  PLAY forget  MENU back");
+        lcd_update();
+        b = button_get_w_tmo(HZ);
+        if (b == BUTTON_MENU) break;
+        if (b == BUTTON_SELECT)
+        {
+            if (ut_step > 0) { ut_step = 0; ut_log("stopped"); }
+            else
+            {
+                ut_step = 1; memset(ut_rd, 0, sizeof ut_rd); memset(ut_wr, 0, sizeof ut_wr);
+                ut_log("==== USB Speed Test (bcm overlay v143), %d steps", UT_N);
+            }
+            ut_save(); ut_arm();
+        }
+        else if (b == BUTTON_PLAY && ut_step == 0)
+        {
+            ut_best_rd = ut_best_wr = -1; ut_save(); ut_arm(); ut_log("result forgotten: USB as the settings say");
+        }
+    }
+    lcd_setfont(FONT_UI);
+    return false;
+}
 void bcm_fat_xfer_init(void)
 {
     char line[64];
     int fd = open("/.rockbox/bcm_test.cfg", O_RDONLY);
-    if (fd < 0) return;
-    while (read_line(fd, line, sizeof line) > 0)
-        if (!strncmp(line, "fat_xfer=", 9)) fat_set_max_read(strtoul(line + 9, NULL, 10));
-    close(fd);
+    if (fd >= 0)
+    {
+        while (read_line(fd, line, sizeof line) > 0)
+            if (!strncmp(line, "fat_xfer=", 9)) { fat_set_max_read(strtoul(line + 9, NULL, 10)); ssd_xfer_from_test = true; }
+        close(fd);
+    }
+    if (file_exists(SSD_MARK)) bcm_ssd_apply(global_settings.ssd_optimize);   /* v143 */
+    else ssd_first_check();
+    ut_load();                                         /* v143: USB Speed Test step / result */
 }
 static bool dbg_xfer_test(void)
 {
@@ -10877,9 +11742,11 @@ static bool kp_in_area(const char *path, bool is_file)
 }
 static bool bcm_standby;                         /* bcm_run: start-up only, no video (Keep VideoCore Ready) */
 /* the run that is ending may leave the VideoCore up */
+static bool tvb_tv_wanted(void);                   /* v143 */
 static bool kp_wanted(void)
 {
-    if (!kp_setting() || !bcm_player_mode || !bcm_play_path || (bcm_tv && !cfg_tv_menu) || qz_on || kp_warm_off) return false;
+    if (!(kp_setting() || (bcm_tv && tvb_tv_wanted())) || !bcm_player_mode || !bcm_play_path || (bcm_tv && !tvb_tv_wanted())
+        || qz_on || kp_warm_off) return false;            /* v143: the TV File Browser keeps it up on its own */
     return kp_in_area(bcm_play_path, !bcm_standby);
 }
 static void kp_upd_hook(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; kp_dirty = true; }
@@ -10960,6 +11827,7 @@ static void kp_log_line(const char *s)
     bcm_logline(s, (int)strlen(s));
     bcm_log_close();
 }
+static void tvb_stop(void);
 /* kp_mtx held */
 static void kp_release_locked(const char *why)
 {
@@ -10969,10 +11837,363 @@ static void kp_release_locked(const char *why)
     bcm_lcd_set_hosted(NULL, NULL);
     kp_hosted = false;
     kp_forget_images();
+    tvb_stop();                                        /* v143 */
     if (kp_tv) backlight_on();
     bcm_handback();                                    /* unfreezes the LCD driver and draws the frame buffer */
     lcd_update();
     bcm_log_close();
+}
+/* ---- v143: TV File Browser (Settings > Video > Video Out > TV File Browser).  With Video Out On (or Auto on a dock
+   that wants the TV), entering a video folder starts the VideoCore straight away (no 1.5 s wait: the iPod's screen is
+   not where you look) and the folder list is drawn for the TV at 640 x 480 -- its own layout and a large font from
+   /.rockbox/fonts, not the iPod's screen doubled.  The iPod's screen shows only /.rockbox/tv.gif (or a short note).
+   The wheel, SELECT and MENU work as usual; a video plays on the TV and the list comes back after it.  MENU three
+   times quickly = back to the iPod's own screen, without TV out, until the next restart. */
+#define TVB_W 640
+#define TVB_H 480
+static bool tvb_on, tvb_user_off;
+static int tvb_h = -1;
+static fb_data *tvb_buf;
+static uint32_t tvb_img, tvb_addr, tvb_win, tvl_img, tvl_addr, tvl_win;
+static uint32_t tvb_sum[TVB_H], tvb_sent[TVB_H];
+static volatile bool tvb_dirty;
+static int tvb_font = -1;
+static unsigned tvb_sig;
+static bool tvb_series;                  /* v144 */
+static char tvb_series_txt[48];
+static long tvb_menu_t;
+static int tvb_menu_n;
+static bool tvb_setting(void) { return global_settings.bcm_tv_browser || cfg_tv_menu; }
+static bool tvb_tv_wanted(void)
+{
+    return tvb_setting() && !tvb_user_off &&
+           (global_settings.bcm_video_out == 0 || (global_settings.bcm_video_out == 3 && iap_dock_tv_choice() == 1));
+}
+static void *tvb_addr_fn(int x, int y) { return tvb_buf + y * TVB_W + x; }
+/* the font: the one in /.rockbox/fonts whose size (the number its name starts with) is nearest 26, at least 18 */
+static void tvb_font_load(void)
+{
+    DIR *d;
+    struct dirent *e;
+    char best[MAX_PATH] = "", p[MAX_PATH];
+    int bd = 1000;
+    if (tvb_font >= 0) return;
+    d = opendir(ROCKBOX_DIR "/fonts");
+    if (!d) return;
+    while ((e = readdir(d)) != NULL)
+    {
+        int sz = atoi(e->d_name), dist;
+        size_t l = strlen(e->d_name);
+        if (sz < 18 || sz > 40 || l < 5 || strcasecmp(e->d_name + l - 4, ".fnt")) continue;
+        dist = sz > 26 ? sz - 26 : 26 - sz;
+        if (strcasestr(e->d_name, "bold")) dist -= 1;                  /* reads better on a TV */
+        if (dist < bd) { bd = dist; strlcpy(best, e->d_name, sizeof best); }
+    }
+    closedir(d);
+    if (!best[0]) return;
+    snprintf(p, sizeof p, ROCKBOX_DIR "/fonts/%s", best);
+    tvb_font = font_load(p);
+    BLOG("  TV File Browser: font %s -> %d", best, tvb_font);
+}
+static unsigned tvb_hash(unsigned h, const char *s) { while (*s) h = h * 31 + (unsigned char)*s++; return h; }
+/* v144: "S01E02" / "s1e2" / "1x02" in a name -> season, episode (0 = none) */
+static bool tvb_episode(const char *n, int *se, int *ep)
+{
+    const char *p;
+    for (p = n; *p; p++)
+    {
+        if ((*p == 'S' || *p == 's') && isdigit((unsigned char)p[1]))
+        {
+            char *q;
+            long a = strtol(p + 1, &q, 10);
+            if ((*q == 'E' || *q == 'e') && isdigit((unsigned char)q[1]) && (p == n || !isalnum((unsigned char)p[-1])))
+            { *se = (int)a; *ep = (int)strtol(q + 1, NULL, 10); return true; }
+        }
+        if (isdigit((unsigned char)*p) && (p == n || !isalnum((unsigned char)p[-1])))
+        {
+            char *q;
+            long a = strtol(p, &q, 10);
+            if ((*q == 'x' || *q == 'X') && isdigit((unsigned char)q[1]) && a < 100)
+            { *se = (int)a; *ep = (int)strtol(q + 1, NULL, 10); return true; }
+        }
+    }
+    return false;
+}
+/* the list, drawn into the 640 x 480 picture (main thread: apps/tree.c, after every key and twice a second) */
+static void tvb_render(void)
+{
+    struct tree_context *tc = tree_get_context();
+    struct viewport vp, *old;
+    struct frame_buffer_t fb;
+    int n, sel, rows, rowh, fh, w, top, r, y, x;
+    unsigned sig;
+    const char *dir, *base;
+    char t[MAX_PATH];
+    if (!tvb_on || !tvb_buf || !tc) return;
+    n = tc->filesindir; sel = tc->selected_item;
+    dir = tc->currdir;
+    base = strrchr(dir, '/'); base = base && base[1] ? base + 1 : dir[0] && dir[1] ? dir : "/";
+    memset(&vp, 0, sizeof vp);
+    vp.font = tvb_font >= 0 ? tvb_font : FONT_UI;
+    fh = font_get(vp.font)->height;
+    rowh = fh + 10;
+    rows = (TVB_H - 40 - 64 - 40) / rowh;
+    top = sel - rows / 2;
+    if (top > n - rows) top = n - rows;
+    if (top < 0) top = 0;
+    sig = tvb_hash((unsigned)n * 7919u + (unsigned)sel, dir);
+    for (r = 0; r < rows && top + r < n; r++)
+    {
+        struct entry *e = tree_get_entry_at(tc, top + r);
+        if (e && e->name) sig = tvb_hash(sig, e->name);
+    }
+    if (sig == tvb_sig) return;
+    tvb_sig = sig;
+    {   /* v144: a series folder: most names carry SxxEyy -> the header says so */
+        int i, eps = 0, smin = 999, smax = 0, se, ep;
+        for (i = 0; i < n; i++)
+        {
+            struct entry *e = tree_get_entry_at(tc, i);
+            if (e && e->name && !(e->attr & ATTR_DIRECTORY) && tvb_episode(e->name, &se, &ep))
+            { eps++; if (se < smin) smin = se; if (se > smax) smax = se; }
+        }
+        tvb_series = eps >= 3 && eps * 2 >= n;
+        if (tvb_series)
+            snprintf(tvb_series_txt, sizeof tvb_series_txt, smin == smax ? "%d episodes, season %d" : "%d episodes, seasons %d-%d",
+                     eps, smin, smax);
+    }
+    memset(&fb, 0, sizeof fb);
+    fb.data = tvb_buf; fb.get_address_fn = tvb_addr_fn; fb.stride = TVB_W; fb.elems = TVB_W * TVB_H;
+    vp.width = TVB_W; vp.height = TVB_H; vp.drawmode = DRMODE_SOLID; vp.buffer = &fb;
+    vp.fg_pattern = LCD_WHITE; vp.bg_pattern = LCD_BLACK;
+    for (y = 0; y < TVB_H; y++)
+    {   /* background: dark blue, a little lighter toward the bottom */
+        fb_data c = LCD_RGBPACK(8, 14 + y * 18 / TVB_H, 34 + y * 30 / TVB_H), *q = tvb_buf + y * TVB_W;
+        for (x = 0; x < TVB_W; x++) q[x] = c;
+    }
+    old = lcd_set_viewport(&vp);
+    /* header: the folder, the count */
+    lcd_set_foreground(LCD_RGBPACK(40, 70, 130));
+    lcd_fillrect(0, 40, TVB_W, rowh + 8);
+    lcd_set_drawmode(DRMODE_FG);
+    lcd_set_foreground(LCD_WHITE);
+    lcd_putsxy(48, 40 + 4, base);
+    if (tvb_series) strlcpy(t, tvb_series_txt, sizeof t);
+    else snprintf(t, sizeof t, "%d", n);
+    lcd_getstringsize(t, &w, NULL);
+    lcd_set_foreground(LCD_RGBPACK(170, 190, 230));
+    lcd_putsxy(TVB_W - 48 - w, 40 + 4, t);
+    lcd_set_drawmode(DRMODE_SOLID);
+    /* the list */
+    for (r = 0; r < rows && top + r < n; r++)
+    {
+        struct entry *e = tree_get_entry_at(tc, top + r);
+        bool isdir;
+        int ry = 40 + rowh + 8 + 8 + r * rowh;
+        if (!e || !e->name) continue;
+        isdir = (e->attr & ATTR_DIRECTORY) != 0;
+        strlcpy(t, e->name, sizeof t);
+        if (!isdir) { char *dot = strrchr(t, '.'); if (dot && dot != t) *dot = 0; }   /* no ".mp4" */
+        if (!isdir && tvb_series)
+        {   /* v144: "Show.Name.S01E02.Title" -> "1x02  Show Name S01E02 Title" (dots and underscores as spaces) */
+            int se, ep;
+            char *c;
+            for (c = t; *c; c++) if (*c == '.' || *c == '_') *c = ' ';
+            if (tvb_episode(t, &se, &ep))
+            {
+                char tmp[MAX_PATH];
+                snprintf(tmp, sizeof tmp, "%dx%02d   %s", se, ep, t);
+                strlcpy(t, tmp, sizeof t);
+            }
+        }
+        if (top + r == sel)
+        {
+            lcd_set_foreground(LCD_RGBPACK(50, 120, 220));
+            lcd_fillrect(40, ry - 2, TVB_W - 80 - 16, rowh);
+        }
+        if (isdir)
+        {   /* a small folder shape */
+            lcd_set_foreground(LCD_RGBPACK(240, 200, 90));
+            lcd_fillrect(52, ry + fh / 2 - 6, 8, 3);
+            lcd_fillrect(52, ry + fh / 2 - 3, 18, 12);
+        }
+        lcd_set_drawmode(DRMODE_FG);
+        lcd_set_foreground(top + r == sel ? LCD_WHITE : isdir ? LCD_RGBPACK(250, 225, 150) : LCD_RGBPACK(215, 220, 235));
+        lcd_putsxy(isdir ? 80 : 56, ry + 3, t);
+        lcd_set_drawmode(DRMODE_SOLID);
+    }
+    if (n > rows)
+    {   /* scroll bar */
+        int ty = 40 + rowh + 16, th = rows * rowh, bh = th * rows / n, by = ty + (th - bh) * top / (n - rows);
+        lcd_set_foreground(LCD_RGBPACK(30, 45, 80));
+        lcd_fillrect(TVB_W - 48, ty, 8, th);
+        lcd_set_foreground(LCD_RGBPACK(150, 175, 220));
+        lcd_fillrect(TVB_W - 48, by, 8, bh < 12 ? 12 : bh);
+    }
+    vp.font = FONT_SYSFIXED;
+    lcd_set_drawmode(DRMODE_FG);
+    lcd_set_foreground(LCD_RGBPACK(140, 155, 190));
+    lcd_putsxy(48, TVB_H - 40 - 12, "MENU three times: back to the iPod screen");
+    lcd_set_drawmode(DRMODE_SOLID);
+    lcd_set_viewport(old);
+    for (y = 0; y < TVB_H; y++)
+    {
+        const uint32_t *q = (const uint32_t *)(tvb_buf + y * TVB_W);
+        uint32_t h = 2166136261u;
+        for (x = 0; x < TVB_W / 2; x++) h = (h ^ q[x]) * 16777619u;
+        tvb_sum[y] = h;
+    }
+    tvb_dirty = true;
+}
+/* kp_thread: the rows that changed, to the TV's image (the TV shows image changes at once) */
+static void tvb_push(void)
+{
+    int y = 0, r;
+    tvb_dirty = false;
+    while (y < TVB_H)
+    {
+        int y0;
+        uint32_t s0[16];
+        if (tvb_sum[y] == tvb_sent[y]) { y++; continue; }
+        y0 = y;
+        while (y < TVB_H && y - y0 < 16 && tvb_sum[y] != tvb_sent[y]) { s0[y - y0] = tvb_sum[y]; y++; }
+        bcm_io_lock();
+        bcm_io_write(tvb_addr + (unsigned)y0 * TVB_W * 2, tvb_buf + y0 * TVB_W, (size_t)(y - y0) * TVB_W * 2);
+        bcm_io_unlock();
+        for (r = 0; r < y - y0; r++) tvb_sent[y0 + r] = s0[r];
+    }
+}
+static uint32_t tvb_window(uint32_t img, int disp, int x, int y, int w, int h)
+{
+    uint32_t o[4], o2[4], pl[8];
+    memset(pl, 0, sizeof pl);
+    pl[0] = (uint32_t)disp; pl[1] = (uint32_t)(cfg_osd_layer + 30); pl[3] = img;
+    ((uint16_t *)pl)[8] = (uint16_t)x; ((uint16_t *)pl)[9] = (uint16_t)y; ((uint16_t *)pl)[12] = (uint16_t)w; ((uint16_t *)pl)[13] = (uint16_t)h;
+    bcm_gfx_rpc(1, NULL, 0, o, NULL, 300);
+    if (bcm_gfx_rpc(3, pl, 0x20, o, NULL, 300) != 0) o[0] = 0;
+    bcm_gfx_rpc(2, NULL, 0, o2, NULL, 300);
+    return o[0] ? o[0] : 0xffffffffu;
+}
+/* the iPod's screen when there is no tv.gif: a short note */
+static fb_data *tvl_buf;
+static void *tvl_addr_fn(int x, int y) { return tvl_buf + y * LCD_WIDTH + x; }
+static void tvb_lcd_note(void)
+{
+    int h = core_alloc_ex(LCD_WIDTH * LCD_HEIGHT * sizeof(fb_data) + 32, NULL), y, x, w;
+    struct viewport vp, *old;
+    struct frame_buffer_t fb;
+    static const char * const l[2] = { "TV File Browser", "MENU three times: iPod screen" };
+    if (h <= 0) return;
+    core_pin(h);
+    tvl_buf = core_get_data(h);
+    if (bcm_gfx_alloc(&tvl_img, &tvl_addr) == 0)
+    {
+        for (y = 0; y < LCD_HEIGHT; y++)
+        {
+            fb_data c = (y > 90 && y < 150) ? LCD_RGBPACK(40, 70, 130) : LCD_RGBPACK(6, 10, 24);
+            for (x = 0; x < LCD_WIDTH; x++) tvl_buf[y * LCD_WIDTH + x] = c;
+        }
+        memset(&fb, 0, sizeof fb);
+        fb.data = tvl_buf; fb.get_address_fn = tvl_addr_fn; fb.stride = LCD_WIDTH; fb.elems = LCD_WIDTH * LCD_HEIGHT;
+        memset(&vp, 0, sizeof vp);
+        vp.width = LCD_WIDTH; vp.height = LCD_HEIGHT; vp.font = FONT_UI; vp.drawmode = DRMODE_FG; vp.buffer = &fb;
+        vp.fg_pattern = LCD_WHITE; vp.bg_pattern = LCD_BLACK;
+        old = lcd_set_viewport(&vp);
+        lcd_set_foreground(LCD_WHITE);
+        for (y = 0; y < 2; y++)
+        {
+            lcd_getstringsize(l[y], &w, NULL);
+            lcd_putsxy((LCD_WIDTH - w) / 2, 100 + y * 24, l[y]);
+        }
+        lcd_set_viewport(old);
+        bcm_io_lock();
+        bcm_io_write(tvl_addr, tvl_buf, LCD_WIDTH * LCD_HEIGHT * 2);
+        bcm_io_unlock();
+        tvl_win = tvb_window(tvl_img, 0, 0, 0, LCD_WIDTH, LCD_HEIGHT);
+    }
+    tvl_buf = NULL;
+    core_unpin(h); core_free(h);
+}
+static void tvb_stop(void)
+{
+    if (tvb_font >= 0) { font_unload(tvb_font); tvb_font = -1; }
+    if (tvb_h > 0) { core_unpin(tvb_h); core_free(tvb_h); }
+    tvb_h = -1; tvb_buf = NULL;
+    tvb_img = tvb_addr = tvb_win = tvl_img = tvl_addr = tvl_win = 0;
+    tvb_on = false;
+    ta_n = 0; ta_win = 0; ta_tried = false; memset(ta_img, 0, sizeof ta_img);   /* (freed by the hand-back / release_all) */
+}
+/* kp_enter (main thread), the TV on: false = no room (the v142 doubled screen copy is used instead) */
+static bool tvb_start(void)
+{
+    int th = global_settings.bcm_tv_signal ? 576 : 480;
+    tvb_stop();
+    tvb_h = core_alloc_ex(TVB_W * TVB_H * sizeof(fb_data) + 32, NULL);
+    if (tvb_h <= 0) { tvb_h = -1; return false; }
+    core_pin(tvb_h);
+    tvb_buf = core_get_data(tvb_h);
+    if (osd_alloc(1, TVB_W, TVB_H, &tvb_img, &tvb_addr) != 0)
+    {
+        BLOG("  TV File Browser: the VideoCore has no room for a 640 x 480 picture -- the iPod screen doubled instead");
+        tvb_stop(); return false;
+    }
+    tvb_on = true;
+    tvb_font_load();
+    memset(tvb_sent, 0xff, sizeof tvb_sent);
+    tvb_sig = 0;
+    tvb_render();
+    tvb_push();
+    tvb_win = tvb_window(tvb_img, 2, (720 - TVB_W) / 2, (th - TVB_H) / 2, TVB_W, TVB_H);
+    ta_load();                                         /* the iPod's screen: the animation, in the middle */
+    if (ta_n) ta_y = (LCD_HEIGHT - ta_h) / 2;
+    else tvb_lcd_note();
+    BLOG("  TV File Browser on: 640 x 480 on the TV (window %08lx), the iPod screen %s", (unsigned long)tvb_win,
+         ta_n ? "animated" : "a note");
+    return true;
+}
+/* v144: MENU three times within a second anywhere outside a video (apps/action.c) = the display is started again:
+   standby given back, or the BCM powered down and Rockbox's display firmware booted again -- the way out of a white
+   screen.  (In the TV File Browser the same keys go back to the iPod's screen.)  cfg menu3_rescue=0 turns it off. */
+void bcm_menu_tap(void)
+{
+    static long t0;
+    static int n;
+    if (!cfg_menu3 || bcm_video_running || tvb_on) return;
+    n = current_tick - t0 < HZ ? n + 1 : 1;
+    t0 = current_tick;
+    if (n < 3) return;
+    n = 0;
+    mutex_lock(&kp_mtx);
+    if (kp_hosted)
+    {
+        kp_release_locked("MENU three times (display rescue)");
+        mutex_unlock(&kp_mtx);
+    }
+    else
+    {
+        int rr;
+        mutex_unlock(&kp_mtx);
+        _backlight_hw_enable(false);
+        rr = bcm_restore_rom_vmcs();
+        lcd_update();
+        backlight_on();
+        if (bcm_log_fd >= 0) BLOG("display rescue (MENU three times): display firmware booted again -> %d", rr);
+    }
+    splash(HZ, "Display restarted");
+}
+/* apps/tree.c, after every key: the list changed? */
+void bcm_tv_browser_tree(void)
+{
+    if (tvb_on) tvb_render();
+}
+static void tvb_exit_user(void)
+{
+    tvb_user_off = true;
+    mutex_lock(&kp_mtx);
+    if (kp_hosted) kp_release_locked("TV File Browser off (MENU three times)");
+    mutex_unlock(&kp_mtx);
+    bcm_tv = false;
+    splash(2 * HZ, "iPod screen (TV off until the next restart)");
 }
 static void kp_thread(void)
 {
@@ -10991,11 +12212,17 @@ static void kp_thread(void)
             else if (!kp_away) kp_away = current_tick;
             bcm_host_service();
             if (bcm_io_dead()) why = "the bus stopped answering";
-            else if (kp_sleep_req) { why = "the display goes to sleep"; slept_req = true; }
+            else if (kp_sleep_req && !tvb_on) { why = "the display goes to sleep"; slept_req = true; }
             else if (usb_inserted()) why = "USB";
-            else if (kp_setting() == 0) why = "the setting is off";
+            else if (kp_setting() == 0 && !tvb_on) why = "the setting is off";
             else if (kp_away && current_tick - kp_away > HZ) why = "left the video folders";   /* v141: 1 s (was 3) */
-            else if (current_tick - kp_since > limit) why = "no video for a while";
+            else if (current_tick - kp_since > (tvb_on ? 3 * limit : limit)) why = "no video for a while";
+            else if (tvb_on)
+            {   /* v143: TV File Browser: the list's changed rows to the TV, the iPod screen's animation */
+                kp_sleep_req = false;
+                if (tvb_dirty) tvb_push();
+                ta_advance(!is_backlight_on(true));
+            }
             else if (kp_dirty && current_tick - kp_last_push >= HZ / 10)
             {
                 int pr;
@@ -11014,7 +12241,7 @@ static void kp_thread(void)
         }
         mutex_unlock(&kp_mtx);
         if (slept_req && !is_backlight_on(true)) lcd_sleep();   /* the sleep that was asked for, now on Rockbox's firmware */
-        sleep(HZ / 50);
+        sleep(tvb_on && ta_n ? 1 : HZ / 50);              /* v143: 30 frames a second for the animation */
     }
 }
 static void kp_init(void)
@@ -11078,7 +12305,9 @@ static bool kp_enter(void)
         r2 = bcm_gencmd_watched(c, tr, sizeof tr, 3);
         bcm_log_text(c, r2, tr);
         BLOG("keep ready: TV menus -- the browser is shown on the TV%s", r2 ? " (the TV output did not answer)" : "");
-        backlight_off();                               /* the panel shows nothing while the TV is driven */
+        mutex_lock(&kp_mtx);
+        if (!tvb_setting() || !tvb_start()) backlight_off();   /* v142 doubled copy: the panel shows nothing */
+        mutex_unlock(&kp_mtx);
     }
     else backlight_set_brightness(global_settings.brightness);
     return true;
@@ -11096,6 +12325,7 @@ static bool kp_take(void)
         bcm_lcd_set_hosted(NULL, NULL);                /* still frozen: updates go nowhere until the video starts */
         bcm_gfx_release_all();                         /* the screen copies */
         kp_forget_images();
+        tvb_stop();                                    /* v143 */
     }
     mutex_unlock(&kp_mtx);
     return warm;
@@ -11110,35 +12340,57 @@ static char kp_pend_dir[MAX_PATH];
 static long kp_pend_t;
 void bcm_video_folder_hint(const char *dir)
 {
-    if (!dir || !kp_setting() || kp_hosted || bcm_video_running || bcm_play_path || !kp_in_area(dir, false))
+    if (!dir || !(kp_setting() || tvb_tv_wanted()) || kp_hosted || bcm_video_running || bcm_play_path || !kp_in_area(dir, false))
     { kp_pend_dir[0] = 0; return; }
     strlcpy(kp_pend_dir, dir, sizeof kp_pend_dir);
-    kp_pend_t = current_tick;
+    kp_pend_t = tvb_tv_wanted() ? current_tick - 2 * HZ : current_tick;   /* v143: the TV browser starts at once */
 }
 static void kp_folder_start(const char *dir);
-void bcm_video_folder_idle(int action)
+static long tvb_input_t;
+int bcm_video_folder_idle(int action)
 {
     struct tree_context *tc;
-    if (!kp_pend_dir[0]) return;
-    if (action != ACTION_NONE) { kp_pend_t = current_tick; return; }       /* still moving around */
-    if (current_tick - kp_pend_t < HZ * 3 / 2) return;
+    if (tvb_on)
+    {   /* v144: untouched for tv_saver_min minutes: the screensaver, then the list again */
+        if (action != ACTION_NONE || !tvb_input_t) tvb_input_t = current_tick;
+        else if (cfg_saver_min > 0 && current_tick - tvb_input_t > (long)cfg_saver_min * 60 * HZ && file_exists(TVS_PATH))
+        {
+            tvb_input_t = current_tick;
+            sv_loop(true);
+            tc = tree_get_context();
+            if (!kp_hosted && tc && tvb_tv_wanted()) kp_folder_start(tc->currdir);   /* the list on the TV again */
+            return ACTION_NONE;
+        }
+    }
+    if (tvb_on && action == ACTION_STD_CANCEL)
+    {   /* v143: MENU three times = the iPod's screen; the 2nd and 3rd press do not go up more folders */
+        tvb_menu_n = current_tick - tvb_menu_t < HZ * 7 / 10 ? tvb_menu_n + 1 : 1;
+        tvb_menu_t = current_tick;
+        if (tvb_menu_n >= 3) { tvb_menu_n = 0; tvb_exit_user(); return ACTION_NONE; }
+        if (tvb_menu_n == 2) return ACTION_NONE;
+    }
+    if (!kp_pend_dir[0]) return action;
+    if (action != ACTION_NONE) { kp_pend_t = current_tick; return action; }       /* still moving around */
+    if (current_tick - kp_pend_t < HZ * 3 / 2) return action;
     tc = tree_get_context();
     if (!tc || strcmp(tc->currdir, kp_pend_dir) || get_current_activity() != ACTIVITY_FILEBROWSER)
-    { kp_pend_dir[0] = 0; return; }
+    { kp_pend_dir[0] = 0; return action; }
+    if (tvb_tv_wanted()) splash(0, "Starting the TV ...");
     kp_folder_start(kp_pend_dir);
     kp_pend_dir[0] = 0;
+    return action;
 }
 static void kp_folder_start(const char *dir)
 {
     char d[MAX_PATH];
-    if (!kp_setting() || kp_hosted || bcm_video_running || bcm_play_path || !dir || !kp_in_area(dir, false)) return;
+    if (!(kp_setting() || tvb_tv_wanted()) || kp_hosted || bcm_video_running || bcm_play_path || !dir || !kp_in_area(dir, false)) return;
     if (TIME_BEFORE(current_tick, kp_fail_until) || usb_inserted() || kp_warm_off) return;
     if (battery_level() >= 0 && battery_level() < 10) return;      /* keep what is left for the iPod itself */
     strlcpy(d, dir, sizeof d);
     bcm_standby = true;
     /* standby is on the iPod's screen; a TV video decides again.  v142 (cfg tv_menu=1): with Video Out On (or Auto on
        a dock that wants the TV) the browser goes to the TV instead */
-    bcm_tv = cfg_tv_menu && (global_settings.bcm_video_out == 0 || (global_settings.bcm_video_out == 3 && iap_dock_tv_choice() == 1));
+    bcm_tv = tvb_tv_wanted();                          /* v143: TV File Browser (or the v142 cfg tv_menu=1) */
     bcm_run(d);
     bcm_standby = false;
     if (!kp_hosted) kp_fail_until = current_tick + 60 * HZ;
@@ -11174,7 +12426,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v142, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v144, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -11487,7 +12739,8 @@ out:
         if (sl_want)
         {   /* v119 */
             sl_want = false;
-            bcm_sleep();
+            if (sv_want) { sv_want = false; sv_loop(false); }   /* v144: the TV screensaver, then the video again */
+            else bcm_sleep();
             sl_play_hold = false;                      /* v141 */
         }
         if (pl_sys_event)
@@ -11835,7 +13088,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v142 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v144 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -11860,7 +13113,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v142, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v144, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();
@@ -11898,6 +13151,11 @@ static const struct {
         { "BCM host test", dbg_bcm_host },
         { "Drive Transfer Test", dbg_xfer_test },       /* v139 */
         { "Dock & Bluetooth Test", dbg_dock_test },    /* v142 */
+        { "USB Speed Test", dbg_usb_tune },             /* v143 */
+        { "Battery Load Check", dbg_battery_loads },    /* v144 */
+        { "Codec A/B (IRAM)", dbg_codec_ab },           /* v144 */
+        { "Fragmentation", dbg_fragmentation },        /* v144 */
+        { "AV Cable Probe", dbg_av_probe },             /* v144 */
         { "CABAC tests", dbg_cabac_tests },
         { "Storage report (exFAT prep)", dbg_storage_report },
         { "Dump flash ROM (exFAT prep)", dbg_flash_dump },

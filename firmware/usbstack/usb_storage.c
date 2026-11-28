@@ -58,6 +58,11 @@
  * optimal, except for sd devices that apparently don't gain anything from
  * double-buffering
  */
+#if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
+/* bcm overlay v143: the buffers hold the largest chunk the USB Speed Test tries (256 KB, 16 descriptors); the chunk
+   used is chosen at each connection (read_chunk / write_chunk) */
+#define USB_READ_BUFFER_SIZE (1024*256)
+#endif
 #ifdef USB_READ_BUFFER_SIZE
 #define READ_BUFFER_SIZE USB_READ_BUFFER_SIZE
 #else
@@ -78,7 +83,7 @@
  * v87: only with Settings > General Settings > System > USB > USB Write Speed = Fast; Stock (default) = Rockbox's 24 KB,
  * exactly as stock Rockbox. */
 #if defined(IPOD_VIDEO) && !defined(USB_WRITE_BUFFER_SIZE) && !defined(BOOTLOADER)
-#define USB_WRITE_BUFFER_SIZE (1024*64)
+#define USB_WRITE_BUFFER_SIZE (1024*256)                /* v143: the most the USB Speed Test tries */
 #define USB_STORAGE_RUNTIME_WRITE_CHUNK
 #endif
 
@@ -103,8 +108,13 @@
 bool usb_storage_fast_writes;              /* v87: set from the settings (apps/settings.c) */
 static unsigned int write_chunk = 1024*24;
 #define WRITE_CHUNK write_chunk
+/* v143: System > Debug > USB Speed Test sets these before a connection (0 = as the settings say) */
+int usb_storage_tune_read_kb, usb_storage_tune_write_kb, usb_storage_tune_ra_kb;
+static unsigned int read_chunk = 1024*64;
+#define READ_CHUNK read_chunk
 #else
 #define WRITE_CHUNK WRITE_BUFFER_SIZE
+#define READ_CHUNK READ_BUFFER_SIZE
 #endif
 
 /* bulk-only class specific requests */
@@ -417,7 +427,9 @@ bool usb_storage_timesync_take(char *rec, int n, long *tick)
 #include "file.h"
 #include "kernel.h"
 bool usb_storage_readahead = true;          /* from the setting (apps/settings.c), read at each connection */
-#define RA_BYTES (256*1024)
+#define RA_MAX (1024*1024)                  /* v143: the window, 256 KB unless the USB Speed Test says */
+static unsigned int ra_bytes = 256*1024;
+#define RA_BYTES ra_bytes
 static int ra_handle = -1;
 static unsigned char *ra_buf;               /* uncached alias, like the transfer buffer: ATA DMA in, USB DMA out */
 static bool ra_on;
@@ -493,6 +505,11 @@ static void ra_init(void)
     ra_on = false;
     if(!usb_storage_readahead || ra_handle > 0)
         return;
+    ra_bytes = usb_storage_tune_ra_kb > 0 ? (unsigned int)usb_storage_tune_ra_kb * 1024 : 256*1024;   /* v143 */
+    if(ra_bytes > RA_MAX)
+        ra_bytes = RA_MAX;
+    if(usb_storage_tune_ra_kb < 0)
+        return;                             /* v143: the test's "no read-ahead" step */
     ra_handle = core_alloc_ex(RA_BYTES + 31, &buflib_ops_locked);
     if(ra_handle <= 0) {
         ra_handle = -1;                     /* no room: plain reads, as before */
@@ -562,6 +579,9 @@ static int ums_read_chunk(int select, sector_t sector, int count, bool busy)
     return us_ata(0, IF_MD(cur_cmd.lun,) sector, count, own);
 }
 
+/* v143: the last connection, for System > Debug > USB Speed Test: KB moved, KB/s while busy (computer gaps over 1 s
+   left out), commands over 64 KB ([0] read, [1] write) */
+unsigned long usb_storage_last_kb[2], usb_storage_last_kbps[2], usb_storage_last_big[2];
 /* called from the USB screen after the cable is pulled: the speed of the session just ended */
 void usb_storage_speed_save(void)
 {
@@ -569,12 +589,18 @@ void usb_storage_speed_save(void)
     struct us_stats s = us;
     memset(&us, 0, sizeof us);
     us_cbw_type = -1;
+    for(int d = 0; d < 2; d++) {            /* v143: for the USB Speed Test */
+        usb_storage_last_kb[d] = (unsigned long)(s.bytes[d] >> 10);
+        usb_storage_last_kbps[d] = s.wall_us[d] ? (unsigned long)(s.bytes[d] * 1000000 / 1024 / s.wall_us[d]) : 0;
+        usb_storage_last_big[d] = s.size_hist[d][4] + s.size_hist[d][5];
+    }
     if(s.bytes[0] + s.bytes[1] == 0)
         return;
     int fd = open("/.rockbox/usb_speed.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if(fd < 0)
         return;
-    fdprintf(fd, "bcm overlay v107 USB speed (the last connection)\n");
+    fdprintf(fd, "bcm overlay v107 USB speed (the last connection); v143: read chunk %u KB, write chunk %u KB, "
+                 "read-ahead window %u KB\n", read_chunk / 1024, write_chunk / 1024, usb_storage_tune_ra_kb < 0 ? 0 : ra_bytes / 1024);
     fdprintf(fd, "disk in use for %ld s; CPU %ld MHz; read-ahead %s (%d KB window); write chunk %d KB "
                  "(Settings > System > USB > USB Write Speed: %s)\n\n",
              (s.t_last - s.t_first) / HZ, (long)(FREQ / 1000000), usb_storage_readahead ? "on" : "off",
@@ -744,6 +770,11 @@ static int usb_storage_init_connection(void)
 #ifdef USB_STORAGE_RUNTIME_WRITE_CHUNK
     write_chunk = !usb_storage_fast_writes ? 1024*24 :       /* v87: stock unless chosen */
                   ata_disk_isssd() ? 1024*64 : 1024*32;     /* bcm overlay v60 */
+    read_chunk = 1024*64;
+    if(usb_storage_tune_write_kb >= 4 && usb_storage_tune_write_kb <= 256)     /* v143: USB Speed Test / its result */
+        write_chunk = (unsigned int)usb_storage_tune_write_kb * 1024;
+    if(usb_storage_tune_read_kb >= 4 && usb_storage_tune_read_kb <= 256)
+        read_chunk = (unsigned int)usb_storage_tune_read_kb * 1024;
 #endif
     /* prime rx endpoint. We only need room for commands */
     state = WAITING_FOR_COMMAND;
@@ -1072,13 +1103,13 @@ static void send_and_read_next(void)
         cur_cmd.last_result = result;
 
     send_block_data(cur_cmd.data[cur_cmd.data_select],
-                    MIN(READ_BUFFER_SIZE,cur_cmd.count*cur_cmd.block_size));
+                    MIN(READ_CHUNK,cur_cmd.count*cur_cmd.block_size));
 
     /* Switch buffers for the next one */
     cur_cmd.data_select=!cur_cmd.data_select;
 
-    cur_cmd.sector+=(READ_BUFFER_SIZE/cur_cmd.block_size);
-    cur_cmd.count-=MIN(cur_cmd.count,READ_BUFFER_SIZE/cur_cmd.block_size);
+    cur_cmd.sector+=(READ_CHUNK/cur_cmd.block_size);
+    cur_cmd.count-=MIN(cur_cmd.count,READ_CHUNK/cur_cmd.block_size);
 
     if(cur_cmd.count!=0) {
         /* already read the next bit, so we can send it out immediately when the
@@ -1086,17 +1117,17 @@ static void send_and_read_next(void)
 #ifdef USB_USE_RAMDISK
         memcpy(cur_cmd.data[cur_cmd.data_select],
                 ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
-                MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
+                MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count)*cur_cmd.block_size);
 #else
 #if defined(IPOD_VIDEO) && !defined(BOOTLOADER)
         /* v107: the chunk just handed to USB may be in the window: then it must not be refilled now */
         result = ums_read_chunk(cur_cmd.data_select, cur_cmd.sector,
-                MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
+                MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count),
                 ra_in_window(cur_cmd.data[!cur_cmd.data_select]));
 #else
         result = storage_read_sectors(IF_MD(cur_cmd.lun,)
                 cur_cmd.sector,
-                MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
+                MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count),
                 cur_cmd.data[cur_cmd.data_select]);
 #endif
         if(cur_cmd.last_result == 0)
@@ -1566,16 +1597,16 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 #ifdef USB_USE_RAMDISK
                 memcpy(cur_cmd.data[cur_cmd.data_select],
                         ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
-                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size,cur_cmd.count)*cur_cmd.block_size);
+                        MIN(READ_CHUNK/cur_cmd.block_size,cur_cmd.count)*cur_cmd.block_size);
 #elif defined(IPOD_VIDEO) && !defined(BOOTLOADER)
                 cur_cmd.last_result = ums_read_chunk(cur_cmd.data_select, cur_cmd.sector,
-                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count), false);   /* v107 */
+                        MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count), false);   /* v107 */
                 if(cur_cmd.sector == 0)
                     bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 (never from the window) */
 #else
                 cur_cmd.last_result = storage_read_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
-                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
+                        MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
 #endif
                 send_and_read_next();
@@ -1622,16 +1653,16 @@ static void handle_scsi(struct command_block_wrapper* cbw)
 #ifdef USB_USE_RAMDISK
                 memcpy(cur_cmd.data[cur_cmd.data_select],
                         ramdisk_buffer + cur_cmd.sector*cur_cmd.block_size,
-                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size,cur_cmd.count)*cur_cmd.block_size);
+                        MIN(READ_CHUNK/cur_cmd.block_size,cur_cmd.count)*cur_cmd.block_size);
 #elif defined(IPOD_VIDEO) && !defined(BOOTLOADER)
                 cur_cmd.last_result = ums_read_chunk(cur_cmd.data_select, cur_cmd.sector,
-                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count), false);   /* v107 */
+                        MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count), false);   /* v107 */
                 if(cur_cmd.sector == 0)
                     bcm_hide_fw_partition(cur_cmd.data[cur_cmd.data_select]);   /* v102 (never from the window) */
 #else
                 cur_cmd.last_result = storage_read_sectors(IF_MD(cur_cmd.lun,)
                         cur_cmd.sector,
-                        MIN(READ_BUFFER_SIZE/cur_cmd.block_size, cur_cmd.count),
+                        MIN(READ_CHUNK/cur_cmd.block_size, cur_cmd.count),
                         cur_cmd.data[cur_cmd.data_select]);
 #endif
                 send_and_read_next();

@@ -392,6 +392,78 @@ static int opus_seek_page_granule(int64_t pos, int64_t curpos,
 }
 
 
+
+/* bcm overlay v144: exact seeking.  The stock seek walked page by page from where playback was (forward: every page
+   in between was read; back: 7 KB steps) and landed on a page near the target with an 80 ms rewind, so it could be
+   off by up to a page (about 1 s) and a long jump read the whole file in between.  Now: bisection on the pages'
+   granule positions (about 20 reads of one page header for any jump), then the last page boundary at or before
+   target - 80 ms where decoding can start (the page before it ends a packet, the page itself does not continue
+   one); the samples from there to the target are decoded and dropped (the 80 ms decoder warm-up RFC 7845 asks for),
+   so playback starts on the exact sample.  Returns the samples to drop, or -1 (the stock seek is used then). */
+static int ex_page(int64_t pos, int64_t *granule, int64_t *len, int *cont)
+{
+    unsigned char h[27], lace[255];
+    unsigned int k, n = 0;
+    ci->seek_buffer(pos);
+    if (ci->read_filebuf(h, 27) != 27 || memcmp(h, "OggS", 4) || h[4] != 0)
+        return 0;
+    if (h[26] && ci->read_filebuf(lace, h[26]) != h[26])
+        return 0;
+    for (k = 0; k < h[26]; k++)
+        n += lace[k];
+    *granule = 0;
+    for (k = 0; k < 8; k++)
+        *granule |= (int64_t)h[6 + k] << (8 * k);
+    *len = 27 + h[26] + n;
+    *cont = h[5] & 1;
+    return 1;
+}
+static int64_t ex_seek(int64_t target, int64_t audio_start)
+{
+    int64_t want = target - SEEK_REWIND, lo = audio_start, lo_g = 0, hi = ci->filesize, g, len, pos, best = -1, best_g = 0;
+    int cont, guard = 64, prev_ok;
+    if (want < 0)
+        want = 0;
+    if (audio_start <= 0 || hi <= audio_start)
+        return -1;
+    while (hi - lo > 65536 && guard-- > 0)
+    {   /* lo: the end of a page whose granule <= want (lo_g) */
+        int64_t mid = lo + (hi - lo) / 2;
+        if (!seek_ogg_page(mid) || (pos = ci->curpos) >= hi || !ex_page(pos, &g, &len, &cont) || g < 0)
+        { hi = mid; continue; }
+        if (g <= want) { lo = pos + len; lo_g = g; }
+        else hi = pos;
+    }
+    /* from lo, page by page: the last start before the target where decoding can begin */
+    pos = lo; g = lo_g; prev_ok = 1;
+    while (pos < ci->filesize)
+    {
+        int64_t pg;
+        if (!ex_page(pos, &pg, &len, &cont))
+            break;
+        if (prev_ok && !cont)
+        {
+            if (g > want)
+                break;
+            best = pos; best_g = g;
+        }
+        prev_ok = pg >= 0;
+        if (pg >= 0)
+        {
+            if (pg > want && best >= 0)
+                break;
+            g = pg;
+        }
+        pos += len;
+    }
+    if (best < 0)
+        return -1;
+    ci->seek_buffer(best);
+    LOGF("exact seek: page at %jd starts at sample %jd, %jd to drop", (intmax_t)best, (intmax_t)best_g,
+         (intmax_t)(target - best_g));
+    return target - best_g;
+}
+
 /* this is the codec entry point */
 enum codec_status codec_main(enum codec_entry_call_reason reason)
 {
@@ -418,6 +490,7 @@ enum codec_status codec_run(void)
     unsigned long strtoffset;
     int skip = 0;
     int64_t seek_target;
+    int64_t audio_start = 0;          /* v144: the first audio page (exact seeks start their search there) */
     uint64_t granule_pos;
 
     ogg_malloc_init();
@@ -458,12 +531,22 @@ enum codec_status codec_run(void)
             if (st != NULL) {
                 /* calculate granule to seek to (including seek rewind) */
                 seek_target = (48LL * param) + header->preskip;
-                skip = MIN(seek_target, SEEK_REWIND);
-                seek_target -= skip;
-
-                LOGF("Opus seek page:%lld,%lld,%ld\n", (long long int)seek_target,
-                     (long long int)page_granule, (long)param);
-                opus_seek_page_granule(seek_target, page_granule, oy, os);
+                {
+                    int64_t ex = audio_start > 0 ? ex_seek(seek_target, audio_start) : -1;   /* v144 */
+                    if (ex >= 0)
+                    {
+                        skip = ex;
+                        ogg_sync_reset(oy);
+                    }
+                    else
+                    {
+                        skip = MIN(seek_target, SEEK_REWIND);
+                        seek_target -= skip;
+                        LOGF("Opus seek page:%lld,%lld,%ld\n", (long long int)seek_target,
+                             (long long int)page_granule, (long)param);
+                        opus_seek_page_granule(seek_target, page_granule, oy, os);
+                    }
+                }
                 /* reset the state to help ensure that subsequent packets won't
                    use state set by unrelated packets processed before seek */
                 opus_decoder_ctl(st, OPUS_RESET_STATE);
@@ -523,9 +606,14 @@ enum codec_status codec_run(void)
                     ci->configure(DSP_SET_STEREO_MODE, (header->channels == 2) ?
                         STEREO_INTERLEAVED : STEREO_MONO);
 
-                    if (strtoffset)
+                    if (strtoffset) {
+                        if (skip_header_pages())            /* v144: where the audio starts, for exact seeks */
+                            audio_start = ci->curpos;
                         seek_ogg_page(strtoffset);
+                    }
                     else if (param) {
+                        if (skip_header_pages())            /* v144 */
+                            audio_start = ci->curpos;
                         action = CODEC_ACTION_SEEK_TIME;
                         goto process_action;
                     } else {
@@ -533,7 +621,7 @@ enum codec_status codec_run(void)
                        allocating space for huge comment packets
                        (embedded Album Art) */
                         if (skip_header_pages())
-                            ;   /* v138: page headers only */
+                            audio_start = ci->curpos;   /* v138: page headers only; v144: kept for exact seeks */
                         else if (seek_opus_tags())
                             seek_ogg_page(ci->curpos);
                         else {

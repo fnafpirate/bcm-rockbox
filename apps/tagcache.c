@@ -5239,10 +5239,34 @@ static bool NO_INLINE db_file_exists(const char* filename)
     return file_exists(buf);
 }
 
+#ifdef IPOD_VIDEO
+/* bcm overlay v144: faster start.  With Auto Update on, every start walks the whole drive for new files and checks every
+   file in the database still exists -- minutes on a big drive.  A clean shutdown after a finished check and with no USB
+   session leaves this marker; the next start finds the drive as it was and skips the walk (the marker goes at once, so
+   a crash or a USB session means a full check next time).  Update Now still checks everything. */
+#define TC_UNCHANGED ROCKBOX_DIR "/.bcm_drive_unchanged"
+static bool tc_check_ok, tc_drive_touched;
+void tagcache_mark_unchanged(void)
+{
+    if (global_settings.tagcache_autoupdate && tc_check_ok && !tc_drive_touched)
+    {
+        int fd = creat(TC_UNCHANGED, 0666);
+        if (fd >= 0)
+            close(fd);
+    }
+}
+#endif
 static void tagcache_thread(void)
 {
     struct queue_event ev;
     bool check_done = false;
+#ifdef IPOD_VIDEO
+    bool unchanged = file_exists(TC_UNCHANGED);
+    if (unchanged)
+        remove(TC_UNCHANGED);
+#else
+    const bool unchanged = false;
+#endif
     cpu_boost(true);
     /* If the previous cache build/update was interrupted, commit
      * the changes first in foreground. */
@@ -5317,6 +5341,9 @@ static void tagcache_thread(void)
 
             case Q_START_SCAN:
                 check_done = false;
+#ifdef IPOD_VIDEO
+                unchanged = false;
+#endif
                 /* fallthrough */
             case SYS_TIMEOUT:
                 if (check_done || !tc_stat.ready)
@@ -5327,13 +5354,13 @@ static void tagcache_thread(void)
                 {
                     load_ramcache();
                     if (global_settings.tagcache_ram == TAGCACHE_RAM_ON)
-                        check_file_refs(global_settings.tagcache_autoupdate);
-                    if (tc_stat.ramcache && global_settings.tagcache_autoupdate)
+                        check_file_refs(global_settings.tagcache_autoupdate && !unchanged);
+                    if (tc_stat.ramcache && global_settings.tagcache_autoupdate && !unchanged)
                         tagcache_build();
                 }
                 else
 #endif /* HAVE_RC_RAMCACHE */
-                if (global_settings.tagcache_autoupdate)
+                if (global_settings.tagcache_autoupdate && !unchanged)
                 {
                     tagcache_build();
 
@@ -5346,6 +5373,9 @@ static void tagcache_thread(void)
                 logf("tagcache check done");
 
                 check_done = true;
+#ifdef IPOD_VIDEO
+                tc_check_ok = true;
+#endif
                 break ;
 
             case Q_STOP_SCAN:
@@ -5357,6 +5387,9 @@ static void tagcache_thread(void)
 
             case SYS_USB_CONNECTED:
                 logf("USB: TagCache");
+#ifdef IPOD_VIDEO
+                tc_drive_touched = true;
+#endif
                 usb_acknowledge(SYS_USB_CONNECTED_ACK, ev.data);
                 usb_wait_for_disconnect(&tagcache_queue);
                 break ;
