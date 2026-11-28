@@ -1,0 +1,10 @@
+# bcm overlay v145: what "Publish to public repo" leaves out of the public copy (one path or glob per line).
+# Your private repository keeps all of it.
+.github/workflows/publish-public.yml
+.github/workflows/build-ipodvideo.yml
+.github/workflows/exfat-setup-exe.yml
+# anything you keep only for yourself, for example:
+private/
+*.ipsw
+**/*.ipsw
+**/Firmware-*

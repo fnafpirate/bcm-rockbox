@@ -90,10 +90,20 @@ its size and SHA-1 match the known file.  Copying reads the next file while the 
 Quick format first tells the drive the whole partition is free (TRIM) where the drive and the connection support it
 (an iPod's own USB mode does not; most card readers do not either; it is skipped then).  Runs on macOS and Linux too
 (as root: sudo; see "Start iPod exFAT Setup.command").
+
+1.16 (bcm overlay v145): works from anywhere.  Its own folder is C:\bcm rockbox (macOS / Linux: "bcm rockbox" in your
+home folder): the Rockbox build, the bootloader, downloaded .ipsw files, backups and logs live there.  The .exe
+carries the Rockbox build and the bootloader inside and puts them there at the first start, so the .exe alone is
+enough.  "Check for updates" asks the project's GitHub releases for a newer iPod exFAT Setup (downloads it, checks its
+SHA-256, swaps itself and restarts) and a newer Rockbox build -- only while the program is open: once when it is
+opened ("Check when opened", can be turned off) or on the button; nothing runs in the background; "Update Rockbox on iPod" puts the newest build on a
+connected Rockbox iPod without formatting (settings, themes, music and the video files stay; rockbox.ipod is written
+last, under a temporary name, so an unplugged cable cannot leave half of it).
 """
 import base64, datetime, hashlib, io, json, os, queue, re, shutil, struct, sys, threading, time, zipfile, zlib
 
-VERSION = '1.15'
+VERSION = '1.16'
+BCM_VERSION = 'v145'                      # the bcm overlay this copy came with
 ALIGN = 4 << 20            # partition start and cluster heap: 4 MiB aligned (flash friendly)
 
 
@@ -1525,10 +1535,7 @@ def ipsw_ok(path, model):
         return False
 
 def ipsw_cache_dirs(here):
-    out = [here]
-    base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), '.cache')
-    out.append(os.path.join(base, 'iPod exFAT Setup'))
-    return out
+    return [here, data_dir('ipsw')]          # 1.16: C:\bcm rockbox\ipsw
 
 def ipsw_find_local(here, model):
     """an already downloaded / copied package for this model (checked), or None"""
@@ -2644,6 +2651,257 @@ def http_get(urls, log=print, timeout=30):
             log('  %s: %s' % (u, ex))
     raise RuntimeError('could not download (%s)' % last)
 
+# ---- 1.16: own folder, built-in files, GitHub releases ----------------------------------------------------------------
+RELEASE_REPO = 'fnafpirate/bcm-rockbox'      # where the releases are (Settings: settings.json "repo" overrides it)
+_DATA = None
+
+def _real_home():
+    """the user's home, also under sudo (the files must not belong to root only)"""
+    u = os.environ.get('SUDO_USER')
+    if u and os.name != 'nt':
+        return os.path.expanduser('~' + u)
+    return os.path.expanduser('~')
+
+def _give_to_user(path):
+    if os.name != 'nt' and os.environ.get('SUDO_UID'):
+        try:
+            os.chown(path, int(os.environ['SUDO_UID']), int(os.environ.get('SUDO_GID', os.environ['SUDO_UID'])))
+        except OSError:
+            pass
+
+def data_dir(sub=None):
+    """C:\bcm rockbox (Windows) or ~/bcm rockbox; falls back to the user's app-data folder if that cannot be made"""
+    global _DATA
+    if _DATA is None:
+        if os.name == 'nt':
+            cands = [os.path.join((os.environ.get('SystemDrive') or 'C:') + '\\', 'bcm rockbox'),
+                     os.path.join(os.environ.get('LOCALAPPDATA') or _real_home(), 'bcm rockbox')]
+        else:
+            cands = [os.path.join(_real_home(), 'bcm rockbox'), os.path.join('/tmp', 'bcm rockbox')]
+        for d in cands:
+            try:
+                os.makedirs(d, exist_ok=True)
+                t = os.path.join(d, '.write_test')
+                open(t, 'w').close(); os.remove(t)
+                _give_to_user(d)
+                _DATA = d
+                break
+            except OSError:
+                continue
+        else:
+            _DATA = os.path.abspath('.')
+    if not sub:
+        return _DATA
+    d = os.path.join(_DATA, sub)
+    if not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+        _give_to_user(d)
+    return d
+
+def open_folder(path):
+    import subprocess
+    try:
+        if os.name == 'nt':
+            os.startfile(path)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', path])
+        else:
+            subprocess.Popen(['xdg-open', path])
+    except OSError:
+        pass
+
+def bundle_dir():
+    """the files built into the .exe (PyInstaller --add-data ...;bundle), or None"""
+    b = getattr(sys, '_MEIPASS', None)
+    if b and os.path.isdir(os.path.join(b, 'bundle')):
+        return os.path.join(b, 'bundle')
+    return None
+
+def settings_load():
+    try:
+        with open(os.path.join(data_dir(), 'settings.json')) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def settings_save(d):
+    try:
+        p = os.path.join(data_dir(), 'settings.json')
+        with open(p, 'w') as f:
+            json.dump(d, f, indent=1)
+        _give_to_user(p)
+    except OSError:
+        pass
+
+def ver_tuple(v):
+    """'v145' / '1.16' / 'bcm host: v144' -> (145,) / (1, 16) / (144,); () = unknown"""
+    m = re.search(r'(\d+(?:\.\d+)*)', v or '')
+    return tuple(int(x) for x in m.group(1).split('.')) if m else ()
+
+def zip_bcm_version(path):
+    """the bcm overlay version a rockbox.zip was built from (.rockbox/bcm-version.txt), or None"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            return z.read('.rockbox/bcm-version.txt').decode('ascii', 'replace').strip() or None
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+
+def drive_bcm_version(root):
+    """the version on a connected Rockbox iPod, or None (installed before v145: unknown)"""
+    try:
+        with open(os.path.join(root, '.rockbox', 'bcm-version.txt')) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+def unpack_bundle(log=print):
+    """first start of the .exe: its Rockbox build and bootloader go to the own folder (a newer build there stays)"""
+    b = bundle_dir()
+    if not b:
+        return
+    for name in os.listdir(b):
+        src, dst = os.path.join(b, name), os.path.join(data_dir(), name)
+        if name.lower().endswith('.zip') and os.path.isfile(dst):
+            if ver_tuple(zip_bcm_version(dst)) >= ver_tuple(zip_bcm_version(src)):
+                continue
+        elif os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(src):
+            continue
+        try:
+            shutil.copyfile(src, dst + '.part'); os.replace(dst + '.part', dst); _give_to_user(dst)
+            log('%s -> %s' % (name, data_dir()))
+        except OSError as ex:
+            log('could not copy %s to %s: %s' % (name, data_dir(), ex))
+
+def find_file(name, here):
+    """a file next to the program first (your own copy wins), then in the own folder, then built in"""
+    for d in (here, data_dir(), bundle_dir()):
+        if d and os.path.isfile(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return os.path.join(data_dir(), name)
+
+def gh_latest(log=print):
+    """the newest release: {'tag', 'url', 'assets': {name: (download url, size)}, 'info': release.json or {}}"""
+    repo = settings_load().get('repo') or RELEASE_REPO
+    raw = http_get('https://api.github.com/repos/%s/releases/latest' % repo, log, timeout=20)
+    rel = json.loads(raw.decode('utf-8'))
+    out = {'tag': rel.get('tag_name', ''), 'url': rel.get('html_url', ''), 'notes': rel.get('body') or '',
+           'assets': {a['name']: (a['browser_download_url'], a.get('size', 0)) for a in rel.get('assets', [])},
+           'info': {}}
+    if 'release.json' in out['assets']:
+        try:
+            out['info'] = json.loads(http_get(out['assets']['release.json'][0], log, timeout=20).decode('utf-8'))
+        except (RuntimeError, ValueError):
+            pass
+    return out
+
+def gh_fetch(rel, name, dest, log=print, progress=lambda f: None):
+    """download one release file to dest; its SHA-256 must match release.json"""
+    import urllib.request
+    if name not in rel['assets']:
+        raise SetupError('the release has no %s' % name)
+    url, size = rel['assets'][name]
+    want = (rel['info'].get('sha256') or {}).get(name)
+    if not want:
+        raise SetupError('release.json has no checksum for %s -- not used' % name)
+    log('downloading %s (%s)' % (name, human(size) if size else '?'))
+    tmp = dest + '.part'
+    h = hashlib.sha256(); got = 0
+    req = urllib.request.Request(url, headers={'User-Agent': 'iPod-exFAT-Setup/%s' % VERSION})
+    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, 'wb') as f:
+        while True:
+            b = r.read(1 << 16)
+            if not b:
+                break
+            h.update(b); f.write(b); got += len(b)
+            if size:
+                progress(min(1.0, got / size))
+    if h.hexdigest().lower() != want.lower():
+        os.remove(tmp)
+        raise SetupError('%s: SHA-256 does not match the release -- not used' % name)
+    os.replace(tmp, dest)
+    _give_to_user(dest)
+    return dest
+
+def my_asset_name():
+    """the release file that replaces this program"""
+    if not getattr(sys, 'frozen', False):
+        return 'ipod_exfat_setup.py'
+    if os.name == 'nt':
+        return 'iPod-exFAT-Setup-win64.exe' if struct.calcsize('P') == 8 else 'iPod-exFAT-Setup-win32.exe'
+    return None                                    # the Mac app: the release page opens instead
+
+def self_update(rel, log=print, progress=lambda f: None):
+    """download the new program, swap it in (Windows lets a running .exe be renamed) and return the path to start"""
+    name = my_asset_name()
+    new = gh_fetch(rel, name, os.path.join(data_dir('downloads'), name), log, progress)
+    me = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+    try:
+        old = me + '.old'
+        if os.path.exists(old):
+            os.remove(old)
+        os.replace(me, old)
+        shutil.copyfile(new, me)
+        log('updated %s' % me)
+        return me
+    except OSError as ex:
+        log('could not replace %s (%s) -- starting the new one from %s' % (me, ex, data_dir('downloads')))
+        return new
+
+def restart_program(path):
+    import subprocess
+    args = [path] if path.lower().endswith('.exe') else [sys.executable, path]
+    subprocess.Popen(args, close_fds=True)
+
+def cleanup_old_self():
+    me = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+    try:
+        if os.path.exists(me + '.old'):
+            os.remove(me + '.old')
+    except OSError:
+        pass
+
+def rockbox_fetch(rel, log=print, progress=lambda f: None):
+    """the release's Rockbox build -> the own folder's rockbox.zip"""
+    dest = os.path.join(data_dir(), 'rockbox.zip')
+    tmp = gh_fetch(rel, 'rockbox-ipodvideo.zip', os.path.join(data_dir('downloads'), 'rockbox-ipodvideo.zip'),
+                   log, progress)
+    shutil.copyfile(tmp, dest + '.part'); os.replace(dest + '.part', dest); _give_to_user(dest)
+    log('Rockbox %s saved to %s' % (zip_bcm_version(dest) or rel['tag'], dest))
+    return dest
+
+def update_rockbox_on_drive(root, zip_path, log=print, progress=lambda f: None):
+    """a Rockbox build onto a connected Rockbox iPod (no format).  Only what the zip holds is written (config.cfg,
+    themes you added, the VideoCore files and the music are not in it); rockbox.ipod last, via a temporary name."""
+    rb = os.path.join(root, '.rockbox')
+    if not os.path.isfile(os.path.join(rb, 'rockbox.ipod')):
+        raise SetupError('%s has no Rockbox' % root)
+    with zipfile.ZipFile(zip_path) as z:
+        mem = [m for m in z.infolist() if not m.is_dir()]
+        if not any(m.filename.replace('\\', '/') == '.rockbox/rockbox.ipod' for m in mem):
+            raise SetupError('%s is not a Rockbox build for the iPod' % zip_path)
+        last = None
+        total = sum(m.file_size for m in mem) or 1; done = 0
+        for m in mem:
+            name = m.filename.replace('\\', '/')
+            parts = [x for x in name.split('/') if x not in ('', '.')]
+            if not parts or '..' in parts or ':' in parts[0] or parts[0].lower() != '.rockbox':
+                log('  skipped %s' % m.filename); continue
+            dest = os.path.join(root, *parts)
+            if name == '.rockbox/rockbox.ipod':
+                last = (m, dest); continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(m) as src, open(dest, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            done += m.file_size; progress(done / total)
+        m, dest = last
+        with z.open(m) as src, open(dest + '.new', 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush(); os.fsync(dst.fileno())
+        os.replace(dest + '.new', dest)
+        progress(1.0)
+    log('Rockbox %s is on %s (%d files).  Eject the iPod, then restart it (hold MENU + SELECT).'
+        % (zip_bcm_version(zip_path) or '', root, len(mem)))
+
 def theme_list(log=print):
     """[{'id', 'name', 'author', 'size', 'image', 'image2', 'archive', 'about', 'current'}] for the iPod Video"""
     import configparser
@@ -2928,8 +3186,9 @@ def gui():
         ttk.Button(frm, text='Browse...', command=lambda: v.set(
             filedialog.askopenfilename(filetypes=types) or v.get())).grid(row=r, column=2)
         return v
-    zip_var = file_row(5, 'Rockbox build:', os.path.join(here, 'rockbox.zip'), [('Rockbox build', '*.zip')])
-    boot_var = file_row(6, 'Bootloader:', os.path.join(here, 'bootloader-ipodvideo.ipod'),
+    unpack_bundle(to_logfile)                  # 1.16: the .exe's built-in files -> C:\bcm rockbox
+    zip_var = file_row(5, 'Rockbox build:', find_file('rockbox.zip', here), [('Rockbox build', '*.zip')])
+    boot_var = file_row(6, 'Bootloader:', find_file('bootloader-ipodvideo.ipod', here),
                         [('iPod bootloader', '*.ipod')])
     # Apple's firmware package: the VideoCore files and the video overlay bitmaps come from it (optional)
     ipsws = sorted(f for f in os.listdir(here) if f.lower().endswith('.ipsw')) if os.path.isdir(here) else []
@@ -2944,9 +3203,7 @@ def gui():
     dl_btn.grid(row=13, column=3, padx=(4, 0))
 
     bk_lbl = ttk.Label(frm, text='Backup file:'); bk_lbl.grid(row=7, column=0, sticky='w')
-    bdir = os.path.join(os.path.expanduser('~'), 'Documents')
-    if not os.path.isdir(bdir):
-        bdir = os.path.expanduser('~')
+    bdir = data_dir('backups')                # 1.16
     bk_var = tk.StringVar(value=os.path.join(bdir, 'ipod_backup_%s.bin' % time.strftime('%Y%m%d_%H%M')))
     bk_ent = ttk.Entry(frm, textvariable=bk_var); bk_ent.grid(row=7, column=1, sticky='ew', padx=6, pady=2)
     bk_btn = ttk.Button(frm, text='Browse...', command=lambda: bk_var.set(filedialog.asksaveasfilename(
@@ -3011,6 +3268,13 @@ def gui():
     ck = ttk.Button(extra, text='Set clock now')
     ttk.Button(extra, text='Extras (themes, fonts, settings)...',
                command=lambda: extras_window(root, TITLE)).pack(side='left', padx=(8, 0))   # 1.14
+    # 1.16: updates
+    upd = ttk.Frame(frm); upd.grid(row=19, column=0, columnspan=4, sticky='ew', pady=(6, 0))
+    ttk.Label(upd, text='Updates:').pack(side='left')
+    rbu_btn = ttk.Button(upd, text='Update Rockbox on iPod'); rbu_btn.pack(side='left', padx=(8, 0))
+    chk_btn = ttk.Button(upd, text='Check for updates'); chk_btn.pack(side='left', padx=(8, 0))
+    ttk.Button(upd, text='Open my files folder', command=lambda: open_folder(data_dir())).pack(side='left', padx=(8, 0))
+    upd_lbl = ttk.Label(upd, text='', foreground='#205080'); upd_lbl.pack(side='left', padx=(10, 0))
     auto_var = tk.BooleanVar(value=False)
     auto_chk = ttk.Checkbutton(extra, text='Keep the clock right automatically', variable=auto_var)
     if clock_helper_installed():
@@ -3140,11 +3404,19 @@ def gui():
                     bar['value'] = int(v * 1000)
                 elif k == 'ipsw':
                     ipsw_var.set(v)
+                elif k == 'zip':                   # 1.16
+                    zip_var.set(v)
+                elif k == 'rel':
+                    on_release(*v)
+                elif k == 'restart':
+                    restart_program(v)
+                    root.destroy()
+                    return
                 elif k == 'then':
                     root.after(300, v)
                 elif k == 'done':
                     st['busy'] = False
-                    for b in (go, rs, rf, dl_btn):
+                    for b in (go, rs, rf, dl_btn, rbu_btn, chk_btn):
                         b['state'] = 'normal'
                     if v == 'clock':
                         pass
@@ -3165,7 +3437,7 @@ def gui():
 
     def run(job):
         st['busy'] = True
-        for b in (go, rs, rf, dl_btn):
+        for b in (go, rs, rf, dl_btn, rbu_btn, chk_btn):
             b['state'] = 'disabled'
         def worker():
             err = None
@@ -3359,6 +3631,101 @@ def gui():
             log('done -- videos play after the iPod is unplugged')
             return 'clock'
         run(job)
+    # ---- 1.16: updates ----
+    def on_release(rel, manual):
+        st['rel'] = rel
+        info = rel['info']
+        sett = settings_load(); sett['last_check'] = time.time(); settings_save(sett)
+        fv, bv = info.get('formatter'), info.get('bcm') or rel['tag']
+        news = []
+        zv = zip_bcm_version(zip_var.get().strip()) if os.path.isfile(zip_var.get().strip()) else None
+        if bv and ver_tuple(bv) > ver_tuple(zv or BCM_VERSION) and 'rockbox-ipodvideo.zip' in rel['assets']:
+            upd_lbl['text'] = 'Rockbox %s is available -- "Update Rockbox on iPod" installs it' % bv
+            news.append('Rockbox %s' % bv)
+        if fv and ver_tuple(fv) > ver_tuple(VERSION):
+            news.append('iPod exFAT Setup %s' % fv)
+            if st.get('busy'):
+                upd_lbl['text'] = 'iPod exFAT Setup %s is available (Check for updates when this is done)' % fv
+            elif manual or sett.get('skip') != fv:
+                if my_asset_name() and my_asset_name() in rel['assets']:
+                    a_ = messagebox.askyesnocancel(TITLE, 'iPod exFAT Setup %s is available (this is %s).\n\n%s\n\n'
+                                                   'Yes: update now (it restarts itself)\nNo: not this version\n'
+                                                   'Cancel: ask again later' % (fv, VERSION, rel['notes'][:600]))
+                    if a_:
+                        def job():
+                            q.put(('restart', self_update(rel, log, prog)))
+                            return 'clock'
+                        run(job); return
+                    if a_ is False:
+                        sett['skip'] = fv; settings_save(sett)
+                elif messagebox.askyesno(TITLE, 'iPod exFAT Setup %s is available (this is %s).  Open the download '
+                                         'page?' % (fv, VERSION)):
+                    import webbrowser
+                    webbrowser.open(rel['url'])
+        if not news:
+            log('  up to date (iPod exFAT Setup %s, Rockbox %s)' % (VERSION, zv or BCM_VERSION))
+        if manual and not news:
+            messagebox.showinfo(TITLE, 'Everything is up to date (iPod exFAT Setup %s, Rockbox %s).'
+                                % (VERSION, zv or BCM_VERSION))
+        if news:
+            log('update available: %s  (%s)' % (', '.join(news), rel['url']))
+
+    def check_updates(manual=False):
+        def bg():
+            log('checking GitHub for updates...')
+            try:
+                rel = gh_latest(to_logfile)
+                q.put(('rel', (rel, manual)))
+            except Exception as ex:
+                to_logfile('update check failed: %s' % ex)
+                log('  no answer (no internet, or no release yet) -- nothing changed')
+        threading.Thread(target=bg, daemon=True).start()
+    chk_btn['command'] = lambda: check_updates(True)
+
+    def do_rbupdate():
+        roots = clock_sync_drives()
+        if not roots:
+            messagebox.showwarning(TITLE, 'No iPod with Rockbox found.  Connect it in Rockbox USB mode (Windows '
+                                   'shows it as a drive) and try again.'); return
+        if not messagebox.askyesno(TITLE, 'Put the newest Rockbox on %s?\n\nNothing is formatted: your settings, '
+                                   'themes, music, videos and the video files stay.  Rockbox itself is replaced.'
+                                   % ', '.join(roots)):
+            return
+        zp0 = zip_var.get().strip()
+        def job():
+            zp = zp0
+            zv = zip_bcm_version(zp) if os.path.isfile(zp) else None
+            try:
+                rel = gh_latest(log)
+                bv = rel['info'].get('bcm') or rel['tag']
+                if 'rockbox-ipodvideo.zip' in rel['assets'] and ver_tuple(bv) > ver_tuple(zv):
+                    zp = rockbox_fetch(rel, log, prog); zv = zip_bcm_version(zp)
+                    q.put(('zip', zp))
+            except Exception as ex:
+                log('(could not ask GitHub for a newer build: %s -- using %s)' % (ex, zp))
+            if not os.path.isfile(zp):
+                raise SetupError('no Rockbox build (rockbox.zip) -- choose one under "Rockbox build"')
+            for r in roots:
+                have = drive_bcm_version(r)
+                log('%s: the iPod has %s, the build is %s' % (r, have or 'a version from before v145',
+                                                             zv or 'a build without a version'))
+                if have and zv and ver_tuple(have) >= ver_tuple(zv):
+                    log('  already up to date -- nothing written'); continue
+                update_rockbox_on_drive(r, zp, log, prog)
+            return 'clock'
+        run(job)
+    rbu_btn['command'] = do_rbupdate
+    cleanup_old_self()
+    # Only while the program is open: one check when it is opened (if the box is ticked) or on the button.  Nothing
+    # runs in the background or when the program is closed, and nothing is downloaded without a Yes.
+    auto_upd = tk.BooleanVar(value=settings_load().get('auto_check', True))
+    def auto_changed():
+        s_ = settings_load(); s_['auto_check'] = bool(auto_upd.get()); settings_save(s_)
+    ttk.Checkbutton(upd, text='Check when opened', variable=auto_upd, command=auto_changed).pack(side='left', padx=(8, 0),
+                                                                                             before=upd_lbl)
+    if auto_upd.get():
+        root.after(1500, check_updates)
+
     def do_clock():
         roots = clock_sync_drives()
         if not roots:
@@ -3416,6 +3783,26 @@ def main2():
     a = sys.argv[1:]
     def opt(name, default=None):
         return a[a.index(name) + 1] if name in a else default
+    if '--check-updates' in a:                       # 1.16
+        rel = gh_latest(print)
+        print('latest release %s: iPod exFAT Setup %s, Rockbox %s  (%s)' % (
+            rel['tag'], rel['info'].get('formatter', '?'), rel['info'].get('bcm', rel['tag']), rel['url']))
+        print('this is iPod exFAT Setup %s; own folder %s' % (VERSION, data_dir()))
+        return
+    if '--update-rockbox' in a:                      # 1.16: --update-rockbox E:\ [--rockbox-zip F] [--yes]
+        r = opt('--update-rockbox')
+        zp = opt('--rockbox-zip') or find_file('rockbox.zip', os.path.dirname(os.path.abspath(sys.argv[0])))
+        if '--rockbox-zip' not in a:
+            try:
+                rel = gh_latest(print)
+                if ver_tuple(rel['info'].get('bcm') or rel['tag']) > ver_tuple(zip_bcm_version(zp) if os.path.isfile(zp) else None):
+                    zp = rockbox_fetch(rel, print)
+            except Exception as ex:
+                print('(no update check: %s)' % ex)
+        if '--yes' not in a:
+            sys.exit('add --yes to write to %s' % r)
+        update_rockbox_on_drive(r, zp, print)
+        return
     OPTIONS['full'] = 'check' if '--full-check' in a else 'zero' if '--full' in a else ''   # 1.13
     OPTIONS['small_fw'] = '--itunes-fw' not in a
     if not a:

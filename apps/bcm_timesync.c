@@ -8,7 +8,7 @@
  *     RBTSYNC1
  *     local=2026-11-12 20:05:31.123
  *     utc=1794531931
- *     pc=DESKTOP-PAUL
+ *     pc=DESKTOP-EXAMPLE
  *     id=<Windows MachineGuid>
  *     seq=<random>
  *

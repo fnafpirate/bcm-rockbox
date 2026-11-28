@@ -1,0 +1,73 @@
+# bcm overlay v145: publishes ONLY the newest version to the public repository -- no history.
+#
+# Your own repository (this one) stays private and keeps every commit.  This workflow copies the current files
+# (minus what .publicignore lists) into the public repository as ONE new commit that replaces everything there,
+# tags it with the version, and that tag makes the public repository build and publish the release
+# (.github/workflows/release.yml runs there).  The public repository's release step then deletes the older
+# releases, so only the newest one can be downloaded.
+#
+# One-time setup (see the going-public guide):
+#   1. a new empty PUBLIC repository, e.g. fnafpirate/bcm-rockbox (rename this private one first, e.g. to
+#      bcm-rockbox-dev, so the public one can have the short name the formatter looks for)
+#   2. a fine-grained token: github.com -> Settings -> Developer settings -> Fine-grained tokens -> Generate:
+#      Repository access = only the public repository; Permissions: Contents = Read and write,
+#      Workflows = Read and write; any expiry you like
+#   3. in THIS repository: Settings -> Secrets and variables -> Actions:
+#        New repository secret   PUBLIC_REPO_TOKEN = the token
+#        Variables tab: New repository variable   PUBLIC_REPO = fnafpirate/bcm-rockbox
+#
+# Use: Actions -> "Publish to public repo" -> Run workflow -> version (e.g. v145)
+name: Publish to public repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, e.g. v145'
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Snapshot of the current files, one commit, pushed over the public repository
+        env:
+          VER: ${{ github.event.inputs.version }}
+          TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
+          REPO: ${{ vars.PUBLIC_REPO }}
+        run: |
+          set -e
+          if [ -z "$TOKEN" ] || [ -z "$REPO" ]; then
+            echo "::error::Set the secret PUBLIC_REPO_TOKEN and the variable PUBLIC_REPO first (see the top of this file)"; exit 1
+          fi
+          case "$VER" in v[0-9]*) ;; *) echo "::error::version must look like v145"; exit 1;; esac
+          mkdir -p "$RUNNER_TEMP/pub"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/pub"
+          # leave out what .publicignore lists (one path or glob per line, # = comment)
+          python3 - "$RUNNER_TEMP/pub" <<'PY'
+          import glob, os, shutil, sys
+          root = sys.argv[1]
+          rules = ['.publicignore']
+          if os.path.isfile(os.path.join(root, '.publicignore')):
+              rules += [l.strip() for l in open(os.path.join(root, '.publicignore')) if l.strip() and not l.startswith('#')]
+          for r in rules:
+              for p in glob.glob(os.path.join(root, r.lstrip('/')), recursive=True):
+                  if os.path.commonpath([root, os.path.realpath(p)]) != os.path.realpath(root):
+                      continue
+                  print('left out:', os.path.relpath(p, root))
+                  shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+          PY
+          cd "$RUNNER_TEMP/pub"
+          git init -q -b main
+          git config user.name "bcm-rockbox"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "bcm-rockbox $VER"
+          git tag -a "$VER" -m "bcm-rockbox $VER"
+          URL="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git push -q --force "$URL" main
+          git push -q --force "$URL" "refs/tags/$VER"
+          echo "### Published $VER to https://github.com/$REPO" >> "$GITHUB_STEP_SUMMARY"
+          echo "The release builds there now: https://github.com/$REPO/actions" >> "$GITHUB_STEP_SUMMARY"

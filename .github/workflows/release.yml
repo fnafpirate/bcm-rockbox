@@ -1,0 +1,241 @@
+# bcm overlay v145: makes a public GitHub Release with everything a user needs, from this repository's own source.
+#
+# Start it:  github.com -> your repo -> Actions -> "Release" -> Run workflow -> branch bcm-host, version e.g. v145
+#            (or push a tag:  git tag v145 && git push origin v145)
+#
+# The release gets:
+#   rockbox-ipodvideo.zip            Rockbox for the iPod Video built here (+ .rockbox/bcm-version.txt)
+#   bootloader-ipodvideo.ipod        the bootloader (tools/bcm/, built from this repo's bootloader/ source)
+#   iPod-exFAT-Setup-win64.exe       formatter, Windows 10 / 11, with the build and bootloader inside
+#   iPod-exFAT-Setup-win32.exe       formatter, Windows 7 SP1 and later (32- and 64-bit)
+#   iPod-exFAT-Setup-mac-arm64.zip   formatter, Macs with Apple silicon
+#   iPod-exFAT-Setup-mac-intel.zip   formatter, Intel Macs
+#   iPod-Defrag-win64.exe / -win32.exe
+#   ipod_exfat_setup.py, ipod_defrag.pyw   the same tools as plain Python
+#   release.json                     versions + SHA-256 of every file (the formatter's update check reads it)
+#   SHA256SUMS.txt                   the same for people
+# GitHub adds "Source code (zip / tar.gz)" of the tagged commit by itself.
+# Nothing from Apple is ever in a release: the formatter downloads Apple's firmware from Apple on the user's PC.
+# Release text: tools/bcm/release_notes.md (edit it before starting the release).
+#
+# v145: runs only in a PUBLIC repository (in the private one it does nothing): "Publish to public repo" in the
+# private repository pushes the snapshot + tag, and the tag starts this.  KEEP_RELEASES = how many releases stay
+# downloadable; older ones (and their tags) are deleted once the new one is published.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag, e.g. v145'
+        required: true
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+env:
+  VER: ${{ github.event.inputs.version || github.ref_name }}
+  KEEP_RELEASES: 1
+
+jobs:
+  rockbox:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget xz-utils bzip2 gzip patch texinfo \
+            automake autoconf libtool libtool-bin flex bison perl python3 zip unzip git ccache \
+            libgmp-dev libmpfr-dev libmpc-dev libisl-dev zlib1g-dev
+
+      - name: Restore ARM toolchain cache
+        id: toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/rbdev
+          key: rbdev-arm-gcc9.5-${{ hashFiles('tools/rockboxdev.sh') }}
+
+      - name: Build ARM toolchain (first time only, ~1 hour)
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          sudo mkdir -p /opt/rbdev && sudo chown "$USER" /opt/rbdev
+          RBDEV_PREFIX=/opt/rbdev RBDEV_TARGET=a tools/rockboxdev.sh
+
+      - name: Save ARM toolchain cache
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/rbdev
+          key: rbdev-arm-gcc9.5-${{ hashFiles('tools/rockboxdev.sh') }}
+
+      - name: Build Rockbox
+        run: |
+          export PATH=/opt/rbdev/bin:$PATH
+          mkdir -p build && cd build
+          ../tools/configure --target=ipodvideo --type=n
+          make -j"$(nproc)" > ../make.log 2>&1 || { grep -n -E "error|undefined reference" ../make.log | head -40; tail -40 ../make.log; exit 1; }
+          make zip
+          mkdir -p ../vz/.rockbox && echo "$VER" > ../vz/.rockbox/bcm-version.txt
+          (cd ../vz && zip -q ../build/rockbox.zip .rockbox/bcm-version.txt)
+          cp rockbox.zip ../rockbox-ipodvideo.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rockbox
+          path: rockbox-ipodvideo.zip
+
+  windows:
+    needs: rockbox
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: win64, python: '3.12', arch: x64, pyinstaller: '6.11.1' }
+          - { name: win32, python: '3.8',  arch: x86, pyinstaller: '6.10.0' }
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: rockbox
+
+      - name: Install PyInstaller (start-up stub compiled from source)
+        shell: pwsh
+        run: |
+          $env:PYINSTALLER_COMPILE_BOOTLOADER = "1"
+          python -m pip install --no-binary pyinstaller "pyinstaller==${{ matrix.pyinstaller }}"
+          if ($LASTEXITCODE -ne 0) { python -m pip install "pyinstaller==${{ matrix.pyinstaller }}" }
+
+      - name: Version stamp, built-in files, version resources
+        shell: python
+        run: |
+          import os, re, shutil
+          ver = os.environ['VER']
+          p = 'tools/bcm/ipod_exfat_setup.py'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r"^BCM_VERSION = .*$", "BCM_VERSION = '%s'" % ver, s, count=1, flags=re.M)
+          open(p, 'w', encoding='utf-8').write(s)
+          os.makedirs('bundle', exist_ok=True)
+          shutil.copyfile('rockbox-ipodvideo.zip', 'bundle/rockbox.zip')
+          shutil.copyfile('tools/bcm/bootloader-ipodvideo.ipod', 'bundle/bootloader-ipodvideo.ipod')
+          def info(src, name, desc, exe):
+              v = re.search(r"^VERSION = '([\d.]+)'", open(src, encoding='utf-8').read(), re.M).group(1)
+              t = tuple(int(x) for x in (v.split('.') + ['0'] * 4)[:4])
+              return f"""VSVersionInfo(
+            ffi=FixedFileInfo(filevers={t}, prodvers={t}, mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+            kids=[StringFileInfo([StringTable('040904B0', [
+              StringStruct('CompanyName', 'bcm-rockbox (open source hobby project)'),
+              StringStruct('FileDescription', '{desc}'),
+              StringStruct('FileVersion', '{v}'),
+              StringStruct('InternalName', '{name}'),
+              StringStruct('LegalCopyright', 'GPL-2.0-or-later'),
+              StringStruct('OriginalFilename', '{exe}'),
+              StringStruct('ProductName', '{name}'),
+              StringStruct('ProductVersion', '{v}')])]),
+              VarFileInfo([VarStruct('Translation', [1033, 1200])])])"""
+          open('ver_setup.txt', 'w').write(info(p, 'iPod exFAT Setup', 'Formats an iPod Video with exFAT and installs Rockbox', 'iPod exFAT Setup.exe'))
+          open('ver_defrag.txt', 'w').write(info('tools/bcm/ipod_defrag.pyw', 'iPod Defrag', 'Defragments an iPod exFAT drive', 'iPod Defrag.exe'))
+
+      - name: Build
+        run: |
+          pyinstaller --onefile --windowed --uac-admin --clean --noupx --version-file ver_setup.txt --add-data "bundle;bundle" --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
+          pyinstaller --onefile --windowed --uac-admin --clean --noupx --version-file ver_defrag.txt --name "iPod Defrag" tools/bcm/ipod_defrag.pyw
+          mkdir out
+          copy "dist\iPod exFAT Setup.exe" "out\iPod-exFAT-Setup-${{ matrix.name }}.exe"
+          copy "dist\iPod Defrag.exe" "out\iPod-Defrag-${{ matrix.name }}.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-${{ matrix.name }}
+          path: out/*
+
+  mac:
+    needs: rockbox
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: mac-arm64, runner: macos-14 }
+          - { name: mac-intel, runner: macos-13 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: rockbox
+      - name: Build the app
+        run: |
+          python -m pip install pyinstaller==6.11.1
+          sed -i '' "s/^BCM_VERSION = .*/BCM_VERSION = '$VER'/" tools/bcm/ipod_exfat_setup.py
+          mkdir -p bundle
+          cp rockbox-ipodvideo.zip bundle/rockbox.zip
+          cp tools/bcm/bootloader-ipodvideo.ipod bundle/
+          pyinstaller --windowed --clean --noupx --add-data "bundle:bundle" --name "iPod exFAT Setup" tools/bcm/ipod_exfat_setup.py
+          mkdir -p out
+          cp -R "dist/iPod exFAT Setup.app" out/
+          cp tools/bcm/start_ipod_exfat_setup.command "out/Start iPod exFAT Setup.command"
+          chmod +x "out/Start iPod exFAT Setup.command"
+          (cd out && zip -qry "../iPod-exFAT-Setup-${{ matrix.name }}.zip" .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: iPod-exFAT-Setup-${{ matrix.name }}.zip
+
+  publish:
+    needs: [ rockbox, windows, mac ]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+      - name: Collect, checksum, publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          find art -type f -exec cp {} dist/ \;
+          sed "s/^BCM_VERSION = .*/BCM_VERSION = '$VER'/" tools/bcm/ipod_exfat_setup.py > dist/ipod_exfat_setup.py
+          cp tools/bcm/ipod_defrag.pyw tools/bcm/bootloader-ipodvideo.ipod dist/
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          ver = os.environ['VER']
+          d = 'dist'
+          sha = {n: hashlib.sha256(open(os.path.join(d, n), 'rb').read()).hexdigest() for n in sorted(os.listdir(d))}
+          fv = re.search(r"^VERSION = '([\d.]+)'", open('tools/bcm/ipod_exfat_setup.py').read(), re.M).group(1)
+          dv = re.search(r"^VERSION = '([\d.]+)'", open('tools/bcm/ipod_defrag.pyw').read(), re.M).group(1)
+          json.dump({'bcm': ver, 'formatter': fv, 'defrag': dv, 'sha256': sha}, open(os.path.join(d, 'release.json'), 'w'), indent=1)
+          with open(os.path.join(d, 'SHA256SUMS.txt'), 'w') as f:
+              for n, h in sha.items():
+                  f.write('%s  %s\n' % (h, n))
+          PY
+          if [ -f tools/bcm/release_notes.md ]; then cp tools/bcm/release_notes.md notes.md; else echo "bcm-rockbox $VER" > notes.md; fi
+          cat tools/bcm/release_footer.md >> notes.md 2>/dev/null || true
+          ls -la dist
+          if gh release view "$VER" >/dev/null 2>&1; then
+            gh release upload "$VER" dist/* --clobber
+          else
+            gh release create "$VER" dist/* --title "bcm-rockbox $VER" --notes-file notes.md --target "$GITHUB_SHA" --latest
+          fi
+          # only the newest KEEP_RELEASES stay: older releases and their tags go
+          gh release list --limit 200 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName' > all.txt
+          tail -n +"$((KEEP_RELEASES + 1))" all.txt | while read -r old; do
+            [ "$old" = "$VER" ] && continue
+            echo "removing old release $old"
+            gh release delete "$old" --yes --cleanup-tag || true
+          done
