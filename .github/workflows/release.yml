@@ -77,7 +77,11 @@ jobs:
       - name: Build Rockbox
         run: |
           export PATH=/opt/rbdev/bin:$PATH
-          mkdir -p build && cd build
+          # v145: build through a short path.  Rockbox's "Generating dependencies" step passes every source path
+          # (~1500 of them) to one shell command, which Linux caps at 128 KB; a long checkout folder such as
+          # /home/runner/work/rockbox-with-video/rockbox-with-video pushes it over ("Argument list too long").
+          ln -sfn "$GITHUB_WORKSPACE" /tmp/r
+          mkdir -p /tmp/r/build && cd /tmp/r/build
           ../tools/configure --target=ipodvideo --type=n
           make -j"$(nproc)" > ../make.log 2>&1 || { grep -n -E "error|undefined reference" ../make.log | head -40; tail -40 ../make.log; exit 1; }
           make zip
@@ -125,6 +129,7 @@ jobs:
           p = 'tools/bcm/ipod_exfat_setup.py'
           s = open(p, encoding='utf-8').read()
           s = re.sub(r"^BCM_VERSION = .*$", "BCM_VERSION = '%s'" % ver, s, count=1, flags=re.M)
+          s = re.sub(r"^RELEASE_REPO = '[^']*'", "RELEASE_REPO = '%s'" % os.environ['GITHUB_REPOSITORY'], s, count=1, flags=re.M)
           open(p, 'w', encoding='utf-8').write(s)
           os.makedirs('bundle', exist_ok=True)
           shutil.copyfile('rockbox-ipodvideo.zip', 'bundle/rockbox.zip')
@@ -182,6 +187,7 @@ jobs:
         run: |
           python -m pip install pyinstaller==6.11.1
           sed -i '' "s/^BCM_VERSION = .*/BCM_VERSION = '$VER'/" tools/bcm/ipod_exfat_setup.py
+          sed -i '' "s#^RELEASE_REPO = '[^']*'#RELEASE_REPO = '$GITHUB_REPOSITORY'#" tools/bcm/ipod_exfat_setup.py
           mkdir -p bundle
           cp rockbox-ipodvideo.zip bundle/rockbox.zip
           cp tools/bcm/bootloader-ipodvideo.ipod bundle/
@@ -210,7 +216,7 @@ jobs:
         run: |
           mkdir dist
           find art -type f -exec cp {} dist/ \;
-          sed "s/^BCM_VERSION = .*/BCM_VERSION = '$VER'/" tools/bcm/ipod_exfat_setup.py > dist/ipod_exfat_setup.py
+          sed -e "s/^BCM_VERSION = .*/BCM_VERSION = '$VER'/" -e "s#^RELEASE_REPO = '[^']*'#RELEASE_REPO = '$GITHUB_REPOSITORY'#" tools/bcm/ipod_exfat_setup.py > dist/ipod_exfat_setup.py
           cp tools/bcm/ipod_defrag.pyw tools/bcm/bootloader-ipodvideo.ipod dist/
           python3 - <<'PY'
           import hashlib, json, os, re
