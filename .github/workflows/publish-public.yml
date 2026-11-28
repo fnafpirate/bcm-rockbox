@@ -17,6 +17,7 @@
 #        Variables tab: New repository variable   PUBLIC_REPO = fnafpirate/bcm-rockbox
 #
 # Use: Actions -> "Publish to public repo" -> Run workflow -> version (e.g. v145)
+#   or, without the Actions page (works from any branch):  git tag publish-v145 && git push origin publish-v145
 name: Publish to public repo
 
 on:
@@ -25,6 +26,8 @@ on:
       version:
         description: 'Version, e.g. v145'
         required: true
+  push:
+    tags: [ 'publish-v*' ]
 
 jobs:
   publish:
@@ -34,11 +37,12 @@ jobs:
 
       - name: Snapshot of the current files, one commit, pushed over the public repository
         env:
-          VER: ${{ github.event.inputs.version }}
+          VER: ${{ github.event.inputs.version || github.ref_name }}
           TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
           REPO: ${{ vars.PUBLIC_REPO }}
         run: |
           set -e
+          VER="${VER#publish-}"
           if [ -z "$TOKEN" ] || [ -z "$REPO" ]; then
             echo "::error::Set the secret PUBLIC_REPO_TOKEN and the variable PUBLIC_REPO first (see the top of this file)"; exit 1
           fi
