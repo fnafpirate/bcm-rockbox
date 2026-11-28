@@ -21,13 +21,13 @@ Stock Rockbox on the iPod Video plays video in software on the iPod's ARM proces
 iPod Video also has a Broadcom BCM2722 "VideoCore" chip that Apple's own firmware uses for H.264 / MPEG-4 video and
 TV output.  This fork talks to that chip the way Apple's firmware does, so Rockbox can:
 
-* play **H.264 / MPEG-4 .mp4 / .m4v videos** in hardware, full screen, with seeking, resume and subtitles,
+* play **H.264 .mp4 / .m4v videos** in hardware, full screen, with seeking, subtitles and resume after sleep,
   including High / Main profile files with CABAC (converted to a form the chip accepts on the fly);
-* send video and its own menus to a **TV** (composite, PAL or NTSC);
+* send video to a **TV** (composite, PAL or NTSC);
 * run on **exFAT** drives of any size (FAT32 still works), with a Windows tool that formats and sets up the iPod in
   one step;
 * plus many smaller things: a steadier battery reading, faster start-up, a TV screensaver, a display rescue, docks
-  and remotes controlling video, and more (see the release notes).
+  and remotes controlling video, and more: see the [full feature list](GUIDE.md#features-what-stock-rockbox-doesnt-do).
 
 Supported: **iPod Video 5G and 5.5G (30 / 60 / 80 GB models, any storage mod).**  Nothing else -- not the iPod
 Classic 6th / 7th gen, nano or mini.

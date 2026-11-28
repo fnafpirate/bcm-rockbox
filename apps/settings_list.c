@@ -1377,7 +1377,6 @@ const struct settings_list settings[] = {
     /* the video player's TV output (BCM2722 composite / S-video: dock connector and the headphone jack's 4th contact) */
     CHOICE_SETTING(0, bcm_video_out, LANG_VIDEO_OUT, 2, "video out", "on,ask,off,auto", NULL, 4,
                    ID2P(LANG_ON), ID2P(LANG_ASK), ID2P(LANG_OFF), ID2P(LANG_VIDEO_OUT_AUTO)),
-    OFFON_SETTING(0, bcm_tv_browser, LANG_TV_BROWSER, false, "tv file browser", NULL),                    /* v143 */
     CHOICE_SETTING(0, bcm_tv_signal, LANG_TV_SIGNAL, 0, "tv signal", "ntsc,pal", NULL, 2,
                    ID2P(LANG_TV_NTSC), ID2P(LANG_TV_PAL)),
     CHOICE_SETTING(0, bcm_tv_picture, LANG_TV_PICTURE, 0, "tv picture", "letterbox,fill", NULL, 2,

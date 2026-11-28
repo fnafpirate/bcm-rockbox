@@ -768,7 +768,6 @@ struct user_settings
     int bcm_tv_signal;   /* 0 NTSC, 1 PAL */
     int bcm_tv_picture;  /* 0 letterbox, 1 fill screen */
     bool bcm_tv_wide;    /* the TV is 16:9 (stock "Widescreen") */
-    bool bcm_tv_browser; /* bcm v143: TV File Browser: the video folders on the TV at 640 x 480 */
     int battery_reading; /* v92: 0 balanced (default), 1 smooth (stock-like), 2 exact (Rockbox) */
     bool bcm_subs;       /* bcm overlay v73: video subtitles shown when the video has some */
     int bcm_sub_size;    /* 0 small, 1 medium, 2 large */

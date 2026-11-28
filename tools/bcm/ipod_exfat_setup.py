@@ -3094,7 +3094,7 @@ def extras_window(parent, TITLE):
         if not r:
             return
         def run():
-            log('downloading the Rockbox font pack (large fonts for the TV File Browser too) ...')
+            log('downloading the Rockbox font pack ...')
             n = safe_extract(http_get(FONTS_URL, log, 300), r, log)
             log('fonts: %d files installed in /.rockbox/fonts' % n)
         bg(run)

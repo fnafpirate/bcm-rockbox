@@ -6,11 +6,75 @@ battery, and fix the usual problems.  Rockbox's own music player, menus and them
 
 > bcm-rockbox is an unofficial hobby project written with AI, provided as-is.  Read [DISCLAIMER.md](DISCLAIMER.md).
 
-**Contents:** [1. Install](#1-install) · [2. Putting videos on it](#2-putting-videos-on-it) ·
+**Contents:** [Features](#features-what-stock-rockbox-doesnt-do) · [1. Install](#1-install) · [2. Putting videos on it](#2-putting-videos-on-it) ·
 [3. Watching a video](#3-watching-a-video) · [4. Video settings](#4-video-settings) · [5. TV out](#5-tv-out) ·
 [6. Subtitles](#6-subtitles) · [7. Battery](#7-battery) · [8. Docks, remotes, Bluetooth](#8-docks-remotes-and-bluetooth-transmitters) ·
 [9. Storage and USB](#9-storage-and-usb) · [10. Updating](#10-updating) · [11. Problems](#11-when-something-goes-wrong) ·
 [12. How it works](#12-how-it-works-for-the-curious)
+
+## Features (what stock Rockbox doesn't do)
+
+Everything below is new in bcm-rockbox; the rest of Rockbox (music playback, the database, themes, plugins, settings)
+works as in normal Rockbox.
+
+**Video**
+* **Hardware H.264 video** on the iPod's own video chip (the VideoCore, like Apple's player): `.mp4` / `.m4v` up to
+  640x480, full screen, with the sound in sync.  Stock Rockbox can only decode small MPEG files on the main processor.
+* **Main / High profile H.264** (the files most encoders make by default) plays too: the iPod converts them on the fly
+  on its second processor core.  Apple's own firmware cannot play these.
+* Apple-style video controls, fast-forward / rewind with a moving picture, 10-second skips, the clock and the end time
+  (press SELECT twice).
+* **Subtitles**: `.srt`, `.vtt`, `.ass` / `.ssa` next to the video, and subtitle tracks inside the MP4; switch tracks
+  while it plays.
+* **Sleep in the middle of a video** and it continues from the same spot, even after the iPod has powered off.
+* **Video Buffering** modes (longest battery or fastest seeking) and **Keep VideoCore Ready** (videos in your video
+  folders start almost at once).
+* Long battery life for video: the video chip runs slower once the picture plays, the main processor sleeps between
+  reads, and asleep the iPod uses Apple's own low-power light sleep.
+* TV shows: a dock's or remote's next / previous goes through the episodes in order.
+* **Movie Quiz** game (Plugins > Games): guess the film from a random frame.
+
+**TV out**
+* Composite TV out, NTSC or PAL, widescreen or 4:3, letterbox or fill, with the right picture shape.
+* Hold MENU during a video to move the picture between the TV and the iPod's screen.
+* Your own animation on the iPod's screen while the TV plays (`tv.gif`), and a TV screensaver (`tv_saver.mp4`).
+* Video Out **Auto**: the TV when the iPod sits in a video dock; each dock remembers its own TV settings.
+
+**Storage**
+* **exFAT** for Rockbox and its bootloader: drives of any size (multi-terabyte iFlash, SD and CF cards) and files over
+  4 GB.  FAT32 still works.
+* Faster folder listing and free-space search on big drives; the drive is marked "needs checking" only while the iPod
+  is writing, so a dead battery rarely leaves it marked.
+* **Optimize Solid State** (switched on by itself for flash storage), faster USB copying options and a USB Speed Test.
+* Dates stay right after 2038 (until 2106).
+
+**Battery**
+* **Battery Reading** Balanced / Smooth / Exact: a steady percentage that does not jump when the screen or a video
+  starts.
+* **Learn Battery**: measures your own battery once, so the percentage fits it.
+* Battery Capacity up to 3800 mAh for big replacement batteries.
+
+**Sound and accessories**
+* **Click Speaker** (Settings > Sound Settings): music and video through the iPod's built-in click speaker when no
+  headphones are in, start-up and shutdown sounds (your own from `/.rockbox/startup chime`), and a charging-complete
+  alert (`/.rockbox/charging chime`).
+* **Start Volume**: music and videos start at 50 %, so a volume left high never blasts your ears.
+* Dock line out: a Bluetooth mode for transmitters, 0-6 dB more level, separate sound settings for docked and for
+  headphones, and dock notices.
+* Docks and remotes control videos; car stereos and docks with a screen get album art and track details.
+* Pulling the headphones out pauses a video.
+* Exact seeking and faster starts in Opus files.
+
+**Other**
+* Your own start-up picture: `/.rockbox/boot_logo.jpg` (or `.bmp`).
+* **Display rescue**: MENU three times quickly restarts the screen (see [11](#11-when-something-goes-wrong)).
+* Test screens in the Debug menu: Battery Load Check, Drive Transfer Test, USB Speed Test, Dock & Bluetooth Test,
+  Fragmentation.
+
+**PC tools** (Windows; Linux runs the `.py`)
+* **iPod exFAT Setup**: formats and installs in one step, moves everything to a bigger card, updates Rockbox without
+  formatting, fetches Apple's video files, and installs themes, fonts and settings backups (Extras).
+* **iPod Defrag**: rejoins split files and repairs the "needs checking" mark.
 
 ---
 
@@ -51,7 +115,7 @@ in 30 GB and 60 GB.  The program usually tells from the iPod itself and asks if 
 ## 2. Putting videos on it
 
 Connect the iPod while Rockbox runs: it appears as a normal drive on the PC.  Copy videos anywhere; folders named
-**Videos**, **TV Shows** or **Movies** get extra features (faster starts, the TV File Browser, episode lists).
+**Videos**, **TV Shows** or **Movies** get extra features (faster starts, episode order for TV shows).
 
 **What plays:**
 
@@ -122,7 +186,6 @@ with a video output.  TV out is standard definition (NTSC or PAL); HD is not pos
 | Setting | Choices | What it does |
 |---|---|---|
 | **Video Out** | On / Ask / **Off** / Auto | *On*: videos always play on the TV.  *Ask*: asks each time a video starts.  *Auto*: the TV when the iPod sits in a dock with video out, otherwise the iPod screen.  The iPod can't tell an AV cable from headphones, so with the cable use *On* or *Ask*. |
-| **TV File Browser** | On / Off | with Video Out On (or Auto on a TV dock), opening a video folder shows the file list on the TV in big type; the iPod screen shows a small animation.  Use the wheel and buttons as usual. |
 | **TV Signal** | NTSC / PAL | NTSC for North America and Japan, PAL for most of Europe, Australia and elsewhere.  A black-and-white or rolling picture means the wrong one. |
 | **Widescreen TV** | On / Off | On for a 16:9 TV |
 | **TV Picture** | Letterbox / Fill | Letterbox shows the whole picture with bars; Fill fills the screen and crops the edges |
@@ -132,7 +195,7 @@ with a video output.  TV out is standard definition (NTSC or PAL); HD is not pos
   **Extras** can install one).
 * **TV screensaver**: put a short looping video called `tv_saver.mp4` in `/.rockbox`.  A video paused on the TV for
   2 minutes then plays it until you press a button, and your video comes back at the same frame.
-* In the TV File Browser, press **MENU three times quickly** to go back to the iPod's screen (until the next restart).
+* The menus and the file list always stay on the iPod's screen; only videos go to the TV.
 
 ---
 
@@ -210,7 +273,7 @@ runs in the background), or press **Check for updates**.
 | Problem | What to do |
 |---|---|
 | The iPod is frozen | hold **MENU + SELECT** about 6 s: it restarts |
-| White or frozen screen in the menus | press **MENU three times quickly**: the screen is restarted |
+| White or blank screen in the menus | press **MENU three times quickly** (within a second): the screen goes dark for a moment and comes back.  If it still does not, the iPod restarts by itself. |
 | Videos don't play ("files missing" or a black screen) | the video chip's files are missing: in iPod exFAT Setup press **Copy video files from .ipsw** with the iPod connected |
 | The PC says the drive needs checking | iPod Defrag > **Check & fix**, or Windows' own *Check* on the drive |
 | The PC does not see the iPod | disk mode (see [Install](#1-install), step 3) |

@@ -3227,7 +3227,6 @@ static int cfg_recover = 2;                       /* v96: VideoCore recovery att
 static int vc_seeks_boot;
 static int cfg_seek_budget = 110;                 /* v110: 90 -> 110 (deaths at 125-126) */
 static int cfg_keep = -1, cfg_keep_min = 10;     /* v99: Keep VideoCore Ready (-1 = the setting), idle minutes */
-static int cfg_tv_menu = 0;                      /* v142: the file browser on the TV while on standby (Video Out On) */
 static int cfg_menu3 = 1;                        /* v144: MENU x3 outside a video = display rescue */
 static int cfg_saver_min = 2;                    /* v144: TV screensaver after this many minutes paused / idle */
 static bool pl_saver, sv_key;                    /* v144: the screensaver clip is playing / a button ended it */
@@ -5217,7 +5216,6 @@ static void bcm_load_cfg(void)
         else if (!strcmp(p, "big_frames")) cfg_big_frames = v;   /* v96 */
         else if (!strcmp(p, "keep"))     cfg_keep = v;           /* v99: 0 off, 1 in the video folder */
         else if (!strcmp(p, "keep_min")) cfg_keep_min = v < 1 ? 1 : v;
-        else if (!strcmp(p, "tv_menu")) cfg_tv_menu = v;
         else if (!strcmp(p, "menu3_rescue")) cfg_menu3 = v;
         else if (!strcmp(p, "tv_saver_min")) cfg_saver_min = v;
         else if (!strcmp(p, "sleep_after_s")) cfg_sleep_after_s = v < 0 ? 0 : v < 10 ? 10 : v;   /* v119 */
@@ -5649,7 +5647,7 @@ static void bcm_gfx_draw_status(void)
     lcd_set_foreground(LCD_RGBPACK(255, 255, 255));
     lcd_clear_display();
     lcd_setfont(FONT_SYSFIXED);
-    lcd_putsxyf(4, 4, "bcm host test v146 - VC graphics layer");
+    lcd_putsxyf(4, 4, "bcm host test v147 - VC graphics layer");
     lcd_putsxyf(4, 16, "this screen = Rockbox FB -> VC image %d", gfx_front < 0 ? 0 : 1 - gfx_front);
     lcd_putsxyf(4, 28, "t=%ld.%lds  presents=%d", e / HZ, (e % HZ) / 10, gfx_presents);
     lcd_putsxyf(4, 40, "video: sent=%d frames (%d KB)", v_frames, v_bytes / 1024);
@@ -11863,7 +11861,9 @@ static bool tvb_series;                  /* v144 */
 static char tvb_series_txt[48];
 static long tvb_menu_t;
 static int tvb_menu_n;
-static bool tvb_setting(void) { return global_settings.bcm_tv_browser || cfg_tv_menu; }
+/* v147: the TV File Browser (v143) and the v142 TV menus (cfg tv_menu) are removed -- browsing on the TV did not work.
+   Everything below that depends on it is switched off here (tvb_start is never reached; the compiler drops it). */
+static bool tvb_setting(void) { return false; }
 static bool tvb_tv_wanted(void)
 {
     return tvb_setting() && !tvb_user_off &&
@@ -12151,14 +12151,19 @@ static bool tvb_start(void)
          ta_n ? "animated" : "a note");
     return true;
 }
-/* v144: MENU three times within a second anywhere outside a video (apps/action.c) = the display is started again:
-   standby given back, or the BCM powered down and Rockbox's display firmware booted again -- the way out of a white
-   screen.  (In the TV File Browser the same keys go back to the iPod's screen.)  cfg menu3_rescue=0 turns it off. */
+/* v144: MENU three times within a second anywhere outside a video (apps/action.c) = the display is started again.
+   v147: the v144 version booted the display firmware ONCE and lit the backlight whatever came of it -- a boot whose
+   first picture never finished (-2, the case bcm_handback has retried since v87) stayed white for good, and in the
+   TV File Browser the keys did nothing at all.  Now it is the video hand-back's recovery: standby given back through
+   bcm_handback (which retries and reboots), otherwise the BCM powered down and the display firmware booted up to three
+   times, the backlight lit only after a complete picture, and the iPod restarted if the display still does not come
+   back -- it never stays white.  cfg menu3_rescue=0 turns it off. */
 void bcm_menu_tap(void)
 {
     static long t0;
     static int n;
-    if (!cfg_menu3 || bcm_video_running || tvb_on) return;
+    int rr, tries;
+    if (!cfg_menu3 || bcm_video_running) return;
     n = current_tick - t0 < HZ ? n + 1 : 1;
     t0 = current_tick;
     if (n < 3) return;
@@ -12166,25 +12171,36 @@ void bcm_menu_tap(void)
     mutex_lock(&kp_mtx);
     if (kp_hosted)
     {
-        kp_release_locked("MENU three times (display rescue)");
+        kp_release_locked("MENU three times (display rescue)");   /* bcm_handback: retries, reboots if it stays white */
         mutex_unlock(&kp_mtx);
-    }
-    else
-    {
-        int rr;
-        mutex_unlock(&kp_mtx);
-        _backlight_hw_enable(false);
-        rr = bcm_restore_rom_vmcs();
-        lcd_update();
+        backlight_set_brightness(global_settings.brightness);
         backlight_on();
-        if (bcm_log_fd >= 0) BLOG("display rescue (MENU three times): display firmware booted again -> %d", rr);
+        splash(HZ, "Display restarted");
+        return;
     }
+    mutex_unlock(&kp_mtx);
+    bcm_log_fd = global_settings.bcm_debug_log ? open(BCM_LOG_PATH, O_WRONLY | O_APPEND) : -1;
+    bcm_tv_dac = false;                                /* the TV output goes with the BCM's power */
+    _backlight_hw_enable(false);                       /* dark until a complete picture (a lit panel without one is white) */
+    rr = bcm_restore_rom_vmcs();
+    BLOG("display rescue (MENU three times): display firmware booted again -> %d", rr);
+    for (tries = 1; tries <= 2 && rr != 0; tries++)
+    {
+        sleep(HZ / 5);
+        rr = bcm_restore_rom_vmcs();
+        BLOG("display rescue: again (%d/2) -> %d", tries, rr);
+    }
+    if (rr != 0)
+    {
+        BLOG("display rescue: the display did not come back -- restarting the iPod instead of a white screen");
+        bcm_log_close();
+        system_reboot();
+    }
+    lcd_update();
+    backlight_set_brightness(global_settings.brightness);
+    backlight_on();
+    bcm_log_close();
     splash(HZ, "Display restarted");
-}
-/* apps/tree.c, after every key: the list changed? */
-void bcm_tv_browser_tree(void)
-{
-    if (tvb_on) tvb_render();
 }
 static void tvb_exit_user(void)
 {
@@ -12426,7 +12442,7 @@ static bool bcm_run(const char *play_path)
         lseek(bcm_log_fd, 0, SEEK_END);   /* v99: a standby start is added after the last log; v102: a warm start after its standby */
     bcm_t_start = current_tick;
     bcm_sync_startup = true; bcm_sync_n = 0; bcm_sync_max_us = 0;     /* v108 */
-    BLOG("bcm host test v146, built %s %s", __DATE__, __TIME__);
+    BLOG("bcm host test v147, built %s %s", __DATE__, __TIME__);
     sl_report_log();                                   /* v121 */
     if (bcm_player_mode)
         BLOG("dock: %s (TV choice %d), video out setting %d, TV %s", iap_dock_name() ? iap_dock_name() : "none",
@@ -13088,7 +13104,7 @@ static bool dbg_cabac_tests(void)
         char path[MAX_PATH];
         int run, i;
         bool tv_save; int cop_save = cfg_cabac_cop, iram_save = cfg_cabac_iram, tv_cfg_save = cfg_tv, cabac_save = cfg_cabac, scrub_save = cfg_scrub_mode, tvx_save = cfg_tv_extra, queue_save = cfg_cabac_queue;
-        simplelist_info_init(&info, "CABAC tests v146 (clips in the drive root)", CT_N, NULL);
+        simplelist_info_init(&info, "CABAC tests v147 (clips in the drive root)", CT_N, NULL);
         info.get_name = ct_getname;
         info.action_callback = ct_action;
         info.selection = ct_next;
@@ -13113,7 +13129,7 @@ static bool dbg_cabac_tests(void)
         {   /* the bench: no VideoCore, only the log */
             bcm_t_start = current_tick; bcm_sync_every = 0;
             bcm_log_open();
-            BLOG("bcm host test v146, built " __DATE__ " " __TIME__);
+            BLOG("bcm host test v147, built " __DATE__ " " __TIME__);
             BLOG("%s", ct_header);
             ct_bench();
             bcm_log_close();

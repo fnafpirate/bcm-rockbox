@@ -778,9 +778,6 @@ static int dirbrowse(void)
         oldbutton = button;
         gui_synclist_do_button(&tree_lists, &button);
         tc.selected_item = gui_synclist_get_sel_pos(&tree_lists);
-#if defined(IPOD_VIDEO) && !defined(SIMULATOR)
-        {   extern void bcm_tv_browser_tree(void); bcm_tv_browser_tree(); }   /* bcm overlay v143: the list on the TV */
-#endif
         int customaction = ONPLAY_NO_CUSTOMACTION;
         bool do_restore_display = true;
         #ifdef HAVE_TAGCACHE
